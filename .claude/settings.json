@@ -11,7 +11,37 @@
       "Bash(where pip *)",
       "Bash(python -m pip show pymmcore-plus)",
       "Bash(python -m venv --help)",
-      "Bash(python -m venv tools/mm_python_env)"
+      "Bash(python -m venv tools/mm_python_env)",
+      "Bash(git commit -m ' *)",
+      "Bash(git tag *)",
+      "Bash(grep -rl \"class I_HW_Identification\" \"/c/Program Files/Prophesee/include\" 2>/dev/null)",
+      "Read(//c/Program Files/Prophesee/include/**)",
+      "Read(//c/Program Files/Prophesee/include/metavision/hal/facilities/**)",
+      "Bash(grep -n \"class Camera\\\\b\\\\|static Camera from_first_available\\\\|static Camera from_serial\\\\|CameraException\\\\|class CameraException\" \"/c/Program Files/Prophesee/include/metavision/sdk/stream/camera.h\" \"/c/Program Files/Prophesee/include/metavision/sdk/stream/camera_exception.h\" 2>/dev/null | head -40)",
+      "Read(//c/Program Files/Prophesee/include/metavision/sdk/stream/**)",
+      "Bash(ls \"/c/Program Files/Prophesee/bin\" | grep -i \"sdk_base\\\\|sdk_stream\\\\|hal\\\\b\\\\|_hal\\\\.\" )",
+      "Read(//c/Program Files/Prophesee/bin/**)",
+      "Bash(find \"/c/Program Files/Prophesee/include/metavision\" -iname \"*exception*\")",
+      "Read(//c/Program Files/Prophesee/include/metavision/**)",
+      "Bash(grep -n \"class BaseException\\\\|#include\" \"/c/Program Files/Prophesee/include/metavision/sdk/stream/camera_exception.h\" | head -20)",
+      "Bash(grep -n \"class BaseException\" -A5 \"/c/Program Files/Prophesee/include/metavision/sdk/base/utils/error_utils.h\")",
+      "Read(//c/Program Files/Prophesee/include/metavision/sdk/base/utils/**)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Preview/MSBuild/Current/Bin/amd64/MSBuild.exe\" ProphEBS.sln //p:Configuration=Release //p:Platform=x64 //nologo //v:minimal)",
+      "Bash(tools/mm_python_env/Scripts/python.exe tools/test_prophebs.py)",
+      "Bash(tools/mm_python_env/Scripts/python.exe -c ' *)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(ls:*)",
+      "Bash(ls)",
+      "Bash(ls *)",
+      "Bash(find:*)",
+      "Bash(ls -la \"C:\\\\Users\\\\kjamartens\\\\AppData\\\\Local\\\\pymmcore-plus\\\\pymmcore-plus\\\\mm\\\\Micro-Manager_2.0.3_20260724\\\\mmgr_dal_ProphEBS.dll\" \"C:\\\\GitHub\\\\Prophesee_EBS_MM\\\\DeviceAdapter\\\\ProphEBS\\\\build\\\\Release\\\\x64\\\\mmgr_dal_ProphEBS.dll\")",
+      "Read(//c/Users/kjamartens/AppData/Local/pymmcore-plus/pymmcore-plus/mm/Micro-Manager_2.0.3_20260724/**)",
+      "Bash(cp \"C:\\\\GitHub\\\\Prophesee_EBS_MM\\\\DeviceAdapter\\\\ProphEBS\\\\build\\\\Release\\\\x64\\\\mmgr_dal_ProphEBS.dll\" \"C:\\\\Users\\\\kjamartens\\\\AppData\\\\Local\\\\pymmcore-plus\\\\pymmcore-plus\\\\mm\\\\Micro-Manager_2.0.3_20260724\\\\mmgr_dal_ProphEBS.dll\")",
+      "Bash(\"tools/mm_python_env/Scripts/python\" \"C:\\\\Users\\\\KJAMAR~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--GitHub-Prophesee-EBS-MM\\\\6062d9d6-0cfc-41ab-9252-2a8531a71fb6\\\\scratchpad\\\\test_binning.py\")"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\kjamartens\\AppData\\Local\\pymmcore-plus\\pymmcore-plus\\mm\\Micro-Manager_2.0.3_20260724"
     ]
   }
 }
