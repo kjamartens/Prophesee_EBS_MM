@@ -23,9 +23,18 @@
 //                machine with no EBS attached. SnapImage() still returns the
 //                static test pattern; real event-driven frames are Goal 3.
 //
-//                Event integration, recording, tunable properties, and
-//                ROI/pixel masking are added in later goals (see
-//                docs/DEVLOG.md at the repository root for the roadmap).
+//                Goal 3 (this revision) replaces the static test image, when
+//                a real EBS is connected, with an actual event-integration
+//                frame: CD (contrast detection) events are accumulated into a
+//                per-pixel counter, and every g_EventIntegrationMs
+//                milliseconds that accumulator is rendered into an 8-bit
+//                grayscale frame and swapped in as the buffer SnapImage()/
+//                Live view return. With no camera connected, the Goal 1
+//                static checkerboard fallback is unchanged.
+//
+//                Recording, tunable properties, and ROI/pixel masking are
+//                added in later goals (see docs/DEVLOG.md at the repository
+//                root for the roadmap).
 //
 // COPYRIGHT:     Koen J.A. Martens, 2026
 // LICENSE:       This file is distributed under the BSD license, consistent
@@ -43,7 +52,9 @@
 
 #include <metavision/sdk/stream/camera.h>
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 // Device name (defined in ProphEBS.cpp, referenced by ProphEBSModule.cpp)
 extern const char* g_ProphEBSCameraDeviceName;
@@ -55,12 +66,27 @@ extern const char* g_PropSerial;
 extern const char* g_PropConnectionType;
 extern const char* g_PropIntegrator;
 
-// Fixed test-image geometry for Goal 1. Real sensor geometry will replace
-// this once the adapter actually queries the Prophesee HAL (Goal 2/3).
+// Fixed test-image geometry for Goal 1 / the no-hardware fallback. Real
+// sensor geometry (from Metavision::I_Geometry) is used instead whenever a
+// camera is actually connected -- see CProphEBSCamera::sensorWidth_/
+// sensorHeight_.
 const unsigned g_TestImageWidth = 640;
 const unsigned g_TestImageHeight = 480;
 
+// Goal 3: fixed event-integration window. Every g_EventIntegrationMs
+// milliseconds, the accumulated per-pixel CD event counts since the last
+// window are rendered into a frame and swapped in as the live image. Not yet
+// user-configurable -- that's Goal 6 ("custom view methods").
+const double g_EventIntegrationMs = 100.0;
+
+// Maps an accumulated per-pixel event count over one integration window to
+// an 8-bit grayscale value (count * scale, clamped to 255). Chosen so a
+// handful of events per pixel per 100 ms window is already visibly bright;
+// not derived from any calibration, just a reasonable default for Goal 3.
+const unsigned g_EventIntensityScale = 32;
+
 class ProphEBSSequenceThread;
+class ProphEBSFrameBuilderThread;
 
 //////////////////////////////////////////////////////////////////////////////
 // CProphEBSCamera class
@@ -121,7 +147,26 @@ private:
    // Goal 1 behavior (static test image, no hardware-derived properties).
    void ConnectToCamera();
 
-   ImgBuffer img_;
+   // Goal 3: starts real event-driven acquisition once ConnectToCamera() has
+   // succeeded -- queries sensor geometry, sizes the frame buffers/event
+   // accumulator, registers the CD callback, starts the frame-builder
+   // thread, and finally starts the camera streaming.
+   void StartEventStreaming();
+   void StopEventStreaming();
+
+   // CD event callback, invoked by the Metavision SDK on its own internal
+   // thread whenever a batch of events has been decoded. Just accumulates
+   // per-pixel counts under eventCountsLock_ -- all the actual frame
+   // rendering happens in BuildAndSwapFrame(), off this hot path.
+   void OnEventsCD(const Metavision::EventCD* begin, const Metavision::EventCD* end);
+
+   // Called by ProphEBSFrameBuilderThread every g_EventIntegrationMs: snapshots
+   // and resets the event-count accumulator, renders it into backImg_, then
+   // swaps front/back so GetImageBuffer()/InsertImage() start returning the
+   // newly-built frame. Readers of frontImg_ never see a partially-written
+   // buffer because the frame builder only ever writes to backImg_.
+   void BuildAndSwapFrame();
+
    bool initialized_;
    double exposure_ms_;
    unsigned roiX_;
@@ -134,8 +179,7 @@ private:
    friend class ProphEBSSequenceThread;
 
    // Goal 2: real EBS connection state. cam_ is default-constructed (not
-   // connected to anything) until ConnectToCamera() succeeds; it is not used
-   // for image acquisition yet (that's Goal 3).
+   // connected to anything) until ConnectToCamera() succeeds.
    Metavision::Camera cam_;
    bool cameraConnected_;
    std::string connectionStatus_;
@@ -143,6 +187,33 @@ private:
    std::string cameraSerial_;
    std::string connectionType_;
    std::string integrator_;
+
+   // Goal 3: real sensor geometry (from Metavision::I_Geometry), valid only
+   // when cameraConnected_ is true; otherwise the g_TestImageWidth/Height
+   // fallback geometry applies instead.
+   unsigned sensorWidth_;
+   unsigned sensorHeight_;
+
+   // Double-buffered frame: frontImg_ is what GetImageBuffer()/InsertImage()
+   // return; backImg_ is what BuildAndSwapFrame() renders into before the
+   // pointers are swapped under frontImgLock_. In the no-hardware fallback
+   // path only frontImg_ (holding the static test pattern) is ever used.
+   ImgBuffer imgBufferA_;
+   ImgBuffer imgBufferB_;
+   ImgBuffer* frontImg_;
+   ImgBuffer* backImg_;
+   mutable MMThreadLock frontImgLock_;
+
+   // Per-pixel CD event counts accumulated since the last integration
+   // window, written by OnEventsCD() (Metavision's callback thread) and
+   // consumed/reset by BuildAndSwapFrame() (frame-builder thread).
+   std::vector<uint32_t> eventCounts_;
+   MMThreadLock eventCountsLock_;
+
+   bool streaming_;
+   Metavision::CallbackId cdCallbackId_;
+   ProphEBSFrameBuilderThread* frameBuilderThd_;
+   friend class ProphEBSFrameBuilderThread;
 };
 
 //////////////////////////////////////////////////////////////////////////////
@@ -170,6 +241,36 @@ private:
    double intervalMs_;
    long numImages_;
    long imageCounter_;
+   bool stop_;
+   MMThreadLock stopLock_;
+};
+
+//////////////////////////////////////////////////////////////////////////////
+// ProphEBSFrameBuilderThread
+//
+// Goal 3: runs continuously (independent of MicroManager's Live/Snap state)
+// once a real EBS is connected and streaming. Every g_EventIntegrationMs it
+// calls CProphEBSCamera::BuildAndSwapFrame() to turn the events accumulated
+// over that window into the next displayable frame. This models the real
+// sensor's own behavior of continuously producing frames while streaming --
+// SnapImage()/Live view just read whatever the latest built frame is,
+// rather than driving the integration themselves.
+//////////////////////////////////////////////////////////////////////////////
+class ProphEBSFrameBuilderThread : public MMDeviceThreadBase
+{
+public:
+   explicit ProphEBSFrameBuilderThread(CProphEBSCamera* pCamera);
+   ~ProphEBSFrameBuilderThread();
+
+   void Start(double intervalMs);
+   void Stop();
+   bool IsStopped();
+
+private:
+   int svc();
+
+   CProphEBSCamera* camera_;
+   double intervalMs_;
    bool stop_;
    MMThreadLock stopLock_;
 };

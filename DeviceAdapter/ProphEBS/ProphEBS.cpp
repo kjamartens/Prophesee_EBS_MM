@@ -3,7 +3,7 @@
 // PROJECT:       Micro-Manager
 // SUBSYSTEM:     DeviceAdapters
 //-----------------------------------------------------------------------------
-// DESCRIPTION:   Device adapter for the Prophesee EBS camera (Goal 1 + 2).
+// DESCRIPTION:   Device adapter for the Prophesee EBS camera (Goals 1-3).
 //                See ProphEBS.h for the full design rationale.
 //
 // COPYRIGHT:     Koen J.A. Martens, 2026
@@ -18,6 +18,7 @@
 #include "CameraImageMetadata.h"
 #include "ModuleInterface.h"
 
+#include <metavision/hal/facilities/i_geometry.h>
 #include <metavision/hal/facilities/i_hw_identification.h>
 
 #include <algorithm>
@@ -59,16 +60,26 @@ CProphEBSCamera::CProphEBSCamera() :
    cameraModel_("N/A"),
    cameraSerial_("N/A"),
    connectionType_("N/A"),
-   integrator_("N/A")
+   integrator_("N/A"),
+   sensorWidth_(g_TestImageWidth),
+   sensorHeight_(g_TestImageHeight),
+   frontImg_(&imgBufferA_),
+   backImg_(&imgBufferB_),
+   streaming_(false),
+   cdCallbackId_(),
+   frameBuilderThd_(nullptr)
 {
    InitializeDefaultErrorMessages();
    thd_ = new ProphEBSSequenceThread(this);
+   frameBuilderThd_ = new ProphEBSFrameBuilderThread(this);
 }
 
 CProphEBSCamera::~CProphEBSCamera()
 {
    StopSequenceAcquisition();
+   StopEventStreaming();
    delete thd_;
+   delete frameBuilderThd_;
 }
 
 void CProphEBSCamera::GetName(char* name) const
@@ -101,7 +112,7 @@ int CProphEBSCamera::Initialize()
       return nRet;
 
    nRet = CreateStringProperty(MM::g_Keyword_Description,
-      "Prophesee EBS Camera adapter (Goal 2: EBS connection + identification)", true);
+      "Prophesee EBS Camera adapter (Goal 3: minimal event-integration video feed)", true);
    if (DEVICE_OK != nRet)
       return nRet;
 
@@ -136,7 +147,20 @@ int CProphEBSCamera::Initialize()
    if (DEVICE_OK != nRet)
       return nRet;
 
-   GenerateTestImage();
+   if (cameraConnected_)
+   {
+      // Full-frame ROI over the real sensor geometry, replacing the Goal 1
+      // defaults sized to the fallback test image.
+      roiX_ = 0;
+      roiY_ = 0;
+      roiXSize_ = sensorWidth_;
+      roiYSize_ = sensorHeight_;
+      StartEventStreaming();
+   }
+   else
+   {
+      GenerateTestImage();
+   }
 
    initialized_ = true;
    return DEVICE_OK;
@@ -144,11 +168,11 @@ int CProphEBSCamera::Initialize()
 
 int CProphEBSCamera::Shutdown()
 {
+   StopEventStreaming();
    if (cameraConnected_)
    {
-      // Camera was never start()-ed (no event streaming yet in Goal 2), so
-      // there is nothing to stop -- just release the HAL device handle by
-      // replacing cam_ with a fresh, unopened Camera.
+      // Release the HAL device handle by replacing cam_ with a fresh,
+      // unopened Camera.
       cam_ = Metavision::Camera();
       cameraConnected_ = false;
    }
@@ -189,12 +213,21 @@ void CProphEBSCamera::ConnectToCamera()
                   << "." << sensorInfo.minor_version_ << ")";
       cameraModel_ = modelStream.str();
 
+      // Real sensor geometry, used from here on instead of the
+      // g_TestImageWidth/Height fallback (throws CameraException, caught
+      // below, on the same unusual "no I_Geometry facility" condition as
+      // I_HW_Identification above).
+      Metavision::I_Geometry& geometry = cam_.get_facility<Metavision::I_Geometry>();
+      sensorWidth_ = static_cast<unsigned>(geometry.get_width());
+      sensorHeight_ = static_cast<unsigned>(geometry.get_height());
+
       cameraConnected_ = true;
       connectionStatus_ = "Connected";
 
       std::ostringstream logMsg;
       logMsg << "ProphEBS: connected to " << cameraModel_ << ", serial=" << cameraSerial_
-             << ", connection=" << connectionType_;
+             << ", connection=" << connectionType_ << ", geometry=" << sensorWidth_ << "x"
+             << sensorHeight_;
       LogMessage(logMsg.str(), false);
    }
    catch (const std::exception& e)
@@ -213,15 +246,119 @@ void CProphEBSCamera::ConnectToCamera()
 }
 
 /**
- * Fills img_ with a fixed checkerboard + gradient pattern. Generated once
- * (not per-Snap) since Goal 1 has no real data source -- every Snap simply
- * returns the same buffer. Goal 3 replaces this with the actual event
- * integration frame.
+ * Goal 3: starts real event-driven acquisition. Only called from
+ * Initialize() when ConnectToCamera() has already set cameraConnected_ and
+ * sensorWidth_/sensorHeight_. Sizes both frame buffers and the event
+ * accumulator to the real sensor geometry, registers the CD callback,
+ * starts the frame-builder thread, then starts the camera itself -- in that
+ * order, so no events can arrive before there's somewhere for them to go.
+ */
+void CProphEBSCamera::StartEventStreaming()
+{
+   imgBufferA_.Resize(sensorWidth_, sensorHeight_, 1);
+   imgBufferB_.Resize(sensorWidth_, sensorHeight_, 1);
+   frontImg_ = &imgBufferA_;
+   backImg_ = &imgBufferB_;
+
+   eventCounts_.assign(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+
+   cdCallbackId_ = cam_.cd().add_callback(
+      [this](const Metavision::EventCD* begin, const Metavision::EventCD* end)
+      {
+         OnEventsCD(begin, end);
+      });
+
+   frameBuilderThd_->Start(g_EventIntegrationMs);
+
+   cam_.start();
+   streaming_ = true;
+
+   std::ostringstream startMsg;
+   startMsg << "ProphEBS: event streaming started, integrating " << g_EventIntegrationMs << " ms per frame";
+   LogMessage(startMsg.str(), false);
+}
+
+/**
+ * Stops event streaming and undoes StartEventStreaming(), in reverse order:
+ * stop the camera first (no more events can arrive), then the frame-builder
+ * thread, then unregister the callback. Safe to call even if streaming was
+ * never started (e.g. no camera connected) or already stopped.
+ */
+void CProphEBSCamera::StopEventStreaming()
+{
+   if (!streaming_)
+      return;
+
+   cam_.stop();
+   frameBuilderThd_->Stop();
+   cam_.cd().remove_callback(cdCallbackId_);
+   streaming_ = false;
+}
+
+/**
+ * Called by the Metavision SDK on its own internal thread for each decoded
+ * batch of CD events. Kept minimal -- just increments per-pixel counts under
+ * eventCountsLock_ -- since this runs on the hot path for however many
+ * events/sec the sensor is producing; all actual frame rendering happens
+ * later, in BuildAndSwapFrame(), off this thread.
+ */
+void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavision::EventCD* end)
+{
+   MMThreadGuard g(eventCountsLock_);
+   for (const Metavision::EventCD* ev = begin; ev != end; ++ev)
+   {
+      if (ev->x < sensorWidth_ && ev->y < sensorHeight_)
+      {
+         uint32_t& count = eventCounts_[static_cast<size_t>(ev->y) * sensorWidth_ + ev->x];
+         if (count < UINT32_MAX)
+            count++;
+      }
+   }
+}
+
+/**
+ * Called by ProphEBSFrameBuilderThread every g_EventIntegrationMs. Snapshots
+ * and resets the event-count accumulator (briefly locking eventCountsLock_,
+ * which OnEventsCD() also briefly locks per event batch), renders those
+ * counts into backImg_ as an 8-bit grayscale frame, then swaps front/back
+ * under frontImgLock_ so subsequent GetImageBuffer()/InsertImage() calls
+ * return the newly-built frame. backImg_ (the old frontImg_) is only
+ * written again on the next call to this function, one integration window
+ * later, so readers of frontImg_ never see a partially-written buffer.
+ */
+void CProphEBSCamera::BuildAndSwapFrame()
+{
+   std::vector<uint32_t> counts(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+   {
+      MMThreadGuard g(eventCountsLock_);
+      counts.swap(eventCounts_);
+      eventCounts_.assign(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+   }
+
+   unsigned char* pixels = backImg_->GetPixelsRW();
+   for (size_t i = 0; i < counts.size(); i++)
+   {
+      unsigned value = counts[i] * g_EventIntensityScale;
+      pixels[i] = static_cast<unsigned char>(value > 255 ? 255 : value);
+   }
+
+   {
+      MMThreadGuard g(frontImgLock_);
+      std::swap(frontImg_, backImg_);
+   }
+}
+
+/**
+ * Fills frontImg_ with a fixed checkerboard + gradient pattern. Generated
+ * once (not per-Snap) since the no-hardware fallback has no real data source
+ * -- every Snap simply returns the same buffer. Only used when
+ * cameraConnected_ is false; StartEventStreaming() takes over frontImg_/
+ * backImg_ otherwise.
  */
 void CProphEBSCamera::GenerateTestImage()
 {
-   img_.Resize(g_TestImageWidth, g_TestImageHeight, 1);
-   unsigned char* pixels = img_.GetPixelsRW();
+   frontImg_->Resize(g_TestImageWidth, g_TestImageHeight, 1);
+   unsigned char* pixels = frontImg_->GetPixelsRW();
 
    const unsigned checkerSize = 32;
    for (unsigned y = 0; y < g_TestImageHeight; y++)
@@ -237,29 +374,35 @@ void CProphEBSCamera::GenerateTestImage()
 
 int CProphEBSCamera::SnapImage()
 {
-   // No hardware to trigger yet -- the buffer already holds the static test
-   // pattern generated in Initialize().
+   // No shutter to trigger -- frontImg_ already holds either the static test
+   // pattern (no hardware) or the most recently built event-integration
+   // frame (real camera streaming continuously via the frame-builder
+   // thread); either way this is a no-op.
    return DEVICE_OK;
 }
 
 const unsigned char* CProphEBSCamera::GetImageBuffer()
 {
-   return img_.GetPixels();
+   MMThreadGuard g(frontImgLock_);
+   return frontImg_->GetPixels();
 }
 
 unsigned CProphEBSCamera::GetImageWidth() const
 {
-   return img_.Width();
+   MMThreadGuard g(frontImgLock_);
+   return frontImg_->Width();
 }
 
 unsigned CProphEBSCamera::GetImageHeight() const
 {
-   return img_.Height();
+   MMThreadGuard g(frontImgLock_);
+   return frontImg_->Height();
 }
 
 unsigned CProphEBSCamera::GetImageBytesPerPixel() const
 {
-   return img_.Depth();
+   MMThreadGuard g(frontImgLock_);
+   return frontImg_->Depth();
 }
 
 unsigned CProphEBSCamera::GetBitDepth() const
@@ -269,7 +412,8 @@ unsigned CProphEBSCamera::GetBitDepth() const
 
 long CProphEBSCamera::GetImageBufferSize() const
 {
-   return img_.Width() * img_.Height() * img_.Depth();
+   MMThreadGuard g(frontImgLock_);
+   return frontImg_->Width() * frontImg_->Height() * frontImg_->Depth();
 }
 
 double CProphEBSCamera::GetExposure() const
@@ -312,8 +456,8 @@ int CProphEBSCamera::ClearROI()
 {
    roiX_ = 0;
    roiY_ = 0;
-   roiXSize_ = g_TestImageWidth;
-   roiYSize_ = g_TestImageHeight;
+   roiXSize_ = sensorWidth_;
+   roiYSize_ = sensorHeight_;
    return DEVICE_OK;
 }
 
@@ -378,8 +522,23 @@ int CProphEBSCamera::InsertImage()
    std::string elapsed = CDeviceUtils::ConvertToString((timeStamp - sequenceStartTime_).getMsec());
    md.AddTag(MM::g_Keyword_Elapsed_Time_ms, elapsed);
 
-   return GetCoreCallback()->InsertImage(this, img_.GetPixels(), GetImageWidth(), GetImageHeight(),
-      GetImageBytesPerPixel(), GetNumberOfComponents(), md.Serialize());
+   // Snapshot frontImg_'s pointer/dimensions under lock, then insert outside
+   // the lock -- InsertImage() copies synchronously, and frontImg_'s memory
+   // stays untouched until at least the next integration window (see
+   // BuildAndSwapFrame()), so this is safe without holding the lock across
+   // the copy.
+   const unsigned char* pixels;
+   unsigned width, height, bytesPerPixel;
+   {
+      MMThreadGuard g(frontImgLock_);
+      pixels = frontImg_->GetPixels();
+      width = frontImg_->Width();
+      height = frontImg_->Height();
+      bytesPerPixel = frontImg_->Depth();
+   }
+
+   return GetCoreCallback()->InsertImage(this, pixels, width, height,
+      bytesPerPixel, GetNumberOfComponents(), md.Serialize());
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -450,4 +609,62 @@ int ProphEBSSequenceThread::svc()
    }
    camera_->GetCoreCallback()->AcqFinished(camera_, 0);
    return ret;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// ProphEBSFrameBuilderThread implementation
+///////////////////////////////////////////////////////////////////////////////
+
+ProphEBSFrameBuilderThread::ProphEBSFrameBuilderThread(CProphEBSCamera* pCamera) :
+   camera_(pCamera),
+   intervalMs_(g_EventIntegrationMs),
+   stop_(true)
+{
+}
+
+ProphEBSFrameBuilderThread::~ProphEBSFrameBuilderThread()
+{
+}
+
+void ProphEBSFrameBuilderThread::Start(double intervalMs)
+{
+   intervalMs_ = intervalMs;
+   {
+      MMThreadGuard g(stopLock_);
+      stop_ = false;
+   }
+   activate();
+}
+
+void ProphEBSFrameBuilderThread::Stop()
+{
+   {
+      MMThreadGuard g(stopLock_);
+      stop_ = true;
+   }
+   wait();
+}
+
+bool ProphEBSFrameBuilderThread::IsStopped()
+{
+   MMThreadGuard g(stopLock_);
+   return stop_;
+}
+
+int ProphEBSFrameBuilderThread::svc()
+{
+   try
+   {
+      while (!IsStopped())
+      {
+         CDeviceUtils::SleepMs(static_cast<long>(std::max(1.0, intervalMs_)));
+         if (!IsStopped())
+            camera_->BuildAndSwapFrame();
+      }
+   }
+   catch (...)
+   {
+      camera_->LogMessage("Exception in ProphEBSFrameBuilderThread::svc", false);
+   }
+   return DEVICE_OK;
 }

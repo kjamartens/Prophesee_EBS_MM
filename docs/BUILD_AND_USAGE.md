@@ -364,6 +364,41 @@ in, **Goal 2 is verified working** — let the project owner know so we can
 tag this as `v0.2` and move on to Goal 3 (minimal video feed from real
 events).
 
+## Goal 3 (Minimal video feed)
+
+### What's new
+
+With a real EBS connected, the adapter now streams actual events from the
+camera instead of showing the static checkerboard: every 100 ms, the CD
+(contrast-detection) events the sensor produced during that window are
+integrated into a per-pixel count and rendered as an 8-bit grayscale image —
+brighter pixels mean more events landed there recently. This runs
+continuously in the background as long as the camera is connected, not just
+while Live is open. With no camera connected, nothing changes from Goal 1/2
+— you still get the static checkerboard.
+
+### 9. Watch a live event feed
+
+1. Make sure your EBS camera is plugged in **before** adding/initializing the
+   device (same requirement as Goal 2, step 8.1).
+2. In the main MicroManager window, select `ProphEBS-Camera` and click
+   **Live**.
+3. Wave a hand, move an object, or change the lighting in front of the
+   sensor. You should see bright pixels appear and move in the ImageJ Live
+   window, tracking whatever is moving/changing in the sensor's field of
+   view. A perfectly static, unchanging scene will look mostly black — that
+   is correct behavior for an event camera (it only reports *changes* in
+   brightness, not a continuous image like a regular camera).
+4. Try **Snap** too — it should show a snapshot of whatever the current
+   100 ms integration window looks like at that instant.
+5. Open the **Device/Property Browser** and confirm the `EBS-*` properties
+   from Goal 2 still read correctly — Goal 3 doesn't change those.
+
+If you see the feed reacting to real movement/light changes in front of the
+sensor (not just a static or blank image), **Goal 3 is verified working** —
+let the project owner know so we can tag this as `v0.3` and move on to
+Goal 4 (recording capabilities).
+
 ## Troubleshooting MicroManager itself
 
 | Symptom | Likely cause |
@@ -372,3 +407,4 @@ events).
 | `ProphEBS` appears as a flat entry marked **"(unavailable)"** instead of an expandable folder with `ProphEBS-Camera` inside it | **Device interface version mismatch** — your installed MicroManager build and the `mmgr_dal_ProphEBS.dll` you built expect different interface versions. Run `tools\mm_python_env\Scripts\mmcore list` (see step 1c) to see the required version and whether your active install matches; if not, get a newer/matching nightly build via `mmcore install` (or the no-admin workaround) |
 | MicroManager crashes or shows a popup error when adding the device | Copy the exact error text and the relevant lines from the CoreLog around the crash — this is the most useful debugging info |
 | Live/Snap shows a black image or an error instead of the checkerboard | Note down what MicroManager's status bar / log says at that moment |
+| Goal 3: Live view stays completely black even while waving a hand in front of the sensor | Check `EBS-ConnectionStatus` is `Connected` first (if not, you're still seeing the Goal 1/2 static checkerboard, not a live feed). If connected, check the sensor lens isn't covered, and that you're close enough / moving enough to actually generate events — event cameras only report brightness *changes* |
