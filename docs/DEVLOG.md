@@ -98,7 +98,7 @@ The user's existing MicroManager install (`Micro-Manager_2.0.3_20260225`, from `
 
 ## Goal 3 — Minimal video feed
 
-### Status: BUILT — verified via pymmcore-plus with a real EBS plugged in; awaiting user confirmation in the MicroManager GUI itself
+### Status: DONE — confirmed working by user, tagged v0.3
 
 ### What was built
 - **Real sensor geometry.** `ConnectToCamera()` now also reads `cam_.get_facility<Metavision::I_Geometry>()` for `sensorWidth_`/`sensorHeight_`, replacing the `g_TestImageWidth`/`g_TestImageHeight` fallback constants whenever a camera is connected (confirmed on hardware: IMX636 reports 1280×720). `Initialize()` resets the ROI to the full real frame in that case.
@@ -122,7 +122,7 @@ The user's existing MicroManager install (`Micro-Manager_2.0.3_20260225`, from `
 - **Build**: `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64` succeeds with 0 warnings/errors (same VS2022 Preview toolset as Goals 1/2).
 - **Real hardware, via `tools/test_prophebs.py`**: `EBS-ConnectionStatus = Connected`, `EBS-Model = IMX636 (Gen 4.2)`; `snapImage`/`getImage` returned `(720, 1280) uint8` — the real sensor geometry, not the Goal 1/2 640×480 fallback. Two snaps 250 ms apart both succeeded; a 500 ms continuous Live-style sequence acquisition buffered 34 frames without error.
 - **Real event data confirmed, not zeros**: an ad hoc script snapping 5 frames ~150 ms apart showed nonzero pixel counts climbing from 89 to 124811 (out of 921600 pixels) with `max()=255` throughout — real ambient-light/motion-driven CD events landing on the sensor and being integrated correctly, not a stub or all-black frame.
-- **Not yet verified**: the full MicroManager GUI Live/Snap view actually *showing* a live event image (the pymmcore-plus harness confirms the same `Initialize()`/`SnapImage()`/sequence-acquisition code path MicroManager itself drives, but the user should still watch Live in the real GUI — ideally waving a hand or moving something in front of the sensor — before this is tagged `v0.3`).
+- **Full MicroManager GUI Live/Snap view confirmed by user**: the live feed visibly reacted to real movement/light changes in front of the sensor.
 
 ### Open questions / TODO for later goals
 - `g_EventIntensityScale = 32` is an arbitrary default, not calibrated against any particular scene/lighting — expect the live image to look very dim or oversaturated depending on ambient conditions until Goal 6 makes integration/gain configurable.
