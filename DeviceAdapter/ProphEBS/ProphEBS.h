@@ -3,20 +3,29 @@
 // PROJECT:       Micro-Manager
 // SUBSYSTEM:     DeviceAdapters
 //-----------------------------------------------------------------------------
-// DESCRIPTION:   Goal 1 (barebones) device adapter for the Prophesee event-based
-//                sensor (EBS) camera.
+// DESCRIPTION:   Prophesee event-based sensor (EBS) camera device adapter.
 //
-//                This is intentionally NOT connected to any Prophesee/Metavision
-//                hardware or SDK yet. It exists purely to prove that a custom
-//                MicroManager camera DeviceAdapter can be built, loaded, and
-//                used from MicroManager (Hardware Configuration Wizard, Live
-//                view, Snap). Upon Initialize() it writes a debug message to
-//                the MicroManager CoreLog, and SnapImage() always returns the
-//                same static test pattern.
+//                Goal 1 (barebones): proved that a custom MicroManager camera
+//                DeviceAdapter can be built, loaded, and used from
+//                MicroManager (Hardware Configuration Wizard, Live view,
+//                Snap) with no real hardware -- SnapImage() always returned a
+//                static test pattern.
 //
-//                Real EBS connectivity, event integration, recording,
-//                properties, and ROI/pixel masking are added in later goals
-//                (see docs/DEVLOG.md at the repository root for the roadmap).
+//                Goal 2 (this revision) adds real Metavision SDK connectivity:
+//                Initialize() now tries to open the first available Prophesee
+//                camera via Metavision::Camera::from_first_available() and,
+//                if successful, reads back its model/serial/connection type
+//                via the HAL's I_HW_Identification facility and exposes them
+//                as read-only MM properties. If no camera is found (or the
+//                Metavision SDK/driver isn't installed), Initialize() does
+//                NOT fail -- it logs why and falls back to the Goal 1 static
+//                test image, so the adapter still loads and is testable on a
+//                machine with no EBS attached. SnapImage() still returns the
+//                static test pattern; real event-driven frames are Goal 3.
+//
+//                Event integration, recording, tunable properties, and
+//                ROI/pixel masking are added in later goals (see
+//                docs/DEVLOG.md at the repository root for the roadmap).
 //
 // COPYRIGHT:     Koen J.A. Martens, 2026
 // LICENSE:       This file is distributed under the BSD license, consistent
@@ -32,10 +41,19 @@
 #include "DeviceThreads.h"
 #include "ImgBuffer.h"
 
+#include <metavision/sdk/stream/camera.h>
+
 #include <string>
 
 // Device name (defined in ProphEBS.cpp, referenced by ProphEBSModule.cpp)
 extern const char* g_ProphEBSCameraDeviceName;
+
+// Read-only MM property names used to surface Goal 2 connection info.
+extern const char* g_PropConnectionStatus;
+extern const char* g_PropModel;
+extern const char* g_PropSerial;
+extern const char* g_PropConnectionType;
+extern const char* g_PropIntegrator;
 
 // Fixed test-image geometry for Goal 1. Real sensor geometry will replace
 // this once the adapter actually queries the Prophesee HAL (Goal 2/3).
@@ -97,6 +115,12 @@ public:
 private:
    void GenerateTestImage();
 
+   // Tries Metavision::Camera::from_first_available(). Never throws and
+   // never fails Initialize() -- on any error it logs the reason and leaves
+   // cameraConnected_ false so the rest of Initialize() can fall back to
+   // Goal 1 behavior (static test image, no hardware-derived properties).
+   void ConnectToCamera();
+
    ImgBuffer img_;
    bool initialized_;
    double exposure_ms_;
@@ -108,6 +132,17 @@ private:
 
    ProphEBSSequenceThread* thd_;
    friend class ProphEBSSequenceThread;
+
+   // Goal 2: real EBS connection state. cam_ is default-constructed (not
+   // connected to anything) until ConnectToCamera() succeeds; it is not used
+   // for image acquisition yet (that's Goal 3).
+   Metavision::Camera cam_;
+   bool cameraConnected_;
+   std::string connectionStatus_;
+   std::string cameraModel_;
+   std::string cameraSerial_;
+   std::string connectionType_;
+   std::string integrator_;
 };
 
 //////////////////////////////////////////////////////////////////////////////

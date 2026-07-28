@@ -21,7 +21,7 @@
 MODULE_API void InitializeModuleData()
 {
    RegisterDevice(g_ProphEBSCameraDeviceName, MM::CameraDevice,
-      "Prophesee EBS Camera (Goal 1 barebones)");
+      "Prophesee EBS Camera");
 }
 
 MODULE_API MM::Device* CreateDevice(const char* deviceName)

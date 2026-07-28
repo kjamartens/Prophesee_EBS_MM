@@ -3,7 +3,7 @@
 // PROJECT:       Micro-Manager
 // SUBSYSTEM:     DeviceAdapters
 //-----------------------------------------------------------------------------
-// DESCRIPTION:   Goal 1 (barebones) device adapter for the Prophesee EBS camera.
+// DESCRIPTION:   Device adapter for the Prophesee EBS camera (Goal 1 + 2).
 //                See ProphEBS.h for the full design rationale.
 //
 // COPYRIGHT:     Koen J.A. Martens, 2026
@@ -18,14 +18,24 @@
 #include "CameraImageMetadata.h"
 #include "ModuleInterface.h"
 
+#include <metavision/hal/facilities/i_hw_identification.h>
+
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 
 // Name used by MicroManager to refer to this device, and to load it from the
 // "mmgr_dal_ProphEBS.dll" library (see ProphEBSModule.cpp).
 const char* g_ProphEBSCameraDeviceName = "ProphEBS-Camera";
+
+// Goal 2 read-only property names.
+const char* g_PropConnectionStatus = "EBS-ConnectionStatus";
+const char* g_PropModel = "EBS-Model";
+const char* g_PropSerial = "EBS-Serial";
+const char* g_PropConnectionType = "EBS-ConnectionType";
+const char* g_PropIntegrator = "EBS-Integrator";
 
 ///////////////////////////////////////////////////////////////////////////////
 // CProphEBSCamera implementation
@@ -43,7 +53,13 @@ CProphEBSCamera::CProphEBSCamera() :
    roiY_(0),
    roiXSize_(g_TestImageWidth),
    roiYSize_(g_TestImageHeight),
-   thd_(nullptr)
+   thd_(nullptr),
+   cameraConnected_(false),
+   connectionStatus_("Not connected"),
+   cameraModel_("N/A"),
+   cameraSerial_("N/A"),
+   connectionType_("N/A"),
+   integrator_("N/A")
 {
    InitializeDefaultErrorMessages();
    thd_ = new ProphEBSSequenceThread(this);
@@ -66,28 +82,57 @@ bool CProphEBSCamera::Busy()
 }
 
 /**
- * Initializes the "hardware". For Goal 1 there is no real EBS connection --
- * this method logs a debug message so the user can confirm (via the
- * MicroManager CoreLog) that the adapter loaded and initialized correctly,
- * then builds the static test image that SnapImage() will keep returning.
+ * Initializes the device. Goal 2 adds a real connection attempt to a
+ * Prophesee EBS via the Metavision SDK (see ConnectToCamera()); whether or
+ * not that succeeds, Initialize() still logs its own debug message and
+ * builds the static test image, so this adapter remains loadable/testable
+ * on machines with no EBS attached (Goal 1 behavior is preserved as a
+ * fallback, not replaced).
  */
 int CProphEBSCamera::Initialize()
 {
    if (initialized_)
       return DEVICE_OK;
 
-   LogMessage("ProphEBS adapter initialized (Goal 1 barebones - no EBS hardware connected yet)", false);
+   LogMessage("ProphEBS adapter initializing...", false);
 
    int nRet = CreateStringProperty(MM::g_Keyword_Name, g_ProphEBSCameraDeviceName, true);
    if (DEVICE_OK != nRet)
       return nRet;
 
    nRet = CreateStringProperty(MM::g_Keyword_Description,
-      "Prophesee EBS Camera adapter (Goal 1: barebones, static test image)", true);
+      "Prophesee EBS Camera adapter (Goal 2: EBS connection + identification)", true);
    if (DEVICE_OK != nRet)
       return nRet;
 
    nRet = CreateFloatProperty(MM::g_Keyword_Exposure, exposure_ms_, false);
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   // Binning isn't meaningful yet (no real sensor) -- only 1x1 is offered,
+   // matching GetBinning()/SetBinning() below.
+   nRet = CreateStringProperty(MM::g_Keyword_Binning, "1", false);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = AddAllowedValue(MM::g_Keyword_Binning, "1");
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   ConnectToCamera();
+
+   nRet = CreateStringProperty(g_PropConnectionStatus, connectionStatus_.c_str(), true);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = CreateStringProperty(g_PropModel, cameraModel_.c_str(), true);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = CreateStringProperty(g_PropSerial, cameraSerial_.c_str(), true);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = CreateStringProperty(g_PropConnectionType, connectionType_.c_str(), true);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = CreateStringProperty(g_PropIntegrator, integrator_.c_str(), true);
    if (DEVICE_OK != nRet)
       return nRet;
 
@@ -99,8 +144,72 @@ int CProphEBSCamera::Initialize()
 
 int CProphEBSCamera::Shutdown()
 {
+   if (cameraConnected_)
+   {
+      // Camera was never start()-ed (no event streaming yet in Goal 2), so
+      // there is nothing to stop -- just release the HAL device handle by
+      // replacing cam_ with a fresh, unopened Camera.
+      cam_ = Metavision::Camera();
+      cameraConnected_ = false;
+   }
    initialized_ = false;
    return DEVICE_OK;
+}
+
+/**
+ * Attempts to open the first available Prophesee EBS via the Metavision
+ * SDK. On success, reads back identification info (serial, sensor name,
+ * connection type, integrator) through the HAL's I_HW_Identification
+ * facility so it can be exposed as read-only MM properties -- this is the
+ * "report back the model number/serial so we can assure the connection is
+ * good" requirement from Goal 2.
+ *
+ * Deliberately does not throw and does not fail Initialize(): a missing
+ * camera (or missing Metavision driver/plugin) is an expected condition
+ * during development without hardware attached, not a fatal adapter error.
+ */
+void CProphEBSCamera::ConnectToCamera()
+{
+   try
+   {
+      cam_ = Metavision::Camera::from_first_available();
+
+      // Throws CameraException (caught below) if the facility isn't
+      // available -- every real Prophesee device registers it, so this only
+      // trips for unusual/unsupported hardware.
+      Metavision::I_HW_Identification& hwId = cam_.get_facility<Metavision::I_HW_Identification>();
+
+      cameraSerial_ = hwId.get_serial();
+      connectionType_ = hwId.get_connection_type();
+      integrator_ = hwId.get_integrator();
+
+      Metavision::I_HW_Identification::SensorInfo sensorInfo = hwId.get_sensor_info();
+      std::ostringstream modelStream;
+      modelStream << sensorInfo.name_ << " (Gen " << sensorInfo.major_version_
+                  << "." << sensorInfo.minor_version_ << ")";
+      cameraModel_ = modelStream.str();
+
+      cameraConnected_ = true;
+      connectionStatus_ = "Connected";
+
+      std::ostringstream logMsg;
+      logMsg << "ProphEBS: connected to " << cameraModel_ << ", serial=" << cameraSerial_
+             << ", connection=" << connectionType_;
+      LogMessage(logMsg.str(), false);
+   }
+   catch (const std::exception& e)
+   {
+      // Covers Metavision::CameraException (thrown when no camera is found,
+      // the driver isn't installed, or the HAL plugin can't load) as well as
+      // any other std::exception the SDK might raise.
+      cameraConnected_ = false;
+      connectionStatus_ = std::string("Not connected: ") + e.what();
+
+      std::ostringstream logMsg;
+      logMsg << "ProphEBS: no EBS camera connected (" << e.what()
+             << ") -- falling back to static test image, as in Goal 1";
+      LogMessage(logMsg.str(), false);
+   }
 }
 
 /**

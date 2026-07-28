@@ -1,7 +1,11 @@
-# Build & Usage Tutorial — Goal 1 (Barebones Device Adapter)
+# Build & Usage Tutorial
 
 This tutorial assumes no prior experience building C++ software or using
-MicroManager. Follow it top to bottom the first time.
+MicroManager. Follow it top to bottom the first time. Goal 1 setup (below)
+still applies to Goal 2 — Goal 2 only adds one extra software install
+(section 1d) and new things to check in MicroManager (section 8).
+
+## Goal 1 (Barebones Device Adapter)
 
 ## What you're building
 
@@ -137,6 +141,43 @@ elevation is needed at all) using the free `innounp` tool.
    extracted copy should now show up, hopefully marked `(active)` if its
    interface version matches.
 
+### 1d. Prophesee Metavision SDK (needed from Goal 2 onward)
+
+Goal 2 adds a dependency on Prophesee's own **Metavision SDK** (the software
+that talks to the EBS hardware). If you're only building Goal 1, you can
+skip this. From Goal 2 onward, the adapter won't build without it.
+
+1. Download and run the Metavision SDK installer from
+   <https://docs.prophesee.ai/stable/get_started/index.html> (the "Installation"
+   page links to the current Windows installer). Use the default install
+   location, **`C:\Program Files\Prophesee`** — the project's build files
+   assume this path unless you override it (see below).
+2. The installer adds `C:\Program Files\Prophesee\bin` to your system `PATH`.
+   This matters twice: once at build time (not directly — the `.vcxproj`
+   references the install folder explicitly) and once at *run* time, because
+   `mmgr_dal_ProphEBS.dll` depends on `metavision_hal.dll`,
+   `metavision_sdk_base.dll`, and `metavision_sdk_stream.dll`, which
+   MicroManager needs to be able to find when it loads our adapter. If you
+   installed to a non-default location, or `PATH` didn't get updated, add
+   `<your-install-dir>\bin` to your `PATH` manually (Windows Settings → search
+   "environment variables" → **Edit environment variables for your account**
+   → `Path` → **New**), then log out/in (or restart your terminal) for it to
+   take effect.
+3. **If you installed Metavision somewhere other than
+   `C:\Program Files\Prophesee`**, pass its location to MSBuild when building
+   (Build → Configuration Manager won't have this option — use a terminal
+   build instead):
+   ```
+   MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64 /p:MetavisionSdkRoot="D:\Prophesee"
+   ```
+   (Building from inside the Visual Studio IDE always uses the default
+   `C:\Program Files\Prophesee` path.)
+4. You do **not** need an EBS camera physically connected to build or load
+   the adapter — Goal 2's connection attempt is designed to fail gracefully
+   (see the Goal 2 section below) so you can develop and test without
+   hardware. You only need the camera plugged in to verify the *connection*
+   itself works.
+
 ## 2. Get the source code
 
 Open a terminal (PowerShell is fine) and run:
@@ -186,6 +227,8 @@ git submodule update --init --recursive
 | `Cannot open include file: 'DeviceBase.h'` | Submodule wasn't cloned | Run `git submodule update --init --recursive` from the repo root, then reload the solution |
 | `TRACKER : error TRK0005: Failed to locate: "CL.exe"` | The C++ build tools component of Visual Studio isn't installed, or you launched a plain terminal instead of the IDE | Re-run the VS Installer and confirm "Desktop development with C++" is checked; if building from a terminal instead of the IDE, use the **"Developer Command Prompt for VS 2022"** (search for it in the Start menu) rather than a plain PowerShell/cmd window |
 | Solution won't load / "unsupported" project errors | Very old Visual Studio version | Make sure you installed **Visual Studio 2022** (not 2019 or earlier) |
+| `Cannot open include file: 'metavision/sdk/stream/camera.h'` or `'opencv2/core.hpp'` (Goal 2+) | Metavision SDK isn't installed, or is installed somewhere other than `C:\Program Files\Prophesee` | Install it (section 1d) or pass `/p:MetavisionSdkRoot="<your path>"` to MSBuild |
+| `unresolved external symbol` referencing `Metavision::...` at link time (Goal 2+) | Metavision `.lib` files not found/linked | Confirm `C:\Program Files\Prophesee\lib` (or your `MetavisionSdkRoot`) contains `metavision_hal.lib`, `metavision_sdk_base.lib`, `metavision_sdk_stream.lib` |
 | Build succeeds but into a `Debug` folder instead of `Release` | Configuration dropdown was left on "Debug" | Switch the dropdown to Release and rebuild (Debug DLLs also work in MicroManager, they're just slower and bulkier — Release is recommended) |
 
 ## 4. Install the adapter into MicroManager
@@ -268,6 +311,58 @@ A successful run prints `Snap OK. Image shape: (480, 640) dtype: uint8` and
 `SUCCESS`. This is useful for quickly confirming a rebuild still works after
 code changes, without reopening MicroManager each time — but it doesn't
 replace actually checking Live/Snap in the real GUI at least once.
+
+## Goal 2 (Connection to the EBS)
+
+### What's new
+
+The adapter now tries to connect to a real Prophesee EBS camera when it
+initializes, using the Metavision SDK (see section 1d above for installing
+it). Live/Snap still show the same Goal 1 static checkerboard — Goal 2 is
+only about *detecting and identifying* the camera, not yet pulling real
+image data from it (that's Goal 3).
+
+### 8. Check the connection properties
+
+1. Make sure your EBS camera is plugged in (USB) **before** you add/initialize
+   the device in MicroManager — the connection attempt happens once, during
+   `Initialize()`, which runs when the device is added via the Hardware
+   Configuration Wizard (or when `pymmcore-plus`/similar calls
+   `initializeDevice`). If you plug the camera in afterward, remove and
+   re-add the device (or restart MicroManager) to retry.
+2. In MicroManager, open the **Device Property Browser**: menu
+   **Tools → Device/Property Browser**.
+3. Find the row for your `ProphEBS-Camera` device and look for these
+   properties:
+   - **EBS-ConnectionStatus** — should read `Connected` if a camera was found.
+   - **EBS-Model** — the sensor name and generation (e.g. `Gen4.1 (Gen 4.1)`).
+   - **EBS-Serial** — the camera's serial number.
+   - **EBS-ConnectionType** — e.g. `USB`.
+   - **EBS-Integrator** — the hardware integrator name.
+
+   These are all read-only (grayed out) — they report what the adapter found,
+   you can't change them here.
+4. **If `EBS-ConnectionStatus` instead reads something like
+   `Not connected: ... Error 101001: Camera not found...`**, that means the
+   Metavision SDK loaded fine but didn't detect a camera. Check, in order:
+   - Is the camera actually plugged in and powered? Try unplugging/replugging
+     the USB cable.
+   - Does Prophesee's own tooling see it? Run
+     `"C:\Program Files\Prophesee\bin\metavision_platform_info.exe"` (or
+     similar bundled diagnostic tool — check `C:\Program Files\Prophesee\bin`
+     for what's available) to confirm the camera is visible outside
+     MicroManager entirely. If Prophesee's own tools don't see it either,
+     this is a hardware/driver problem, not an adapter problem.
+   - Re-add the device in MicroManager (Initialize only runs once per
+     add/load) after fixing the above.
+5. This message string is also written to the CoreLog (see step 6 above) —
+   search for `ProphEBS:` to find both the "connected to ..." success line
+   and the "no EBS camera connected (...)" fallback line.
+
+If `EBS-ConnectionStatus` reads `Connected` with a real model/serial filled
+in, **Goal 2 is verified working** — let the project owner know so we can
+tag this as `v0.2` and move on to Goal 3 (minimal video feed from real
+events).
 
 ## Troubleshooting MicroManager itself
 
