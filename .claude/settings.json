@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git submodule *)",
+      "Bash(python3 -c \"import uuid; print\\(str\\(uuid.uuid4\\(\\)\\).upper\\(\\)\\)\")",
+      "Bash(powershell -Command \"[guid]::NewGuid\\(\\).ToString\\(\\).ToUpper\\(\\)\")",
+      "Read(//c/Program Files/Microsoft Visual Studio/2022/**)",
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\Msbuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"C:\\\\GitHub\\\\Prophesee_EBS_MM\\\\DeviceAdapter\\\\ProphEBS\\\\ProphEBS.sln\" /p:Configuration=Release /p:Platform=x64 /m 2>&1)",
+      "Read(//c/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/**)",
+      "Bash(where python *)",
+      "Bash(where pip *)",
+      "Bash(python -m pip show pymmcore-plus)",
+      "Bash(python -m venv --help)",
+      "Bash(python -m venv tools/mm_python_env)"
+    ]
+  }
+}

@@ -1,0 +1,57 @@
+
+I want you to code the Metavision Prophesee event-based camera into MicroManager 2.0 software as a DeviceAdapter, so that we can control the event-based sensor (EBS) via micromanager on microscopes.
+
+Here i will give you some documentation you can look into, and some project goals.
+
+Documentation:
+The micro-manager API is described here:
+https://micro-manager.org/apidoc/mmstudio/latest/
+and here:
+https://micro-manager.org/Version_2.0_API
+
+Additionally, there are 3 examples provided (in the /micromanager_examples/ folder):
+The DemoCamera, which is a dummy camera. PVCAM, which is a state-of-the-art scientific camera integrator with many settings and products etc. TSI, which is a budget-type color camera. 
+Study these and learn from them.
+
+From the Metavision Prophesee side, 
+The C++ API getting started guide can be found here:
+https://docs.prophesee.ai/stable/get_started/get_started_cpp.html
+with compilation info here:
+https://docs.prophesee.ai/stable/samples/compilation/compilation.html#chapter-samples-cpp-compilation
+and some examples here:
+https://github.com/prophesee-ai/openeb
+of which i have included some in the folder /prophesee_examples/, where e.g. the events_integration might be interesting.
+
+Now on to the project goals. I will define a few of them, but I want you to stop work after each goal so I can test. Once this is complete, we upload it to github as v0.1, then continue to second goal, upload to v0.2, etc etc.
+
+1. Barebones device adapter
+A barebones DeviceAdapter which just sort of prints a debug message or shows a static image upon loading, so we can assure that everything is OK with our building etc etc.
+
+2. Connection to the EBS
+I want to be able to find a prophesee EBS when its connected to my PC (i.e. select/find a COM port, make connection, see its there, etc). Basically then I just want it to report back the model number or something trivial like this so we can assure that the ebs connection is good.
+
+3. Minimal video feed
+The EBS gives events, not frame data. I want to have a minimal video feed, which e.g. integrates the events from the past 100 ms and shows this every 100 ms as a camera frame in micromanager.
+
+4. Recording capabilities
+It's unsure up until now if we can actually record anything from within micromanager, so I want to ensure that I can record a multi-dimensional acquisition (e.g. 10 frames at 100 ms), which then creates simply the .raw file that is normally expected.
+
+5. Adding properties
+I want to add all properties that can be changed on the event-based sensor as micro-manager changeable properties (e.g. bias_on, hpf, etc). These should then change on the EBS and work etc.
+
+6. Adding custom view methods
+Get inspired by the EBS documentation to offer multiple view methods. Most importantly, I just want to be able to integrate for the past X time, maybe have an offset value so that it's never <0, maybe do some filters that are commonly used.
+
+7. Pixel-by-pixel differences
+I want to be able to block out individual pixels (basically just a list of indeces), as well as give a ROI of the EBS which is recorded.
+
+8. Full suite polishing
+Do a full sweep over everything and make proper tests, documentation, handle errors, etc etc.
+
+I also have some guidelines for you about the coding:
+For each goal, I want a full 'Current Status', and 'Build/Installation/Usage Tutorial'. Assume I'm a dummy and that you need to explain me *everything* about building a C++ program. What software do i need to have, what buttons to press, how to handle error messages, etc?
+Have proper documentation throughout the cpp files
+Have good documentation in the makefiles
+For the first goal, really give me detailed instructions on how to set everything up.
+Ask me questions if things are unclear!
+Ensure that you write good documentation for *yourself* so you can pick up where you left later. Keep track of what you want to do, what you did, what design decision you made and why, etc.

@@ -1,0 +1,16 @@
+/micromanager_examples
+/prophesee_examples
+
+# Visual Studio / MSBuild output
+[Bb]uild/
+*.vcxproj.user
+.vs/
+*.pdb
+*.ilk
+*.obj
+*.log
+
+# Local Python tooling (pymmcore-plus helper venv) - recreated via docs/BUILD_AND_USAGE.md
+/tools/mm_python_env/
+/tools/mm_install_test/
+
