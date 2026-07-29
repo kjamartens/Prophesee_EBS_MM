@@ -128,3 +128,578 @@ The user's existing MicroManager install (`Micro-Manager_2.0.3_20260225`, from `
 - `g_EventIntensityScale = 32` is an arbitrary default, not calibrated against any particular scene/lighting — expect the live image to look very dim or oversaturated depending on ambient conditions until Goal 6 makes integration/gain configurable.
 - No polarity distinction yet (ON vs OFF events both just increment the same counter) — a future goal could split these into separate channels or a diverging color map if that turns out to be useful.
 - Goal 4 (recording) is where these same per-frame buffers (or the raw event stream itself, still TBD) get written out to a real `.raw` file via multi-dimensional acquisition.
+
+## Goal 4 — Recording capabilities
+
+### Status: DONE — self-tested on real hardware, awaiting user GUI confirmation before tagging v0.4
+
+### Requirement clarification (asked user before implementing)
+
+The roadmap wording ("record a multi-dimensional acquisition ... which then
+creates simply the .raw file that is normally expected") was ambiguous
+between (a) just proving MM's own MDA/TIFF-stack saving works with this
+camera, or (b) producing the actual Metavision `.raw` event file via the
+SDK's native recording API. Asked the user directly — they confirmed **(b)**:
+hook MM's acquisition start/stop to call the Metavision SDK's own
+`cam_.start_recording()`/`stop_recording()`, producing the real Prophesee
+`.raw` event file.
+
+A second question came up during design: device adapters have no visibility
+into MM's MDA save directory (confirmed by grepping the `mmCoreAndDevices`
+submodule — no such API exists; PVCAM's real adapter hits the same wall and
+solves it with a plain settable property the user fills in by hand). The
+user pushed back asking why this can't be automatic. Investigated further:
+MM's save directory is a **Studio (Java)** concept, one layer above MMCore —
+Studio calls generic MMCore functions with no path info attached, so there
+is no hook inside the C++ device adapter to intercept it, full stop. Given
+that hard constraint, the user chose: keep the scripted approach (a small
+Beanshell script run in MM's Scripting Console bridges Studio's known path
+down into the device via `core.setProperty(...)`), **plus** a property to
+switch back to a fully automatic (if MDA-decoupled) path when the script
+isn't used.
+
+### What was built
+
+- **Metavision native raw recording**, wired into the existing
+  `StartSequenceAcquisition`/`StopSequenceAcquisition` methods (`ProphEBS.cpp`):
+  - `StartSequenceAcquisition(long numImages, double interval_ms, bool)` —
+    when `numImages != LONG_MAX` (i.e. **not** MicroManager's Live view,
+    which calls the unbounded overload with `LONG_MAX`) and a camera is
+    connected, calls the new `StartRawRecordingIfRequested()` before starting
+    the sequence thread.
+  - `StopSequenceAcquisition()` — calls the new `StopRawRecordingIfActive()`
+    after stopping the sequence thread.
+  - `ProphEBSSequenceThread::svc()` — a finite sequence reaching its
+    `numImages_` count ends the loop on its own thread, without ever calling
+    `StopSequenceAcquisition()`; added the same `StopRawRecordingIfActive()`
+    call right before `AcqFinished()` so the `.raw` file is always finalized,
+    not just on a user-triggered abort.
+- **Two new properties**:
+  - `EBS-RawFilePath` (string, read/write, default empty) — manual override.
+    Non-empty: used verbatim, skipping auto-discovery. Empty (the default):
+    the path is fully auto-discovered, see below.
+  - `EBS-RawRecordingStatus` (string, read/write — **not** created read-only,
+    since MM's `PropertyCollection::Set()` silently no-ops `SetProperty()`
+    calls on read-only properties even from the owning device, and this one
+    needs the device to update it live) — `Not recording`, `Recording to
+    <path>`, `Finished: <path>`, or `Failed: <reason>`.
+- **Automatic MDA-path discovery, entirely in C++, no scripting** (see the
+  "Getting to zero-configuration" section below for how this was arrived
+  at) — `TryGetMMAcquisitionRootPrefix()` and `FindMMUserProfilePath()`
+  (anonymous namespace, top of `ProphEBS.cpp`) read
+  `%LOCALAPPDATA%\Micro-Manager\UserProfiles\*.json` (MM Studio's own
+  persisted UI-state file) using `boost::property_tree`'s JSON parser
+  (header-only, already vendored under
+  `C:\Program Files\Prophesee\third_party\include\boost\` by the Metavision
+  SDK install -- no new `.vcxproj` dependency needed) to extract the Multi-D
+  Acquisition dialog's current save root/prefix. `GenerateAutoRawFilePath()`
+  (`Documents\ProphEBS_Recordings\ProphEBS_TIMESTAMP.raw`) is the last-resort
+  fallback if that lookup fails for any reason.
+- Extended `tools/test_prophebs.py` with three checks (only run when
+  `EBS-ConnectionStatus == "Connected"`, same guard as the Goal 3 checks):
+  a 10-frame acquisition with `EBS-RawFilePath` left empty produces a
+  non-empty `.raw` file at the auto-discovered path; an explicit
+  `EBS-RawFilePath` override does the same at the exact path given; and a
+  Live-view burst (`startContinuousSequenceAcquisition`) does **not** start
+  any recording (`EBS-RawRecordingStatus` never reads `Recording to ...`
+  afterward) — confirming the Live-vs-MDA distinction actually holds.
+
+### Design decisions (and why)
+
+- **Distinguish MDA from Live view via `numImages == LONG_MAX`, not a new
+  property.** `StartSequenceAcquisition(double)` (what Live view calls) was
+  already implemented as a thin wrapper forwarding `LONG_MAX` to the finite
+  overload (see Goal 1) — this existing signal is exactly "unbounded stream"
+  vs. "known-length sequence," which maps directly onto "don't record Live"
+  vs. "do record an MDA" with no new state needed.
+- **Raw recording failure never fails the acquisition.** Wrapped in
+  try/catch, reported via `EBS-RawRecordingStatus` and the CoreLog. The image
+  feed (what Live/Snap/MDA actually display) must keep working even if the
+  Metavision-side recording can't start for some reason (bad path, disk
+  full, etc.) — consistent with the Goal 2 principle of never breaking the
+  adapter's core loadable/usable state over a secondary feature. This same
+  principle is why UserProfile auto-discovery failing is *also* not an
+  error -- it just falls back to `GenerateAutoRawFilePath()`.
+- **`EBS-RawRecordingStatus` created non-read-only**, unlike the Goal 2
+  identification properties. Those are set once at `Initialize()` and never
+  change again, so `true` (read-only) was fine. This one must change
+  multiple times per adapter lifetime as recordings start/stop, and MM's
+  `PropertyCollection::Set()` (confirmed by reading
+  `third_party/mmCoreAndDevices/MMDevice/Property.cpp`) silently ignores
+  `SetProperty()` on anything created read-only, with no error — so it had
+  to be created writable for the device's own updates to actually take
+  effect. (Being technically user-writable too is a harmless side effect,
+  not a security/correctness concern for a local device property.)
+- **Every `SetProperty(g_PropRawRecordingStatus, ...)` call is paired with an
+  `OnPropertyChanged()` call.** `SetProperty()` alone only updates this
+  device's own internal property map; MMCore keeps a separate `stateCache_`
+  that the Device/Property Browser GUI actually displays from, refreshed
+  only on a Core-initiated `setProperty()` or a device-initiated
+  `OnPropertyChanged()` callback. Missing this made the GUI show a stale
+  status even though a direct `getProperty()` already returned the correct
+  value -- see the bug-hunting narrative below for how this was found.
+- **Auto-path fallback folder is `Documents\ProphEBS_Recordings\`, not a temp
+  or install-relative folder.** Always writable without admin rights (same
+  constraint noted in Goal 1's device-interface-version incident), and
+  discoverable by a non-technical user browsing Windows Explorer.
+
+### Getting to zero-configuration: three iterations, in order
+
+This goal went through three designs before landing on the final one. Kept
+here in full because the reasoning for *rejecting* the first two is exactly
+the kind of thing worth remembering before reinventing them in a later goal.
+
+**Iteration 1 -- `EBS-RawAutoPath` on/off toggle + manual Beanshell script.**
+First implementation: a private path under `Documents\ProphEBS_Recordings\`
+by default (`EBS-RawAutoPath=On`), or an `EBS-RawFilePath` the user sets by
+hand (`EBS-RawAutoPath=Off`) via a Beanshell script
+(`scripts/SetProphEBSRawPath.bsh`, run manually in the Scripting Console
+before clicking Acquire!) that read Studio's `SequenceSettings` root/prefix
+and pushed it into the property. Self-tested successfully via
+`tools/test_prophebs.py` (auto and explicit paths both produced real,
+non-empty `.raw` files on the connected IMX636). User tried it for real in
+the GUI and initially reported it matched their MDA folder correctly --
+but this turned out to be based on reviewing the script's logic, not a full
+successful run; see Iteration 3.
+
+Along the way the user asked whether the script could be avoided entirely
+("baked into the dll"). At the time this looked impossible: MM's MDA save
+directory is Studio (Java)-level state that never reaches MMCore or the C++
+device layer -- Studio only ever calls generic MMCore functions with no path
+info attached. This is true as far as the *live* Studio object model goes,
+but turned out not to be the whole story -- see Iteration 3.
+
+**Iteration 2 -- auto-attaching Beanshell hook.** As a partial answer to
+"can this be automatic," added `scripts/AttachProphEBSRawPathHook.bsh`,
+using MM's `IAcquisitionEngine2010.attachRunnable(frame, position, channel,
+slice, Runnable)` hook API to attach the same path-sync logic once per MM
+session (or via a Startup script) instead of re-running it before every
+MDA. This still required *some* one-time Beanshell setup, which the user
+explicitly did not want ("I do NOT want users to fiddle around with a bsh
+script or have a startup thing"), so both scripts were later deleted
+entirely in favor of Iteration 3.
+
+**Bug found while testing Iteration 1/2 in the real GUI**:
+`EBS-RawRecordingStatus` displayed a stale path in the Device/Property
+Browser. Root cause (see "Design decisions" above): missing
+`OnPropertyChanged()` calls after `SetProperty()` on that property, so
+MMCore's `stateCache_` (what the GUI reads) never refreshed, even though a
+direct `getProperty()` query already returned the correct value -- exactly
+why `tools/test_prophebs.py` (which uses `core.getProperty()`) never caught
+it. **Lesson for future goals**: any property a device updates on its own
+initiative needs a paired `OnPropertyChanged()` call, and the Python
+self-test harness cannot verify GUI-cache-consistency bugs like this one --
+only a real Device/Property Browser check can. Fixed by adding the missing
+calls (kept in the final design).
+
+**The actual "file doesn't get stored anywhere" bug**: after the
+`OnPropertyChanged()` fix, the user tried a real MDA and reported the
+reported path was correct but *no file appeared there at all* -- the MDA
+only produced its own `.tif`. Root cause (not fully certain, but consistent
+with all observed symptoms): MicroManager's own save folder may not exist
+yet at the exact moment `StartSequenceAcquisition()` fires and
+`cam_.start_recording()` is called -- Studio likely creates the folder
+lazily around the first saved image, not synchronously when Acquire! is
+clicked -- so asking the Metavision SDK to write into a not-yet-existing
+directory can silently fail (its writer thread runs asynchronously per the
+SDK docs, so a failure there doesn't necessarily propagate back as an
+exception or a `false` return). The user's own suggestion at this point was
+"copy the file after it's created instead" -- sidestepping the whole timing
+question by writing to a guaranteed-safe folder first and moving the result
+afterward, once the MDA's folder is certain to exist. A
+`scripts/CopyProphEBSRawToMDA.bsh` was drafted around this, but immediately
+made moot by Iteration 3, discovered minutes later.
+
+**Iteration 3 (final) -- read MM's own persisted UserProfile JSON,
+directly from C++, zero scripts.** Prompted by the user's explicit ask to
+"really dive into all documentation... latch onto unorthodox methods if you
+have to" rather than accept another scripting workaround. Investigated
+where MM Studio persists its UI state and found
+`%LOCALAPPDATA%\Micro-Manager\UserProfiles\<profile>.json` -- a "Micro-Manager
+Property Map" format JSON file MM writes as a normal side effect of using
+the application (confirmed present and populated on the dev machine without
+any special setup). Inside it,
+`map.Preferences.scalar["org.micromanager.internal.dialogs.AcqControlDlg"].scalar.MDA_SEQUENCE_SETTINGS.scalar`
+holds a second, embedded JSON string (MM serializes its `SequenceSettings`
+object to text before storing it) containing the *exact* `root`/`prefix`
+values currently configured in the MDA dialog.
+
+Verified this was parseable before touching the adapter: wrote a standalone
+scratch `.cpp` using `boost::property_tree::json_parser` (already vendored,
+header-only, under `C:\Program Files\Prophesee\third_party\include\boost\`
+-- confirmed by grepping for `json_parser.hpp`/`json.hpp` there -- so no new
+`AdditionaIncludeDirectories`/link dependency needed), compiled it standalone
+against the real profile file on the dev machine, and got back the correct
+`root=C:\Data\EBSMMTest3`, `prefix=test` that matched what the user's real
+MDA dialog was configured to. Only after that stand-alone proof did this get
+wired into `ProphEBS.cpp` as `FindMMUserProfilePath()` +
+`TryGetMMAcquisitionRootPrefix()`.
+
+This is undocumented/internal MM implementation detail (a specific Java
+class's own preference key, not any kind of stable public API), which is
+exactly why it's wrapped in try/catch at every step with a safe fallback
+(`GenerateAutoRawFilePath()`) rather than treated as guaranteed to work
+forever. `EBS-RawAutoPath` was removed entirely (no longer needed -- there's
+only one path-resolution behavior now, with `EBS-RawFilePath` as a manual
+override for the rare case auto-discovery isn't wanted), and both
+`.bsh` scripts and the top-level `scripts/` folder were deleted.
+
+### Follow-up: auto-discovered path was stale when changed mid-session
+
+User confirmed the UserProfile auto-discovery approach worked, but reported
+that changing the MDA's save folder in the dialog wasn't reflected -- the
+`.raw` kept landing in the *previous* folder. Investigated by re-checking
+the actual profile JSON's `root`/`prefix` values against what the user had
+just changed them to on their machine, and confirmed the file **does**
+eventually update to the new value -- but not necessarily by the moment
+`StartSequenceAcquisition()` fires. Most likely explanation: MicroManager's
+`UserProfile` save mechanism doesn't necessarily flush every keystroke/field
+edit straight to disk (probably some internal debounce/periodic-save
+behavior) -- so reading the file at the *instant* recording starts risks
+catching a value that's a few seconds stale if the user only just edited the
+path before clicking Acquire!.
+
+**Fix**: moved auto-discovery from `StartRawRecordingIfRequested()` to
+`StopRawRecordingIfActive()`, and changed the whole strategy from "write
+directly to the (guessed) MDA path" to "always stage to a local,
+guaranteed-safe path during recording, then move the finished file to the
+freshly-re-discovered MDA path afterward":
+
+- `StartRawRecordingIfRequested()` now always records to
+  `GenerateAutoRawFilePath()`'s local staging path when `EBS-RawFilePath` is
+  empty (an explicit `EBS-RawFilePath` is still used verbatim, un-staged).
+  A new `movePendingToMdaFolder_` flag records whether this was a staged
+  (auto) recording or an explicit one.
+- `StopRawRecordingIfActive()` -- called only after the whole acquisition
+  has finished, giving MicroManager's own save timing the maximum possible
+  window to have flushed the new path to disk -- re-runs
+  `TryGetMMAcquisitionRootPrefix()` fresh at that point (when
+  `movePendingToMdaFolder_` is set) and moves (`fs::rename`, falling back to
+  copy+delete for cross-drive moves) the just-finished file there.
+- This also happens to fully replace the earlier "MDA folder might not exist
+  yet when recording starts" concern from the previous incident (see above)
+  with something strictly more robust: recording no longer ever touches the
+  MDA folder directly at all during the write -- only a same-machine
+  filesystem move afterward, once both the local file and (presumably) the
+  MDA folder already exist.
+
+**Second bug found while verifying this fix**: the Metavision SDK also
+writes a companion `<same-stem>.bias` file (a snapshot of the sensor's bias
+settings) next to the `.raw` at recording time -- undocumented in the
+headers available here, discovered by inspecting the staging folder after a
+test run and finding an orphaned `.bias` file left behind while the `.raw`
+had moved. Fixed by moving (or copy+delete-ing) `<stem>.bias` alongside the
+`.raw`, if it exists, using the same move-with-fallback helper (refactored
+into a small local lambda since it's now needed twice).
+
+**Verified**: re-ran `tools/test_prophebs.py` against real hardware after
+this fix. The auto-discovery check correctly picked up
+`C:\Data\EBSMMTest5` / `test2` (values the user had changed to *after* the
+original `C:\Data\EBSMMTest3` / `test` test, confirming the fix actually
+uses the current, not stale, profile value) and both the `.raw` and its
+companion `.bias` file were confirmed present together at the destination,
+with none left orphaned in the staging folder.
+
+**Note**: the user's own earlier real-GUI test recordings (several
+`.raw`/`.bias` pairs from the same dev session, timestamped `09:37`-`09:48`)
+are still sitting in `Documents\ProphEBS_Recordings\` from before this fix
+was deployed -- left in place since they're the user's own test data, not
+cleaned up automatically.
+
+### Follow-up: the deferred-read fix *still* didn't pick up mid-session folder changes
+
+User reported it still wasn't working: rebuilt/redeployed the DLL with the
+above fix, fully closed and reopened MicroManager (ruling out a stale-DLL
+explanation), then set an MDA to `EBSMMTest4`/`test`, ran it (worked
+correctly), changed the MDA to `EBSMMTest5`/`test2` *without restarting MM*,
+ran again -- and the `.raw` still landed in `EBSMMTest4`. Confirmed via a
+direct question that this was all one continuous MM session, never
+restarted in between.
+
+**Root cause, this time for real**: the `UserProfile` JSON only gets
+flushed to disk when MicroManager *closes* -- not live, not on any
+periodic timer, not on field-blur. Every earlier observation of the file
+reflecting a "fresh" value coincidentally followed an MM restart (needed
+anyway to reload the rebuilt DLL each time), which masked this. So
+deferring the read from start-of-recording to end-of-recording (the
+previous fix) bought at most ~1 extra second of margin -- utterly
+irrelevant against a source that might not update again until the
+application closes. The whole `UserProfile`-based approach can only ever
+reflect the *previous* session's settings during a live session -- a
+fundamental dead end for the realistic "change folder, acquire again"
+workflow, not a timing bug fixable by reading it later.
+
+**The actual live source, found by reading the adapter's own CoreLog**:
+grepped the real GUI session's CoreLog file (the same file
+`LogMessage()` calls from this adapter already write into) for context
+around the reported failure, and found MicroManager Studio logs the block
+
+```text
+[IFO,App] MDA Settings:
+{
+  ...
+  "root": "C:\\Data\\EBSMMTest4",
+  "prefix": "test",
+  ...
+}
+```
+
+synchronously, right before triggering the acquisition engine, for *every*
+acquisition run in the session -- and each occurrence had the exact,
+current, freshly-changed root/prefix from that specific run. This is a
+different mechanism than the `UserProfile` file entirely: it's a direct
+per-acquisition log write, not a periodically-flushed cache.
+Confirmed the process-ID linkage that makes this readable from C++ without
+Java: `MMCore`/this DLL loads into the *same OS process* as Studio's JVM,
+and the CoreLog filename embeds that process's PID
+(`CoreLog<timestamp>_pid<PID>.txt`) -- `GetCurrentProcessId()` from inside
+this DLL matches it exactly.
+
+**Fix**: added `TryGetMdaRootPrefixFromCoreLog()` (new primary discovery
+method) alongside the existing `TryGetMdaRootPrefixFromUserProfile()`
+(demoted to fallback, kept since a stale-but-plausible path still beats
+none), combined via `TryDiscoverMdaRootPrefix()`:
+
+- `GetOwnModuleDirectory()` -- finds this DLL's own directory (== the MM
+  install directory, where `CoreLogs\` lives) via the "address of a
+  function in this module" `GetModuleHandleEx` trick, needing no `DllMain`.
+- `FindCurrentCoreLogPath()` -- finds the CoreLog file whose name ends in
+  `_pid<GetCurrentProcessId()>.txt`.
+- `TryGetMdaRootPrefixFromCoreLog()` -- tails that file for the last
+  `"MDA Settings:"` block, strips MM's per-line log-continuation prefix
+  (`...[       ]`) off each wrapped line, and parses the reassembled text
+  as JSON for `root`/`prefix`.
+- `StopRawRecordingIfActive()` now calls `TryDiscoverMdaRootPrefix()`
+  instead of the UserProfile lookup directly.
+
+**Second bug found immediately while verifying this fix**: an
+automated-test run (`tools/test_prophebs.py`, via `pymmcore-plus`, no Java
+Studio at all) picked up a completely wrong, stale root/prefix
+(`EBSMMTest4`/`test3`, from a CoreLog file whose last entry showed
+`"Core session ended"` **11 minutes earlier**). Root cause: Windows reuses
+process IDs once a process exits, and the freshly-started `python.exe` test
+process had been assigned a PID that collided with an old, already-finished
+MicroManager session's leftover CoreLog file -- `FindCurrentCoreLogPath()`
+was matching by filename suffix alone, with no way to tell "this file
+belongs to a dead process that used to have my PID" apart from "this file
+belongs to me." **Fix**: compare the candidate file's own creation time
+(`GetFileAttributesEx` -> `ftCreationTime`) against this process's start
+time (`GetProcessTimes` -> `creationTime`); only trust files created at or
+after this process began. An old PID-collision leftover necessarily
+predates the current process and gets correctly rejected now.
+
+**Real limitation of the self-test harness, found while investigating the
+above**: `tools/test_prophebs.py` never exercises
+`TryGetMdaRootPrefixFromCoreLog()`'s intended (primary) codepath at all.
+`pymmcore-plus` calls `core.setPrimaryLogFile()` itself, pointing MMCore's
+logging at its own package-managed location instead of
+`<install_dir>/CoreLogs/` -- so no matching, freshly-created CoreLog file
+ever exists under the DLL's own directory during one of these test runs,
+and `TryDiscoverMdaRootPrefix()` *always* falls through to the
+`UserProfile` fallback in this harness, by construction. This means the
+whole point of this fix -- correctly tracking a same-session MDA folder
+change -- is **only verifiable by the user, live, in the real MicroManager
+GUI** (which does write to the default `CoreLogs\` location). The
+automated test still passing after this fix is evidence of "no regression
+in the fallback path," not evidence the primary fix works.
+
+**User confirmed working** in the real GUI: set an MDA to one folder,
+acquired, changed to a different folder without restarting MM, acquired
+again -- the second `.raw` correctly landed in the new folder. The
+CoreLog-based primary discovery mechanism is now considered proven, not
+just self-tested via the fallback path.
+
+### Follow-up: match MM's own per-run numbered subfolder convention
+
+User pointed out MM doesn't save directly into `<root>/` -- for a saving
+MDA (e.g. `MULTIPAGE_TIFF`) it creates a per-run subfolder
+`<prefix>_<N>/`, where `N` is one more than the highest such subfolder
+number that already exists under `<root>` (confirmed by the user: renaming
+an existing `test2_1` folder to `test2_34` makes MM's *next* run
+`test2_35` -- it's a live filesystem scan each time, not a remembered
+counter, and this number never appears in the CoreLog). Inside that
+folder, the image stack is also named after it, e.g.
+`test2_2_MMStack_Pos0.ome.tif`. User wants the `.raw`/`.bias` to follow the
+exact same convention: `<root>/<prefix>_<N>/<prefix>_<N>_events_Pos0.raw`
+(and `.bias`).
+
+**Implementation** (`FindHighestNumberedMdaSubfolder()`, new): rather than
+re-deriving `N` independently (which risks an off-by-one mismatch against
+MM's own counting logic, especially since MM's rule is "highest existing +
+1" rather than "remembered count + 1"), this scans `mdaRoot` for
+subfolders matching `<mdaPrefix>_<digits>` and reuses whichever one has
+the highest number. This is safe specifically *because*
+`StopRawRecordingIfActive()` only ever runs after the whole acquisition has
+finished -- by then, MM has already created and been writing into its own
+folder for the current run throughout, so it's guaranteed to exist and
+(being the most recent) to be the highest-numbered one. A short retry loop
+(up to 4 attempts, 150ms apart) covers the unlikely case that this runs
+before MM's own folder-creation has landed on disk. If no numbered
+subfolder ever appears (e.g. a save mode that doesn't use one, or saving
+disabled), falls back to the previous flat layout
+(`<root>/<prefix>_prophesee_events.raw`) unchanged.
+
+**Verified**: simulated MM's own convention by hand-creating
+`test2_1/` and `test2_2/test2_2_MMStack_Pos0.ome.tif` under a discovered
+root, then ran `tools/test_prophebs.py` -- the recording correctly landed
+at `test2_2\test2_2_events_Pos0.raw` (matching the *highest*-numbered
+folder, `test2_2`, not `test2_1`), with its `.bias` companion alongside it
+and the pre-existing `.ome.tif` from the simulated MM run untouched. Test
+folders/files cleaned up afterward.
+
+### Verified locally
+
+- **Build**: `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`
+  succeeds with 0 warnings/errors (same VS2022 Preview toolset as Goals 1-3),
+  including the new `boost::property_tree` include.
+- **Real hardware, via `tools/test_prophebs.py`** (final version): all three
+  Goal 4 checks passed against the real connected IMX636 sensor. Critically,
+  the auto-discovery check produced
+  `EBS-RawRecordingStatus = Finished: C:\Data\EBSMMTest3\test_prophesee_events.raw`
+  -- `C:\Data\EBSMMTest3` / `test` read directly out of the user's real,
+  live MM UserProfile JSON, with the property left completely empty (no
+  script, no manual property setting) -- a 27 MB non-empty `.raw` file
+  actually existed there. The explicit-`EBS-RawFilePath` override and the
+  Live-view-doesn't-record checks also passed. All test-generated `.raw`
+  files were deleted afterward (proof-of-plumbing only, not meaningful
+  recordings worth keeping).
+- **Not yet verified**: a real Multi-D Acquisition run entirely through the
+  MicroManager Studio GUI (as opposed to `pymmcore-plus` driving the same
+  calls) -- per `docs/BUILD_AND_USAGE.md` Goal 4 section, this is the
+  hand-off step for the user. Given the self-test now reads the *real*
+  UserProfile file the GUI itself writes to, this should now "just work,"
+  but the GUI round-trip itself is still unverified by this harness.
+
+### Follow-up: stream directly to the MDA folder instead of staging-then-moving
+
+User asked for two more things in the same session. First: since
+`TryGetMdaRootPrefixFromCoreLog()` is synchronously fresh (unlike the old
+`UserProfile` approach), why still stage every recording locally and move
+it afterward, for large datasets that's an unnecessary double write.
+
+**Implementation**: `StartRawRecordingIfRequested()` now tries MDA
+auto-discovery immediately, and if it resolves (root/prefix found, `"save"`
+is `true`, and MM's numbered subfolder appears within a short retry window
+-- `ComputeNumberedMdaDestination()`, factored out of the stop-time move
+logic so both call sites share it), `cam_.start_recording()` writes
+straight to the final destination, no local staging or later move at all.
+Local staging (`GenerateAutoRawFilePath()`) is now purely the fallback for
+when discovery fails, `"save"` is unchecked, or the folder didn't appear in
+time -- in which case `StopRawRecordingIfActive()`'s existing move-at-the-end
+logic is still there as a second chance, unchanged.
+
+Also fixed a related correctness gap surfaced by this change: the MDA
+settings JSON has a `"save"` boolean (whether "Save images" is checked at
+all). Both `TryGetMdaRootPrefixFromCoreLog()` and
+`TryGetMdaRootPrefixFromUserProfile()` now also return this, and neither
+call site attempts numbered-subfolder discovery when it's `false` -- without
+this check, an unsaved acquisition could have been mis-attributed into some
+unrelated *older* run's numbered folder (whichever happened to be the
+highest-numbered one lying around), which would have been actively wrong,
+not just a missed optimization.
+
+**Verified**: `tools/test_prophebs.py` incidentally exercised the `"save":
+false` path for real -- the user's live profile happened to have "Save
+images" unchecked at test time, and the recording correctly fell back to
+local staging rather than guessing a folder. Note (same caveat as the
+CoreLog work generally): this harness still can't exercise the *true*
+start-time direct-streaming path itself (no CoreLog written by
+`pymmcore-plus` in the expected location -- see the earlier follow-up on
+this), since discovery here always fell through to the `UserProfile`
+fallback; the shared `ComputeNumberedMdaDestination()`/
+`FindHighestNumberedMdaSubfolder()` logic itself was already proven
+correct (same code, exercised from the stop-time call site in the previous
+follow-up). GUI confirmation from the user still pending for this specific
+change.
+
+### Investigated and declined: recording an unsaved MDA that's saved manually afterward
+
+User's other ask: when an MDA runs with "Save images" *unchecked*, MM keeps
+the images in a RAM-backed datastore and displays them in a viewer; the
+user can later click that window's **Save** button to write it to disk,
+choosing the location at that point -- well after this adapter's own
+recording (and `StopRawRecordingIfActive()`) has already finished. Wanted
+the `.raw`/`.bias` moved to match, using the same naming convention, at
+that later point.
+
+**This was investigated properly, not just log-grepped, and declined --
+there is no live signal to hook.** The user had already confirmed the
+CoreLog has nothing for this. Went a level deeper: extracted
+`MMJ_.jar` (`plugins/Micro-Manager/MMJ_.jar` in the MM install --
+confirmed via `unzip -l | grep DefaultDatastore` that this jar holds the
+Studio classes referenced elsewhere in this log) and inspected the actual
+compiled classes involved in a manual save:
+
+- `SaveButton` (the image window's Save button) just wires a click to
+  `Datastore.save(...)` -- no logging of any kind in the class itself.
+- `DefaultDatastore.save()` / `DefaultDataSaver` (the `SwingWorker` that
+  actually writes the files in the background) contain no log statement
+  that includes the destination path -- confirmed by reading every string
+  constant in both compiled classes; the only related string is the
+  generic error `"Failed to save data"`.
+- The Save dialog's "last used directory" is remembered via
+  `FileDialogs.setDirectory()`/`getDirectory()`, which -- checked directly
+  in its decompiled constant pool -- goes through MM's own `UserProfile`
+  object, i.e. the *exact same* flush-only-on-MM-close mechanism already
+  ruled out for this purpose (confirmed it's not a separate,
+  faster-flushing `java.util.prefs`-backed store).
+
+So unlike the earlier CoreLog breakthrough, there is no textual, live
+signal to grab onto here at all -- not "we haven't found it yet," but "the
+relevant compiled code doesn't write one anywhere queryable while MM is
+still running." Presented this finding plus two options (a manual
+`EBS-MoveLastRecordingTo`-style property vs. leaving it as-is); user chose
+to leave it as-is. **No code changes made for this request** -- an unsaved
+MDA's recording simply stays in `Documents\ProphEBS_Recordings\` (already
+the existing fallback behavior), and matching a later manual save is a
+manual step for the user if/when it comes up.
+
+### Follow-up: make the staging/fallback folder itself configurable
+
+Final ask of the session: expose the `Documents\ProphEBS_Recordings\`
+staging folder (used whenever MDA-folder discovery doesn't resolve a direct
+destination -- "Save images" unchecked, discovery failure, etc.) as a
+property instead of a hardcoded path.
+
+**Implementation**: new `EBS-TempRecordingFolder` property (string,
+read/write, default empty). `GenerateAutoRawFilePath()` now reads it via
+`GetProperty()`; non-empty overrides the `Documents\ProphEBS_Recordings\`
+default with the given folder (created if needed), empty keeps the
+existing default. No other logic changed -- this only affects where the
+one fallback/staging function writes.
+
+**Verified**: `tools/test_prophebs.py` extended with a 4b2 check -- set
+`EBS-TempRecordingFolder` to a scratch folder, ran a 5-frame acquisition
+(landed there because the live profile's `"save": false` state on this
+machine routes it through the fallback path, same as earlier follow-ups),
+confirmed the `.raw` appeared in the custom folder, not the default one.
+Test folder cleaned up afterward.
+
+### Open questions / TODO for later goals
+
+- The exact MM UserProfile JSON key path
+  (`org.micromanager.internal.dialogs.AcqControlDlg` / `MDA_SEQUENCE_SETTINGS`)
+  is internal MM implementation detail, observed on this dev machine's
+  MicroManager 2.0.3 install -- if a future MM version restructures this,
+  auto-discovery will silently fall back to `GenerateAutoRawFilePath()`
+  (never breaks recording, just stops landing in the MDA folder). Worth
+  rechecking this key path if the adapter is ever tested against a
+  significantly newer/older MM release.
+- The MM UserProfile file reflects whatever was last flushed to disk by
+  Studio's own (not fully understood) save-timing -- if a user edits the
+  root/prefix field and clicks Acquire! within under a second, there's a
+  theoretical chance the on-disk value hasn't caught up yet. Not something
+  we've been able to trigger or verify either way; flag if a user reports
+  the auto-discovered path looking "one acquisition behind."
+- If multiple MM user profiles exist (`Index.json` lists more than one),
+  `FindMMUserProfilePath()` uses the first entry, falling back to the most
+  recently modified `*.json` file if that one's unreadable -- untested with
+  a genuinely multi-profile MM setup (this dev machine only has "Default
+  User").
+- No attempt yet to stitch the recorded `.raw` file's timing back to
+  MicroManager's own saved image stack/metadata (e.g. embedding the `.raw`
+  path as OME metadata on the MM-side images) — out of scope unless the user
+  asks for it later.
+- Goal 5 (adding properties) is where the EBS's own hardware settings
+  (bias_on, hpf, etc.) become MM properties — recording itself is now
+  considered functionally complete pending the user's GUI confirmation.

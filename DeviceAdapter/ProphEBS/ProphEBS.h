@@ -32,9 +32,17 @@
 //                Live view return. With no camera connected, the Goal 1
 //                static checkerboard fallback is unchanged.
 //
-//                Recording, tunable properties, and ROI/pixel masking are
-//                added in later goals (see docs/DEVLOG.md at the repository
-//                root for the roadmap).
+//                Goal 4 (this revision) adds recording: when a finite
+//                (multi-D-acquisition-style) sequence acquisition starts on a
+//                connected camera, the adapter calls the Metavision SDK's own
+//                cam_.start_recording()/stop_recording() to write the real
+//                Prophesee .raw event file alongside whatever image data
+//                MicroManager itself saves -- see g_PropRawFilePath/
+//                g_PropRawAutoPath/g_PropRawRecordingStatus below.
+//
+//                Tunable properties and ROI/pixel masking are added in later
+//                goals (see docs/DEVLOG.md at the repository root for the
+//                roadmap).
 //
 // COPYRIGHT:     Koen J.A. Martens, 2026
 // LICENSE:       This file is distributed under the BSD license, consistent
@@ -65,6 +73,31 @@ extern const char* g_PropModel;
 extern const char* g_PropSerial;
 extern const char* g_PropConnectionType;
 extern const char* g_PropIntegrator;
+
+// Goal 4: raw event-file recording properties.
+// - g_PropRawFilePath: manual override. Empty (the default) means "figure
+//   out the path automatically" -- see StopRawRecordingIfActive() in
+//   ProphEBS.cpp, which reads this process's own MicroManager CoreLog file
+//   (Studio logs the exact MDA settings there, live, right before every
+//   acquisition) to discover the Multi-D Acquisition dialog's *current*
+//   save root/prefix, with no MM scripting or user action required at all.
+//   Falls back to MM's on-close-only UserProfile JSON, and then to an
+//   auto-generated path under Documents\ProphEBS_Recordings, if that lookup
+//   fails for any reason -- recording never blocks on this. Setting this
+//   property to a non-empty path skips auto-discovery and uses that path
+//   verbatim instead, for the rare case where the automatic behavior isn't
+//   wanted.
+// - g_PropRawRecordingStatus: read-write status string the device itself
+//   updates ("Not recording", "Recording to <path>", "Finished: <path>",
+//   "Failed: <reason>") so progress/success is visible from the Device
+//   Property Browser without digging through the CoreLog.
+// - g_PropTempFolder: overrides the folder GenerateAutoRawFilePath() stages
+//   into (or records to permanently, if MDA-folder discovery never
+//   resolves). Empty (the default) keeps using
+//   Documents\ProphEBS_Recordings.
+extern const char* g_PropRawFilePath;
+extern const char* g_PropRawRecordingStatus;
+extern const char* g_PropTempFolder;
 
 // Fixed test-image geometry for Goal 1 / the no-hardware fallback. Real
 // sensor geometry (from Metavision::I_Geometry) is used instead whenever a
@@ -167,6 +200,50 @@ private:
    // buffer because the frame builder only ever writes to backImg_.
    void BuildAndSwapFrame();
 
+   // Goal 4: builds a local staging raw-file path (Documents\
+   // ProphEBS_Recordings\ProphEBS_<timestamp>.raw), creating the folder if
+   // needed. Used by StartRawRecordingIfRequested() as the actual recording
+   // destination whenever EBS-RawFilePath is empty -- MDA-folder
+   // auto-discovery deliberately happens later, in
+   // StopRawRecordingIfActive(), not here (see that method's comment for
+   // why) -- and remains the final location if that later discovery fails.
+   std::string GenerateAutoRawFilePath() const;
+
+   // Called from StartSequenceAcquisition() only for finite (MDA-style)
+   // sequences with a connected camera -- resolves the recording path
+   // (EBS-RawFilePath verbatim if set, else GenerateAutoRawFilePath() as a
+   // local staging location -- MDA auto-discovery is intentionally deferred
+   // to StopRawRecordingIfActive()), calls cam_.start_recording(), and
+   // updates EBS-RawRecordingStatus either way. Never fails the acquisition
+   // itself: a raw-recording failure is logged/reported via the status
+   // property, not returned as an error, since the MM image feed must keep
+   // working even if the Metavision-side recording can't start (e.g. a bad
+   // path). Every SetProperty() on g_PropRawRecordingStatus here is paired
+   // with an OnPropertyChanged() call -- SetProperty() alone only updates
+   // this device's own internal property map, but MMCore keeps a separate
+   // stateCache_ (what the Device/Property Browser actually displays) that
+   // is only refreshed on a Core-initiated setProperty() or when the device
+   // calls OnPropertyChanged() to report a self-initiated change. Without
+   // that call the GUI shows a stale status (e.g. the previous recording's
+   // path) even though a direct GetProperty()/getProperty() query already
+   // returns the correct new value -- this bit us once already, see
+   // docs/DEVLOG.md Goal 4 follow-up.
+   void StartRawRecordingIfRequested();
+
+   // Called from StopSequenceAcquisition() and from
+   // ProphEBSSequenceThread::svc()'s natural-completion path (a finite MDA
+   // sequence finishing on its own doesn't otherwise call
+   // StopSequenceAcquisition()). No-op if no raw recording is active. If
+   // movePendingToMdaFolder_ is set (recording was staged locally, i.e.
+   // EBS-RawFilePath was empty), this is where MDA-folder auto-discovery
+   // actually runs -- deliberately as late as possible, since MicroManager
+   // doesn't necessarily flush its UserProfile JSON to disk the instant the
+   // MDA dialog's fields change, so reading it here (after the whole
+   // acquisition has run, not at its start) gives MicroManager's own save
+   // timing far more time to catch up. Same SetProperty()+OnPropertyChanged()
+   // pairing as StartRawRecordingIfRequested() above, for the same reason.
+   void StopRawRecordingIfActive();
+
    bool initialized_;
    double exposure_ms_;
    unsigned roiX_;
@@ -214,6 +291,19 @@ private:
    Metavision::CallbackId cdCallbackId_;
    ProphEBSFrameBuilderThread* frameBuilderThd_;
    friend class ProphEBSFrameBuilderThread;
+
+   // Goal 4: raw event-file recording state. rawRecordingActive_/
+   // currentRawFilePath_/movePendingToMdaFolder_ are only meaningful between
+   // a successful StartRawRecordingIfRequested() and the matching
+   // StopRawRecordingIfActive(). movePendingToMdaFolder_ is true whenever
+   // EBS-RawFilePath was empty at start time (i.e. currentRawFilePath_ is a
+   // local staging path from GenerateAutoRawFilePath()) -- it tells
+   // StopRawRecordingIfActive() whether to attempt the MDA-folder
+   // auto-discovery + move at all, versus leaving an explicit
+   // EBS-RawFilePath recording exactly where the user put it.
+   bool rawRecordingActive_;
+   std::string currentRawFilePath_;
+   bool movePendingToMdaFolder_;
 };
 
 //////////////////////////////////////////////////////////////////////////////

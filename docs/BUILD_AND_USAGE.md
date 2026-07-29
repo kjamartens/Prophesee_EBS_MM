@@ -399,6 +399,85 @@ sensor (not just a static or blank image), **Goal 3 is verified working** —
 let the project owner know so we can tag this as `v0.3` and move on to
 Goal 4 (recording capabilities).
 
+## Goal 4 (Recording capabilities)
+
+### What's new
+
+The adapter can now produce a real Prophesee `.raw` event file — the same
+format Metavision's own tools write — while MicroManager runs a Multi-D
+Acquisition (MDA), and it lands **next to the MDA's own saved images
+automatically** — no script to run, no setting to remember, nothing to
+configure before clicking Acquire!. Two properties are involved:
+
+| Property | Meaning |
+|---|---|
+| `EBS-RawFilePath` | Manual override. Leave empty (the default) for fully automatic behavior. Set it to a specific path to use that instead, skipping auto-discovery entirely. |
+| `EBS-RawRecordingStatus` | Read-write status the adapter itself updates: `Not recording`, `Recording to <path>`, `Finished: <path>`, or `Failed: <reason>`. Check this after an acquisition to confirm the `.raw` file was actually written, and where. |
+| `EBS-TempRecordingFolder` | Where recordings land when the MDA folder can't be determined (e.g. "Save images" unchecked, or auto-discovery fails) — also used as a brief staging spot in some direct-streaming edge cases. Leave empty for the default (`Documents\ProphEBS_Recordings\`), or set it to any folder you'd rather use instead. |
+
+Recording only triggers for a **finite** sequence acquisition (i.e. an MDA
+with a fixed number of frames, like "10 frames at 100 ms") — not for Live
+view, which is an unbounded stream and would otherwise record indefinitely
+every time you click Live.
+
+**Follows MicroManager's own per-run folder convention.** For a saving MDA
+(e.g. `MULTIPAGE_TIFF`), MicroManager doesn't save directly into your
+chosen root folder — it creates a numbered subfolder per run
+(`<prefix>_<N>/`, where `N` auto-increments so previous runs are never
+overwritten) and names the image stack after that folder, e.g.
+`test_2_MMStack_Pos0.ome.tif`. The `.raw`/`.bias` files follow the exact
+same convention: `<root>\<prefix>_<N>\<prefix>_<N>_events_Pos0.raw` (and
+`.bias`), landing right next to that run's own images. If a run doesn't use
+a numbered subfolder (e.g. saving is disabled, or a different save mode),
+the files fall back to `<root>\<prefix>_prophesee_events.raw` instead.
+
+**How the automatic path-matching works, and why it had to be done this
+way:** MicroManager's MDA save directory is a Studio (Java)-level setting
+that never reaches the C++ device adapter/MMCore layer directly — there is
+no message in the MMCore API that carries a file path, so the adapter cannot
+simply ask Core for it. It turns out MM Studio logs the *exact*, live MDA
+settings (including root/prefix) to its own CoreLog file right before every
+single acquisition — the adapter tails that same file (it runs in the same
+OS process as MicroManager's Java side, so it can reliably find its own
+process's CoreLog) to discover the current save location with **zero
+user-facing setup**, correctly tracking changes made mid-session without
+restarting MicroManager. If that fails for any reason, it falls back to a
+second, less reliable source (MicroManager's `UserProfile` JSON file, which
+only reflects the *previous* session's settings), and finally to the
+adapter's own `Documents\ProphEBS_Recordings\` folder if even that isn't
+available — recording never blocks or fails an acquisition because of this.
+
+This relies on internal, undocumented parts of MicroManager (a specific log
+message; a specific settings file layout), not a stable public API, which is
+why the fallbacks exist — if a future MM update ever breaks the primary
+lookup, recording will keep working, just not necessarily next to the MDA's
+images until the adapter is updated to match. See `docs/DEVLOG.md` (Goal 4)
+for the full story of how this was found, including two earlier approaches
+(a Beanshell script the user had to run; reading a settings file that turned
+out to only update when MicroManager closes) that were tried and abandoned
+along the way.
+
+### 10. Record a Multi-D Acquisition
+
+1. Make sure your EBS camera is plugged in and `EBS-ConnectionStatus` reads
+   `Connected` (open the Device/Property Browser to check).
+2. In the main MicroManager window, open **Multi-Dimensional Acquisition**
+   (usually a toolbar button or under the **Devices** menu).
+3. Set it up for **10 frames** (or "Time points": 10) with a **100 ms**
+   interval, and pick/confirm a save location as usual.
+4. Click **Acquire!** and let it run to completion. Nothing else to set up
+   — the `.raw` file's location is discovered automatically.
+5. Open the **Device/Property Browser**, find `ProphEBS-Camera`, and check
+   `EBS-RawRecordingStatus`. It should read `Finished: <path>`, and that path
+   should be inside (or right next to) the folder you picked in step 3.
+6. Navigate to that path in Windows Explorer and confirm the `.raw` file
+   exists and has a non-trivial size (a few MB or more, depending on how much
+   event activity happened during the ~1 second acquisition).
+
+If the `.raw` file exists and has real content, **Goal 4 is verified
+working** — let the project owner know so we can tag this as `v0.4` and move
+on to Goal 5 (adding EBS hardware properties).
+
 ## Troubleshooting MicroManager itself
 
 | Symptom | Likely cause |
@@ -408,3 +487,6 @@ Goal 4 (recording capabilities).
 | MicroManager crashes or shows a popup error when adding the device | Copy the exact error text and the relevant lines from the CoreLog around the crash — this is the most useful debugging info |
 | Live/Snap shows a black image or an error instead of the checkerboard | Note down what MicroManager's status bar / log says at that moment |
 | Goal 3: Live view stays completely black even while waving a hand in front of the sensor | Check `EBS-ConnectionStatus` is `Connected` first (if not, you're still seeing the Goal 1/2 static checkerboard, not a live feed). If connected, check the sensor lens isn't covered, and that you're close enough / moving enough to actually generate events — event cameras only report brightness *changes* |
+| Goal 4: `EBS-RawRecordingStatus` reads `Failed: ...` | The resolved path is likely invalid (e.g. a folder that couldn't be created, or no write permission) — check the exact error text and the CoreLog. If `EBS-RawFilePath` is empty (auto-discovery), check the CoreLog for "auto-discovered" vs. "could not auto-discover" to see which path was actually used |
+| Goal 4: the `.raw` file didn't land next to the MDA's images | Auto-discovery likely fell back to `Documents\ProphEBS_Recordings\` — check the CoreLog around acquisition start for "could not auto-discover the Multi-D Acquisition save location." This can happen if MicroManager's UserProfile JSON format changed in your installed version (see `docs/DEVLOG.md`, Goal 4) — the recording still succeeds, just not in the expected folder |
+| Goal 4: no `.raw` file was created at all | Confirm `EBS-ConnectionStatus` was `Connected` — recording needs a real streaming camera; it's a no-op with no hardware attached (by design, same as Goal 2/3's fallback behavior) |
