@@ -703,3 +703,260 @@ Test folder cleaned up afterward.
 - Goal 5 (adding properties) is where the EBS's own hardware settings
   (bias_on, hpf, etc.) become MM properties — recording itself is now
   considered functionally complete pending the user's GUI confirmation.
+
+## Goal 5 — Adding hardware-setting properties
+
+### Status: self-tested on real hardware, awaiting user GUI confirmation before tagging v0.5
+
+### What was built
+
+Confirmed every Metavision HAL facility used below actually exists (read
+directly from the installed SDK headers under
+`C:\Program Files\Prophesee\include\metavision\hal\facilities\`, not
+guessed) before writing any code against it: `I_LL_Biases`, `I_ErcModule`,
+`I_EventTrailFilterModule`, `I_AntiFlickerModule`, `I_Monitoring`, plus
+`I_HW_Identification::get_current_data_encoding_format()` and
+`DeviceConfig::enable_biases_range_check_bypass()`.
+
+- **`EBS-BiasRangeCheckBypass`** — a pre-init-only property ("Off"/"On",
+  default "Off"), created in the *constructor* (not `Initialize()`) via
+  `CreateStringProperty(..., isPreInitProperty=true)`, mirroring
+  Metavision Studio's "bypass biases range check" checkbox.
+  `ConnectToCamera()` reads it and passes a `Metavision::DeviceConfig`
+  with `enable_biases_range_check_bypass(...)` into the
+  `Camera::from_first_available(const DeviceConfig&)` overload.
+- **Bias properties, fetched from the camera, not hardcoded** —
+  `CreateBiasProperties()` calls `I_LL_Biases::get_all_biases()` on a
+  connected camera and creates one `EBS-<biasname>` Integer property per
+  key the sensor actually reports (`EBS-bias_diff`, `EBS-bias_diff_off`,
+  `EBS-bias_diff_on`, `EBS-bias_fo`, `EBS-bias_hpf`, `EBS-bias_refr` on
+  the IMX636 here, but generalizes to any sensor), defaulting to the
+  value already on the sensor (its own boot-time default) with range
+  limits from `LL_Bias_Info::get_bias_range()`. A single `OnBias()`
+  handler (keyed off `pProp->GetName()`) backs all of them. When no
+  camera is connected, falls back to the fixed
+  `{bias_diff, bias_diff_off, bias_diff_on, bias_fo, bias_hpf, bias_refr}`
+  list from the user's original request, defaulting to 0 and backed by a
+  local `std::map` instead of hardware.
+- **ERC (event rate control)** — `EBS-ERC-Enabled` (default Off) and
+  `EBS-ERC-EventRate` (default 50,000,000 = 50 Mev/s), via
+  `I_ErcModule`, range-limited from `get_min/max_supported_cd_event_rate()`
+  when connected.
+- **Event trail (STC) filter** — `EBS-EventTrailFilter-Enabled` (default
+  Off), `-Threshold` (default 10,000 µs = 10 ms), `-Mode` (string enum
+  `TRAIL`/`STC_CUT_TRAIL`/`STC_KEEP_TRAIL`, default `TRAIL`, restricted to
+  `I_EventTrailFilterModule::get_available_types()` when connected). Via
+  `I_EventTrailFilterModule`.
+- **Anti-flicker** — `EBS-AntiFlicker-Enabled` (default Off),
+  `-StartThreshold`/`-StopThreshold` (default 6/4), `-DutyCycle` (default
+  50%), `-FilterType` (`"Band Pass"`/`"Band Cut"`, default `"Band Cut"` —
+  mapped to the SDK's `BAND_PASS`/`BAND_STOP` respectively, using
+  Metavision Studio's UI wording rather than the SDK's own enum names).
+  Also `-LowFreq`/`-HighFreq` (default 50/60 Hz, mains hum) — the
+  mandatory frequency band the filter needs to do anything, not in the
+  user's original list but added per their explicit decision when asked.
+  Via `I_AntiFlickerModule`.
+- **Static read-only info** — `EBS-Generation` (e.g. `"4.2"`, from
+  `SensorInfo`) and `EBS-DataEncodingFormat` (e.g. `"EVT3"`, from
+  `get_current_data_encoding_format()`), read once in `ConnectToCamera()`
+  alongside the existing Goal 2 identification properties.
+- **Live monitoring properties** — `EBS-AvgDataRate-MBps`,
+  `EBS-AvgEventRate-MEvps`, `EBS-AvgERCDropRate-KEvps`,
+  `EBS-Temperature-C`, `EBS-Illumination-lux`, `EBS-PixelDeadTime-us`. A
+  new `ProphEBSStatsThread` (mirrors `ProphEBSFrameBuilderThread`) calls
+  `UpdateStats()` every `g_StatsIntervalMs` (1 s) while streaming:
+  - Data/event rate are measured, not estimated — two new
+    `std::atomic<uint64_t>` counters (`totalRawBytes_`, `totalEventCount_`)
+    incremented by a new `cam_.raw_data().add_callback(...)` (real byte
+    buffer sizes) and one added line in the existing `OnEventsCD()`
+    (`end - begin`), both cheap single atomic adds per batch, same
+    off-the-hot-path design as the existing `eventCounts_` accumulator.
+  - ERC drop-rate is an **estimate**, per explicit user decision, since
+    the HAL has no API reporting actual hardware-dropped event count:
+    `enabled ? max(0, target_cd_event_rate − measured_event_rate) : 0`.
+  - Temperature/illumination/pixel-dead-time are polled directly from
+    `I_Monitoring`, each in its own `try`/`catch` (this sensor throws on
+    `get_illumination()` specifically but not the other two — see bug
+    below).
+
+### Design decisions (and why)
+
+- **Live-stats properties read a cached `std::atomic<double>` in
+  `BeforeGet`, rather than being pushed via `SetProperty()` +
+  `OnPropertyChanged()` from the stats thread.** This was the *original*
+  design (following the `EBS-RawRecordingStatus` pattern from Goal 4) and
+  it caused a real, repeatable crash during self-testing — see "Bug
+  found" below for the root cause and why Goal 4's pattern doesn't
+  actually generalize to a property that updates continuously for the
+  device's entire lifetime.
+- **`EBS-BiasRangeCheckBypass` is flagged pre-init via
+  `isPropertyPreInit()`, not actually made read-only at the MMCore level
+  after `Initialize()`.** Investigated this by reading
+  `MMDevice/Property.cpp::PropertyCollection::Set()` directly: it only
+  ever checks the per-property `readOnly_` flag, never
+  `IsPropertyPreInit()` — so a post-init `setProperty()` call is not
+  blocked by MMCore itself. The "settable during setup only" enforcement
+  is a Hardware Configuration Wizard (GUI) convention built on top of
+  this flag, not a Core-level guarantee. Adjusted `tools/test_prophebs.py`
+  to assert `isPropertyPreInit()` rather than a read-only transition,
+  since the latter isn't actually true.
+- **Anti-flicker's mandatory frequency band exposed as two more
+  properties, not hardcoded**, and **range-limited from
+  `get_min/max_supported_frequency()`** — the second half of this
+  decision was only added after self-testing surfaced the "Bug found"
+  below.
+- **`EBS-AvgDataRate-MBps` measures real transferred bytes via
+  `raw_data().add_callback()`, not an estimate from event count ×
+  assumed bytes/event** — EVT2/EVT3 have variable bytes-per-event, so a
+  computed estimate would have been meaningfully wrong; the actual byte
+  buffers the SDK already hands back are simpler and exact.
+
+### Bug found while self-testing: shared `CPropertyAction*` causes a double-free on shutdown
+
+`CreateBiasProperties()`'s original implementation allocated **one**
+`CPropertyAction` and passed the same pointer to `CreateIntegerProperty()`
+for every bias (and, separately, the six live-stats properties shared one
+`CPropertyAction` the same way). This compiled and worked for ordinary
+property reads/writes — the crash only showed up at device shutdown, as
+an intermittent process crash (observed as the self-test harness exiting
+with no Python traceback and lost stdout, consistent with a hard native
+crash rather than a normal exception).
+
+Root-caused by reading `MMDevice/Property.h`: `MM::Property`'s destructor
+(`~Property() { delete fpAction_; }`) unconditionally deletes its own
+action functor. Every property created with the *same* `CPropertyAction*`
+therefore deletes that same pointer when it's destroyed — the first one
+frees it validly, every subsequent one is a double-free, corrupting the
+heap. `micromanager_examples/DemoCamera/DemoCamera.cpp`'s own
+`OnTestProperty` loop already does the right thing (`new
+CPropertyActionEx(...)` freshly *inside* the loop, once per property) —
+confirmed against that reference before fixing. **Fix**: both
+`CreateBiasProperties()` and the live-stats property loop in
+`Initialize()` now allocate a fresh `new CPropertyAction(...)` per
+property, never reusing one across multiple `CreateProperty()` calls.
+
+**Lesson for future goals**: any loop that creates multiple MM properties
+must allocate a new action-functor instance per property, full stop —
+this is easy to get wrong once (it compiles, links, and passes ordinary
+property read/write tests fine) and only manifests as a shutdown-time
+crash.
+
+### Bug found while self-testing: background-thread `SetProperty()` racing the main thread
+
+Related to the above but a separate issue: the first working version of
+the live-stats properties followed Goal 4's `EBS-RawRecordingStatus`
+pattern exactly (`SetProperty()` + `OnPropertyChanged()` from
+`UpdateStats()`, running on `ProphEBSStatsThread`'s own thread). This
+also produced an intermittent crash. Unlike Goal 4's status string
+(updated a handful of times per recording), `ProphEBSStatsThread` ticks
+continuously, once per second, for the *entire* time a camera is
+connected — heavily overlapping with the self-test's own
+`core.setProperty()`/`core.getProperty()` calls happening from the main
+thread throughout. `MM::PropertyCollection`'s thread-safety against a
+background-thread `SetProperty()` racing a main-thread property access is
+not documented or verified anywhere in the MMDevice headers, and Goal 4's
+one-shot pattern never exercised this path enough to hit it.
+
+**Fix**: redesigned so `UpdateStats()` never calls `SetProperty()` (the
+device's own, apparently-not-thread-safe `PropertyCollection` mutator) —
+it only writes to plain `std::atomic<double>` members (`avgDataRateMBps_`
+etc.), and a new shared `OnStat()` handler reads the matching atomic in
+`BeforeGet`, computed synchronously on whatever thread MMCore is already
+calling from (e.g. a Python `getProperty()` call, or the GUI). The six
+live-stats properties are created read-only.
+
+**Verified fixed**: after both fixes, `tools/test_prophebs.py` ran
+start-to-finish repeatedly against the real connected IMX636 with no
+crash, `exit=0`, `SUCCESS` printed.
+
+### Follow-up: stats properties weren't live-updating in the GUI
+
+User reported the six live-stats properties only changed value when some
+*other* property was touched, not continuously — the `BeforeGet`-only
+design above is correct for on-demand reads (e.g. the self-test's
+`getProperty()` calls) but does nothing to make the Device/Property
+Browser refresh on its own, since nothing was prompting MMCore to call
+`GetProperty()` in the first place. Root cause: `SetProperty()` was
+removed (correctly, see the crash above) but so was any call to
+`OnPropertyChanged()` — and per the Goal 4 lesson, the GUI reads from
+MMCore's `stateCache_`, which is *only* updated by `OnPropertyChanged()`
+(or a Core-initiated `setProperty()`), never by `BeforeGet` alone.
+
+**Fix**: added six `OnPropertyChanged(name, value)` calls at the end of
+`UpdateStats()`, using the freshly-computed atomic values directly (no
+extra `GetProperty()`/`SetProperty()` round-trip needed). This is safe
+from the background thread specifically because `OnPropertyChanged()` is
+a *different* code path than `SetProperty()` — confirmed by reading
+`CoreCallback::OnPropertyChanged()` in `MMCore/CoreCallback.cpp`: it only
+touches MMCore's separately-locked `stateCache_` under its own
+`std::lock_guard`, never this device's own `PropertyCollection` (the
+thing `SetProperty()` mutates, and the actual source of the earlier
+crash). So the final design keeps both fixes together: atomics +
+`BeforeGet` for correctness/thread-safety of the *value*, plus
+`OnPropertyChanged()` for pushing live updates to the GUI, without ever
+calling this device's own `SetProperty()` from a background thread.
+
+**Verified**: re-ran `tools/test_prophebs.py` after this change — still
+`exit=0`, `SUCCESS`, no crash. The live-update behavior itself (GUI
+refreshing every ~1s without touching another property) can only be
+confirmed by the user in the real Device/Property Browser, not by this
+harness (same caveat as other GUI-only behaviors throughout this log).
+
+### Bug found while self-testing: anti-flicker frequency band silently rejected
+
+`CreateAntiFlickerProperties()` originally didn't call `SetPropertyLimits()`
+on `EBS-AntiFlicker-LowFreq`/`HighFreq`, and `set_frequency_band()`'s
+`bool` return value wasn't checked. Setting `LowFreq=45` on this sensor
+(whose actual minimum supported frequency is 50 Hz) was silently rejected
+by the hardware; the property kept reading back its old value with no
+error anywhere. **Fix**: added `SetPropertyLimits()` from
+`get_min/max_supported_frequency()` (so MM itself rejects an out-of-range
+value before it reaches the hardware) and a `LogMessage()` warning if
+`set_frequency_band()` ever returns `false` despite passing MM's own
+limits. `tools/test_prophebs.py` now derives its probe values from the
+property's own reported limits instead of a hardcoded guess.
+
+### Verified locally
+
+- **Build**: `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`
+  succeeds with 0 warnings/errors (VS2022 Preview toolset, same as Goals
+  1-4). Note: on this dev machine, building via the **PowerShell tool**
+  was required — the identical command via the Bash tool's `cmd /c '...'`
+  reliably produced truncated/no output even though MSBuild output
+  streamed correctly through PowerShell; see
+  `docs/BUILD_AND_USAGE.md`/build-environment notes.
+- **Real hardware, via `tools/test_prophebs.py`** (extended with Goal 5
+  checks): `EBS-BiasRangeCheckBypass` correctly flagged pre-init;
+  `EBS-Generation`/`EBS-DataEncodingFormat` read back `"4.2"`/`"EVT3"`;
+  all 6 real (hardware-fetched) bias properties round-tripped a mid-range
+  value within their reported limits; ERC/event-trail-filter/anti-flicker
+  enable+value round-trips all passed; live-stats properties settled to
+  plausible non-zero values after ~3.5 s of streaming
+  (`AvgDataRate-MBps ≈ 24`, `AvgEventRate-MEvps ≈ 10`,
+  `Temperature-C = 22`, `PixelDeadTime-us = 75`) — `Illumination-lux`
+  stayed at its `0.0` default since `I_Monitoring::get_illumination()`
+  throws on this particular sensor (logged as `[HAL][ERROR] Failed to get
+  illumination`, harmless, handled by the per-metric try/catch). Full
+  script (`SUCCESS`, exit 0) including all Goal 1-4 checks passed
+  unchanged, confirming no regression.
+- **Not yet verified**: a real walkthrough in the MicroManager Studio GUI
+  — per the usual handoff pattern, this is pending the user, specifically
+  checking that `EBS-BiasRangeCheckBypass` is editable before "Add
+  Device" and greyed out afterward in the Hardware Config Wizard/Device
+  Property Browser, and that bias property sliders respect their fetched
+  min/max ranges visually.
+
+### Open questions / TODO for later goals
+
+- `EBS-AvgERCDropRate-KEvps` is explicitly an estimate
+  (`target − measured`), not a hardware-reported value — there is no HAL
+  API for the real dropped-event count. If Prophesee ever exposes one,
+  this should switch to it.
+- `I_Monitoring::get_illumination()` throwing on the connected IMX636
+  (while `get_temperature()`/`get_pixel_dead_time()` work fine) is
+  unexplained — possibly a HAL/firmware limitation specific to this
+  sensor or SDK version, not investigated further since the per-metric
+  try/catch already handles it gracefully (property stays at its safe
+  0.0 default rather than blocking the other metrics).
+- Goal 6 ("custom view methods") is next per the roadmap — configurable
+  integration window, offset, and common filters for the live view.

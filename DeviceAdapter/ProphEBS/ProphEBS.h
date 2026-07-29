@@ -59,8 +59,14 @@
 #include "ImgBuffer.h"
 
 #include <metavision/sdk/stream/camera.h>
+#include <metavision/hal/facilities/i_antiflicker_module.h>
+#include <metavision/hal/facilities/i_erc_module.h>
+#include <metavision/hal/facilities/i_event_trail_filter_module.h>
+#include <metavision/hal/facilities/i_ll_biases.h>
 
+#include <atomic>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -99,6 +105,71 @@ extern const char* g_PropRawFilePath;
 extern const char* g_PropRawRecordingStatus;
 extern const char* g_PropTempFolder;
 
+// Goal 5: pre-init-only property. Must be set (in the Hardware Configuration
+// Wizard, or via loadDevice/before initializeDevice) before Initialize() --
+// MM's PropertyCollection enforces pre-init properties as read-only once the
+// device is initialized, which is exactly "settable during device setup
+// only." Mirrors Metavision Studio's "bypass biases range check" checkbox
+// (Metavision::DeviceConfig::enable_biases_range_check_bypass) -- widens
+// every bias' allowed range from the recommended range to the full
+// hardware-allowed range. Read once, in ConnectToCamera(), before opening
+// the camera.
+extern const char* g_PropBiasRangeCheckBypass;
+
+// Goal 5: fallback bias names exposed (as local, non-hardware-backed
+// properties defaulting to 0) when no camera is connected. When a camera
+// *is* connected, the actual set of bias properties is fetched from
+// Metavision::I_LL_Biases::get_all_biases() instead -- this list is only a
+// fallback so the properties the user explicitly asked for still exist and
+// are inspectable/settable (locally) without hardware attached.
+extern const char* const g_FallbackBiasNames[6];
+
+// Goal 5: ERC (event rate control) property names.
+extern const char* g_PropErcEnabled;
+extern const char* g_PropErcEventRate;
+
+// Goal 5: event trail (STC) filter property names.
+extern const char* g_PropEventTrailFilterEnabled;
+extern const char* g_PropEventTrailFilterThreshold;
+extern const char* g_PropEventTrailFilterMode;
+
+// Goal 5: anti-flicker property names.
+extern const char* g_PropAntiFlickerEnabled;
+extern const char* g_PropAntiFlickerStartThreshold;
+extern const char* g_PropAntiFlickerStopThreshold;
+extern const char* g_PropAntiFlickerDutyCycle;
+extern const char* g_PropAntiFlickerFilterType;
+extern const char* g_PropAntiFlickerLowFreq;
+extern const char* g_PropAntiFlickerHighFreq;
+
+// Goal 5: static read-only info properties (beyond the Goal 2 ones).
+extern const char* g_PropGeneration;
+extern const char* g_PropDataEncodingFormat;
+
+// Goal 5: live, periodically-refreshed read-only monitoring properties.
+// Unlike g_PropRawRecordingStatus in Goal 4, these are NOT updated via
+// SetProperty()/OnPropertyChanged() from ProphEBSStatsThread's background
+// thread -- MM's PropertyCollection isn't documented/verified thread-safe
+// against a background-thread SetProperty() racing the main thread's own
+// property reads/writes (unlike Goal 4's status string, which only updates
+// once per recording, this thread ticks every g_StatsIntervalMs for the
+// entire time the camera is connected, so the same race that was
+// theoretically possible in Goal 4 became practically hit here during
+// self-testing (an intermittent crash, root-caused to this). Instead,
+// UpdateStats() only writes to plain std::atomic<double> members, and each
+// property is a normal read-only property with a CPropertyAction handler
+// that reads the cached atomic in BeforeGet -- computed off the property
+// system entirely, thread-safe by construction, no push needed.
+extern const char* g_PropAvgDataRate;
+extern const char* g_PropAvgEventRate;
+extern const char* g_PropAvgErcDropRate;
+extern const char* g_PropTemperature;
+extern const char* g_PropIllumination;
+extern const char* g_PropPixelDeadTime;
+
+// Goal 5: stats refresh period for the new ProphEBSStatsThread.
+const double g_StatsIntervalMs = 1000.0;
+
 // Fixed test-image geometry for Goal 1 / the no-hardware fallback. Real
 // sensor geometry (from Metavision::I_Geometry) is used instead whenever a
 // camera is actually connected -- see CProphEBSCamera::sensorWidth_/
@@ -120,6 +191,7 @@ const unsigned g_EventIntensityScale = 32;
 
 class ProphEBSSequenceThread;
 class ProphEBSFrameBuilderThread;
+class ProphEBSStatsThread;
 
 //////////////////////////////////////////////////////////////////////////////
 // CProphEBSCamera class
@@ -171,6 +243,39 @@ public:
    // into the MMCore circular buffer.
    int InsertImage();
 
+   // Goal 5: property action handlers. One shared OnBias() handles every
+   // bias property (looks up which one via pProp->GetName()) rather than a
+   // handler per bias, since the actual set of biases is fetched from the
+   // camera at runtime (see ConnectToCamera()/CreateBiasProperties()) and
+   // isn't known at compile time.
+   int OnBias(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnErcEnabled(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnErcEventRate(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnEventTrailFilterEnabled(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnEventTrailFilterThreshold(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnEventTrailFilterMode(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnAntiFlickerEnabled(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnAntiFlickerStartThreshold(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnAntiFlickerStopThreshold(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnAntiFlickerDutyCycle(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnAntiFlickerFilterType(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnAntiFlickerLowFreq(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnAntiFlickerHighFreq(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Goal 5: one shared read-only handler for all six live-stats
+   // properties -- BeforeGet just reads the matching cached
+   // std::atomic<double> (looked up via pProp->GetName(), same pattern as
+   // OnBias()), no hardware/thread interaction at all on this call path.
+   int OnStat(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Goal 5: called every g_StatsIntervalMs by ProphEBSStatsThread while
+   // streaming_ -- reads and resets the raw-byte/event-count atomics to
+   // compute average data/event rate, estimates the ERC drop rate, and
+   // polls I_Monitoring for temperature/illumination/pixel dead time.
+   // Writes only to the std::atomic<double> stat cache members below, never
+   // touches the MM property system -- see g_PropAvgDataRate for why.
+   void UpdateStats();
+
 private:
    void GenerateTestImage();
 
@@ -179,6 +284,21 @@ private:
    // cameraConnected_ false so the rest of Initialize() can fall back to
    // Goal 1 behavior (static test image, no hardware-derived properties).
    void ConnectToCamera();
+
+   // Goal 5: creates one Integer property per bias. If cameraConnected_,
+   // enumerates Metavision::I_LL_Biases::get_all_biases() and sets each
+   // property's range from LL_Bias_Info::get_bias_range(); otherwise falls
+   // back to g_FallbackBiasNames, defaulting each to 0 with no range limit
+   // (there's no hardware to validate against). Called from Initialize().
+   void CreateBiasProperties();
+
+   // Goal 5: creates the ERC/event-trail-filter/anti-flicker properties.
+   // Called from Initialize(), after ConnectToCamera(), so range-limited
+   // properties (e.g. EBS-ERC-EventRate) can use the real hardware-reported
+   // min/max when connected.
+   void CreateErcProperties();
+   void CreateEventTrailFilterProperties();
+   void CreateAntiFlickerProperties();
 
    // Goal 3: starts real event-driven acquisition once ConnectToCamera() has
    // succeeded -- queries sensor geometry, sizes the frame buffers/event
@@ -304,6 +424,58 @@ private:
    bool rawRecordingActive_;
    std::string currentRawFilePath_;
    bool movePendingToMdaFolder_;
+
+   // Goal 5: bias property state. When cameraConnected_, biasNames_ holds
+   // the SDK-reported keys from I_LL_Biases::get_all_biases() (property
+   // name is "EBS-" + key); otherwise it holds g_FallbackBiasNames and
+   // localBiasValues_ is the backing store OnBias() reads/writes instead of
+   // touching hardware.
+   std::vector<std::string> biasNames_;
+   std::map<std::string, long> localBiasValues_;
+
+   // Goal 5: local fallback storage for ERC/event-trail-filter/anti-flicker
+   // properties when no camera is connected -- mirrors the bias fallback
+   // above so OnErcEnabled() etc. have somewhere to read/write without
+   // touching cam_.
+   bool localErcEnabled_;
+   long localErcEventRate_;
+   bool localEventTrailFilterEnabled_;
+   long localEventTrailFilterThreshold_;
+   std::string localEventTrailFilterMode_;
+   bool localAntiFlickerEnabled_;
+   long localAntiFlickerStartThreshold_;
+   long localAntiFlickerStopThreshold_;
+   double localAntiFlickerDutyCycle_;
+   std::string localAntiFlickerFilterType_;
+   long localAntiFlickerLowFreq_;
+   long localAntiFlickerHighFreq_;
+
+   // Goal 5: static read-only info, read once in ConnectToCamera().
+   std::string generation_;
+   std::string dataEncodingFormat_;
+
+   // Goal 5: live-stats state. totalRawBytes_/totalEventCount_ are
+   // incremented on the Metavision SDK's own callback threads (raw_data()
+   // and cd(), respectively) and read-and-reset by UpdateStats() on
+   // statsThd_'s thread -- std::atomic avoids needing a dedicated lock for
+   // what's just a running total.
+   std::atomic<uint64_t> totalRawBytes_;
+   std::atomic<uint64_t> totalEventCount_;
+   Metavision::CallbackId rawDataCallbackId_;
+   ProphEBSStatsThread* statsThd_;
+   friend class ProphEBSStatsThread;
+
+   // Goal 5: cached stat values, written only by UpdateStats() (on
+   // statsThd_'s thread) and read only by OnStat() (called synchronously by
+   // MMCore on whatever thread is querying the property) -- std::atomic is
+   // sufficient since each is an independent value with no cross-field
+   // consistency requirement.
+   std::atomic<double> avgDataRateMBps_;
+   std::atomic<double> avgEventRateMEvps_;
+   std::atomic<double> avgErcDropRateKEvps_;
+   std::atomic<double> temperatureC_;
+   std::atomic<double> illuminationLux_;
+   std::atomic<double> pixelDeadTimeUs_;
 };
 
 //////////////////////////////////////////////////////////////////////////////
@@ -351,6 +523,35 @@ class ProphEBSFrameBuilderThread : public MMDeviceThreadBase
 public:
    explicit ProphEBSFrameBuilderThread(CProphEBSCamera* pCamera);
    ~ProphEBSFrameBuilderThread();
+
+   void Start(double intervalMs);
+   void Stop();
+   bool IsStopped();
+
+private:
+   int svc();
+
+   CProphEBSCamera* camera_;
+   double intervalMs_;
+   bool stop_;
+   MMThreadLock stopLock_;
+};
+
+//////////////////////////////////////////////////////////////////////////////
+// ProphEBSStatsThread
+//
+// Goal 5: runs continuously while a connected camera is streaming, calling
+// CProphEBSCamera::UpdateStats() every g_StatsIntervalMs to refresh the
+// live read-only monitoring properties (data/event rate, ERC drop-rate
+// estimate, temperature, illumination, pixel dead time). Mirrors
+// ProphEBSFrameBuilderThread's pattern exactly, just on a coarser interval
+// suited to human-readable stats rather than frame building.
+//////////////////////////////////////////////////////////////////////////////
+class ProphEBSStatsThread : public MMDeviceThreadBase
+{
+public:
+   explicit ProphEBSStatsThread(CProphEBSCamera* pCamera);
+   ~ProphEBSStatsThread();
 
    void Start(double intervalMs);
    void Stop();

@@ -8,7 +8,22 @@ mm_dir = r"C:\Users\kjamartens\AppData\Local\pymmcore-plus\pymmcore-plus\mm\Micr
 core = CMMCorePlus()
 core.setDeviceAdapterSearchPaths([mm_dir])
 core.loadDevice("ProphEBSCam", "ProphEBS", "ProphEBS-Camera")
+
+# Goal 5: EBS-BiasRangeCheckBypass is a pre-init property -- MM's own
+# convention (isPropertyPreInit()) for "settable during device setup only":
+# the Hardware Config Wizard uses this flag to grey the property out once a
+# device has been added/initialized, though MMCore itself doesn't block a
+# post-init setProperty() call at the API level (that enforcement is a GUI
+# concern, not a Core one -- confirmed by reading
+# MMDevice/Property.cpp::PropertyCollection::Set(), which only checks the
+# per-property readOnly_ flag, never IsPropertyPreInit()). So the
+# behavior to check here is the metadata flag itself, not read-only-ness.
+assert core.isPropertyPreInit("ProphEBSCam", "EBS-BiasRangeCheckBypass"), \
+    "EBS-BiasRangeCheckBypass should be flagged as a pre-init property"
+core.setProperty("ProphEBSCam", "EBS-BiasRangeCheckBypass", "Off")
+
 core.initializeDevice("ProphEBSCam")
+print("Goal 5: EBS-BiasRangeCheckBypass is flagged pre-init, as expected")
 
 # Goal 2: connection/identification properties. These are populated whether
 # or not a real EBS is plugged in -- ConnectionStatus reports either
@@ -141,6 +156,123 @@ if connection_status == "Connected":
         core.popNextImage()
 else:
     print("Goal 4: no EBS connected -- cam_.start_recording() needs a real streaming camera, skipping recording checks")
+
+# Goal 5: static read-only info properties. Non-empty regardless of
+# connection state (fall back to "N/A" like the Goal 2 identification
+# properties), but only meaningfully populated when connected.
+for prop in ("EBS-Generation", "EBS-DataEncodingFormat"):
+    value = core.getProperty("ProphEBSCam", prop)
+    print(prop, "=", value)
+    assert value, f"{prop} should never be empty"
+if connection_status == "Connected":
+    assert core.getProperty("ProphEBSCam", "EBS-Generation") != "N/A"
+    assert core.getProperty("ProphEBSCam", "EBS-DataEncodingFormat") != "N/A"
+
+# Goal 5: bias properties. All EBS-bias_* properties should exist (either
+# fetched from real hardware, or the fixed fallback list) and be settable
+# within whatever range MM reports (unbounded when not connected).
+bias_props = [p for p in core.getDevicePropertyNames("ProphEBSCam") if p.startswith("EBS-bias_")]
+assert len(bias_props) >= 6, f"expected at least the 6 requested biases, got: {bias_props}"
+print("Goal 5: found", len(bias_props), "bias properties:", bias_props)
+for prop in bias_props:
+    original = core.getProperty("ProphEBSCam", prop)
+    try:
+        has_limits = core.hasPropertyLimits("ProphEBSCam", prop)
+    except Exception:
+        has_limits = False
+    if has_limits:
+        lo = int(core.getPropertyLowerLimit("ProphEBSCam", prop))
+        hi = int(core.getPropertyUpperLimit("ProphEBSCam", prop))
+        probe = lo + (hi - lo) // 2
+    else:
+        probe = 0
+    core.setProperty("ProphEBSCam", prop, str(probe))
+    readback = core.getProperty("ProphEBSCam", prop)
+    assert int(readback) == probe, f"{prop}: set {probe}, read back {readback}"
+    core.setProperty("ProphEBSCam", prop, original)  # restore
+print("Goal 5: all bias properties round-tripped a mid-range value successfully")
+
+# Goal 5: ERC (event rate control) properties.
+erc_min = int(core.getPropertyLowerLimit("ProphEBSCam", "EBS-ERC-EventRate")) \
+    if core.hasPropertyLimits("ProphEBSCam", "EBS-ERC-EventRate") else 1
+erc_max = int(core.getPropertyUpperLimit("ProphEBSCam", "EBS-ERC-EventRate")) \
+    if core.hasPropertyLimits("ProphEBSCam", "EBS-ERC-EventRate") else 100000000
+core.setProperty("ProphEBSCam", "EBS-ERC-EventRate", str(min(erc_max, max(erc_min, 20000000))))
+core.setProperty("ProphEBSCam", "EBS-ERC-Enabled", "On")
+assert core.getProperty("ProphEBSCam", "EBS-ERC-Enabled") == "On"
+print("Goal 5: ERC-Enabled =", core.getProperty("ProphEBSCam", "EBS-ERC-Enabled"),
+      ", ERC-EventRate =", core.getProperty("ProphEBSCam", "EBS-ERC-EventRate"))
+core.setProperty("ProphEBSCam", "EBS-ERC-Enabled", "Off")
+core.setProperty("ProphEBSCam", "EBS-ERC-EventRate", "50000000")  # restore default
+
+# Goal 5: event trail (STC) filter properties.
+core.setProperty("ProphEBSCam", "EBS-EventTrailFilter-Threshold", "20000")
+core.setProperty("ProphEBSCam", "EBS-EventTrailFilter-Mode", "STC_CUT_TRAIL")
+core.setProperty("ProphEBSCam", "EBS-EventTrailFilter-Enabled", "On")
+assert core.getProperty("ProphEBSCam", "EBS-EventTrailFilter-Mode") == "STC_CUT_TRAIL"
+assert core.getProperty("ProphEBSCam", "EBS-EventTrailFilter-Threshold") == "20000"
+print("Goal 5: EventTrailFilter-Enabled =", core.getProperty("ProphEBSCam", "EBS-EventTrailFilter-Enabled"),
+      ", Mode =", core.getProperty("ProphEBSCam", "EBS-EventTrailFilter-Mode"),
+      ", Threshold =", core.getProperty("ProphEBSCam", "EBS-EventTrailFilter-Threshold"))
+core.setProperty("ProphEBSCam", "EBS-EventTrailFilter-Enabled", "Off")
+core.setProperty("ProphEBSCam", "EBS-EventTrailFilter-Mode", "TRAIL")
+core.setProperty("ProphEBSCam", "EBS-EventTrailFilter-Threshold", "10000")  # restore defaults
+
+# Goal 5: anti-flicker properties, including the frequency band. LowFreq/
+# HighFreq's actual hardware-supported range varies by sensor -- probe
+# values are derived from MM's own reported limits (set in
+# CreateAntiFlickerProperties() from I_AntiFlickerModule::
+# get_min/max_supported_frequency()) rather than assumed, since a
+# hardcoded out-of-range value is silently rejected by the hardware
+# (bool return value) and was exactly how a missing-limits bug was caught
+# here during development -- see docs/DEVLOG.md Goal 5.
+if core.hasPropertyLimits("ProphEBSCam", "EBS-AntiFlicker-LowFreq"):
+    af_min = int(core.getPropertyLowerLimit("ProphEBSCam", "EBS-AntiFlicker-LowFreq"))
+    af_max = int(core.getPropertyUpperLimit("ProphEBSCam", "EBS-AntiFlicker-HighFreq"))
+else:
+    af_min, af_max = 50, 60
+af_low = af_min
+af_high = min(af_max, af_min + 10)
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-LowFreq", str(af_low))
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-HighFreq", str(af_high))
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-DutyCycle", "40")
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-FilterType", "Band Pass")
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-Enabled", "On")
+assert core.getProperty("ProphEBSCam", "EBS-AntiFlicker-FilterType") == "Band Pass"
+assert core.getProperty("ProphEBSCam", "EBS-AntiFlicker-LowFreq") == str(af_low)
+assert core.getProperty("ProphEBSCam", "EBS-AntiFlicker-HighFreq") == str(af_high)
+print("Goal 5: AntiFlicker-Enabled =", core.getProperty("ProphEBSCam", "EBS-AntiFlicker-Enabled"),
+      ", FilterType =", core.getProperty("ProphEBSCam", "EBS-AntiFlicker-FilterType"),
+      ", Band =", core.getProperty("ProphEBSCam", "EBS-AntiFlicker-LowFreq"), "-",
+      core.getProperty("ProphEBSCam", "EBS-AntiFlicker-HighFreq"))
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-Enabled", "Off")
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-FilterType", "Band Cut")
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-LowFreq", "50")
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-HighFreq", "60")
+core.setProperty("ProphEBSCam", "EBS-AntiFlicker-DutyCycle", "50")  # restore defaults
+
+# Goal 5: live-stats properties. Only meaningful with a connected, streaming
+# camera -- give the stats thread (1s interval) a few ticks to update them
+# at least once from their 0.0 initial value.
+if connection_status == "Connected":
+    time.sleep(3.5)
+    data_rate = float(core.getProperty("ProphEBSCam", "EBS-AvgDataRate-MBps"))
+    event_rate = float(core.getProperty("ProphEBSCam", "EBS-AvgEventRate-MEvps"))
+    drop_rate = float(core.getProperty("ProphEBSCam", "EBS-AvgERCDropRate-KEvps"))
+    temperature = float(core.getProperty("ProphEBSCam", "EBS-Temperature-C"))
+    illumination = float(core.getProperty("ProphEBSCam", "EBS-Illumination-lux"))
+    dead_time = float(core.getProperty("ProphEBSCam", "EBS-PixelDeadTime-us"))
+    print("Goal 5: live stats -- AvgDataRate-MBps =", data_rate, ", AvgEventRate-MEvps =", event_rate,
+          ", AvgERCDropRate-KEvps =", drop_rate, ", Temperature-C =", temperature,
+          ", Illumination-lux =", illumination, ", PixelDeadTime-us =", dead_time)
+    assert data_rate >= 0.0 and event_rate >= 0.0 and drop_rate >= 0.0
+    # Temperature is the most reliable plausibility check available without
+    # hardware-specific knowledge of illumination/dead-time ranges -- a real
+    # sensor should report a sane room/board temperature, not the 0.0
+    # properties were created with.
+    assert temperature != 0.0, "expected EBS-Temperature-C to have been updated by the stats thread"
+else:
+    print("Goal 5: no EBS connected -- live stats properties stay at their 0.0 default, skipping plausibility checks")
 
 core.unloadDevice("ProphEBSCam")
 print("SUCCESS")
