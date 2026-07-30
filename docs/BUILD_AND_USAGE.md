@@ -478,6 +478,125 @@ If the `.raw` file exists and has real content, **Goal 4 is verified
 working** — let the project owner know so we can tag this as `v0.4` and move
 on to Goal 5 (adding EBS hardware properties).
 
+## Goal 5 (Adding hardware-setting properties)
+
+### What's new
+
+Every commonly-adjusted EBS hardware setting is now exposed as a normal MM
+property — visible and settable from the Device/Property Browser exactly
+like any other camera's gain/offset/binning, with no special UI. If a real
+sensor is connected, each property is backed by the actual hardware
+(reading its current on-sensor value, and writing changes straight to the
+sensor); if no camera is connected, the same properties still exist as
+local, non-hardware-backed values so the adapter stays fully
+inspectable/testable without an EBS attached.
+
+| Property group | Properties |
+|---|---|
+| Bias range check | `EBS-BiasRangeCheckBypass` (**pre-init only** — set before "Add Device"/`initializeDevice`, greyed out afterward; mirrors Metavision Studio's "bypass biases range check" checkbox) |
+| Biases | One `EBS-bias_*` Integer property per bias the sensor reports (e.g. `EBS-bias_diff`, `EBS-bias_diff_off`, `EBS-bias_diff_on`, `EBS-bias_fo`, `EBS-bias_hpf`, `EBS-bias_refr` on the IMX636) — each range-limited to what the hardware actually supports |
+| Event rate control (ERC) | `EBS-ERC-Enabled` (Off/On, default Off), `EBS-ERC-EventRate` (default 50,000,000 events/s) |
+| Event trail (STC) filter | `EBS-EventTrailFilter-Enabled` (Off/On, default Off), `-Threshold` (default 10,000 µs), `-Mode` (`TRAIL`/`STC_CUT_TRAIL`/`STC_KEEP_TRAIL`, default `TRAIL`) |
+| Anti-flicker | `EBS-AntiFlicker-Enabled` (Off/On, default Off), `-StartThreshold`/`-StopThreshold` (default 6/4), `-DutyCycle` (default 50%), `-FilterType` (`Band Pass`/`Band Cut`, default `Band Cut`), `-LowFreq`/`-HighFreq` (default 50/60 Hz) |
+| Static info | `EBS-Generation` (e.g. `4.2`), `EBS-DataEncodingFormat` (e.g. `EVT3`) — read-only, alongside the Goal 2 identification properties |
+| Live monitoring | `EBS-AvgDataRate-MBps`, `EBS-AvgEventRate-MEvps`, `EBS-AvgERCDropRate-KEvps`, `EBS-Temperature-C`, `EBS-Illumination-lux`, `EBS-PixelDeadTime-us` — read-only, refresh roughly once per second while the camera is streaming |
+
+`EBS-AvgERCDropRate-KEvps` is an estimate (target minus measured event
+rate), since the hardware doesn't report a real dropped-event count.
+`EBS-Illumination-lux` may stay at `0.0` on some sensors/SDK versions —
+this specific IMX636 unit throws on that one hardware query while
+temperature and pixel-dead-time both work fine; handled gracefully (that
+one metric just doesn't update, the others still do).
+
+### 11. Adjust EBS hardware settings
+
+1. Make sure your EBS camera is plugged in and `EBS-ConnectionStatus` reads
+   `Connected` (open the Device/Property Browser to check).
+2. In the Device/Property Browser, find `ProphEBS-Camera` and scroll through
+   its property list — you should see the bias, ERC, event trail filter,
+   anti-flicker, and live monitoring properties listed above alongside the
+   properties from earlier goals.
+3. Try changing a bias value (e.g. `EBS-bias_hpf`) to a different value
+   within its shown min/max range, then click elsewhere to apply it — this
+   writes straight to the sensor.
+4. Turn `EBS-AntiFlicker-Enabled` **On** and watch `EBS-AntiFlicker-LowFreq`/
+   `-HighFreq` reject anything outside the range the sensor supports (the
+   Browser should just refuse an out-of-range value rather than silently
+   ignoring it).
+5. Watch `EBS-AvgDataRate-MBps`/`EBS-AvgEventRate-MEvps`/`EBS-Temperature-C`
+   update on their own every second or so while **Live** is running, with no
+   need to touch any other property first.
+
+If bias/filter changes take effect on the sensor and the live monitoring
+properties update on their own, **Goal 5 is verified working** — let the
+project owner know so we can tag this as `v0.5` and move on to Goal 6
+(custom view methods).
+
+## Goal 6 (Custom view methods)
+
+### What's new
+
+The live view is now fully configurable instead of the fixed "100 ms
+window, ×32 brightness" behavior from Goal 3. Four things changed:
+
+| Property | Meaning |
+|---|---|
+| `Exposure` | MicroManager's own standard exposure control **is** the event-integration window now — set it like you would on any camera (Device/Property Browser, MDA dialog, or a script's `setExposure()`). Can go down to **0.001 ms (1 microsecond)** — see the sub-millisecond note below — and changes take effect on the very next event, no restart needed. |
+| `EBS-DisplayRefreshMs` | How often the live image is actually published/refreshed (default **1 ms**), separate from `Exposure`. There's no benefit setting this below ~1 ms since nothing downstream (Live view, a human eye) can show it any faster — this just controls how often the displayed frame updates, independent of how short each integration window is. |
+| `EBS-LiveViewMinIntervalMs` | Floor (default **5 ms**) on how fast MicroManager's **Live** view specifically is allowed to push new frames. Live view otherwise follows `Exposure` directly (like any normal camera) — this floor only kicks in once `Exposure` drops below it, since pushing Live frames faster than the GUI can actually display them just causes a growing display backlog/delay, not a smoother picture. Doesn't affect Snap or Multi-D Acquisition, only continuous Live streaming. |
+| `EBS-ViewMode` | Which per-pixel quantity is rendered: `NetSigned` (default) shows ON-event-count minus OFF-event-count, signed; `Merged` is the old Goal 3/5 look (ON+OFF combined); `OnOnly`/`OffOnly` show just one polarity. |
+| `EBS-ViewOffset` | The gray level a quiet (no-activity) pixel sits at — default **10**. In `NetSigned` mode this is what lets net OFF activity show up as *darker than* this baseline instead of being clipped to 0. |
+| `EBS-ViewScale` | Multiplier applied to the raw per-pixel count before adding the offset — default **1**. Turn this up if the live image looks too dim; down if it's saturating to white. |
+
+Formula: `pixel = clamp(EBS-ViewOffset + raw_count × EBS-ViewScale, 0, 255)`.
+
+**Sub-millisecond `Exposure` note**: internally, the integration window is
+now measured against the sensor's own event timestamps (microsecond
+resolution) rather than a fixed timer, so values well under 1 ms genuinely
+work — tested down to the 0.001 ms (1 µs) floor on real hardware at ~10
+million events/second with no issues. If the sensor's scene goes fully
+quiet (no events at all) for about 100 ms, the display automatically resets
+to the `EBS-ViewOffset` baseline rather than freezing on the last frame.
+If you drop `Exposure` below `EBS-LiveViewMinIntervalMs` while **Live** is
+running, the live feed itself won't refresh faster than that floor (even
+though the integration window internally is that short) — this is
+intentional, since MicroManager's own display/GUI can't usefully show
+updates faster than a few milliseconds anyway, and trying to push faster
+than that just builds up a growing display delay instead of a smoother
+picture. Lower `EBS-LiveViewMinIntervalMs` if you want to test pushing
+Live view harder, but don't expect it to help once you're faster than the
+GUI can actually draw.
+
+There's also an optional software denoising filter, independent of the
+Goal 5 hardware event-trail (STC) filter:
+
+| Property | Meaning |
+|---|---|
+| `EBS-ActivityFilter-Enabled` | `Off` (default) / `On`. When on, events are run through Metavision's own activity-noise filter *before* being counted, dropping isolated events with no similar neighbor recently. |
+| `EBS-ActivityFilter-Threshold-us` | How far back (in microseconds) to look for a "similar recent event" — default 10,000 µs (10 ms). Larger values filter more aggressively. |
+
+### 12. Try the new view controls
+
+1. Make sure your EBS camera is plugged in and connected, and open **Live**.
+2. Open the **Device/Property Browser** for `ProphEBS-Camera`.
+3. Change `Exposure` (e.g. to 250 to integrate longer, or 30 for a faster,
+   noisier feed) and watch the Live window respond within about one new
+   exposure interval. Try a sub-millisecond value too, e.g. `0.1` or even
+   the floor `0.001` — the feed should keep updating smoothly, just
+   integrating a much shorter slice of activity per displayed frame.
+4. Change `EBS-ViewMode` between `NetSigned`, `Merged`, `OnOnly`, and
+   `OffOnly` while something is moving in front of the sensor, and compare
+   how each looks.
+5. Try raising `EBS-ViewScale` (e.g. to 4 or 8) if the `NetSigned`/`OnOnly`/
+   `OffOnly` views look too dim, or lowering it if they're washed out to
+   white.
+6. Turn `EBS-ActivityFilter-Enabled` **On** in a noisy/low-light scene and
+   compare the amount of stray single-pixel flicker before and after.
+
+If the live view visibly responds to each of these properties as described,
+**Goal 6 is verified working** — let the project owner know so we can tag
+this as `v0.6` and move on to Goal 7 (pixel masking and sensor ROI).
+
 ## Troubleshooting MicroManager itself
 
 | Symptom | Likely cause |

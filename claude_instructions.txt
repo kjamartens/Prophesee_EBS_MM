@@ -44,6 +44,7 @@ Get inspired by the EBS documentation to offer multiple view methods. Most impor
 
 7. Pixel-by-pixel differences
 I want to be able to block out individual pixels (basically just a list of indeces), as well as give a ROI of the EBS which is recorded.
+- this ROI selection has some MM-based things, i.e. selecting a fov or zooming in on the center. assure that these will work.
 
 8. Full suite polishing
 Do a full sweep over everything and make proper tests, documentation, handle errors, etc etc.

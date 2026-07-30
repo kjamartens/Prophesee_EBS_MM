@@ -274,5 +274,180 @@ if connection_status == "Connected":
 else:
     print("Goal 5: no EBS connected -- live stats properties stay at their 0.0 default, skipping plausibility checks")
 
+# Goal 6: Exposure now doubles as the event-integration window (OnExposure(),
+# added this goal -- Goals 1-5 created the property with no action, so it
+# never did anything). Round-trip within its declared limits.
+exp_min = core.getPropertyLowerLimit("ProphEBSCam", "Exposure")
+exp_max = core.getPropertyUpperLimit("ProphEBSCam", "Exposure")
+original_exposure = core.getProperty("ProphEBSCam", "Exposure")
+core.setExposure("ProphEBSCam", 50.0)
+assert float(core.getProperty("ProphEBSCam", "Exposure")) == 50.0
+print("Goal 6: Exposure round-tripped to 50.0 ms (limits", exp_min, "-", exp_max, ")")
+core.setProperty("ProphEBSCam", "Exposure", original_exposure)  # restore
+
+# Goal 6: EBS-ViewMode -- round-trip every allowed value, then restore the
+# default (NetSigned).
+original_view_mode = core.getProperty("ProphEBSCam", "EBS-ViewMode")
+for mode in ("Merged", "OnOnly", "OffOnly", "NetSigned"):
+    core.setProperty("ProphEBSCam", "EBS-ViewMode", mode)
+    assert core.getProperty("ProphEBSCam", "EBS-ViewMode") == mode
+print("Goal 6: EBS-ViewMode round-tripped through Merged/OnOnly/OffOnly/NetSigned")
+core.setProperty("ProphEBSCam", "EBS-ViewMode", original_view_mode)
+
+# Goal 6: EBS-ViewOffset/EBS-ViewScale -- the "offset +- found events" ask.
+# Probe a mid-range value from MM's own reported limits rather than a
+# hardcoded guess (same pattern as the Goal 5 bias/anti-flicker checks).
+offset_lo = int(core.getPropertyLowerLimit("ProphEBSCam", "EBS-ViewOffset"))
+offset_hi = int(core.getPropertyUpperLimit("ProphEBSCam", "EBS-ViewOffset"))
+offset_probe = offset_lo + (offset_hi - offset_lo) // 2
+original_offset = core.getProperty("ProphEBSCam", "EBS-ViewOffset")
+core.setProperty("ProphEBSCam", "EBS-ViewOffset", str(offset_probe))
+assert int(core.getProperty("ProphEBSCam", "EBS-ViewOffset")) == offset_probe
+core.setProperty("ProphEBSCam", "EBS-ViewOffset", original_offset)
+
+original_scale = core.getProperty("ProphEBSCam", "EBS-ViewScale")
+core.setProperty("ProphEBSCam", "EBS-ViewScale", "2.5")
+assert float(core.getProperty("ProphEBSCam", "EBS-ViewScale")) == 2.5
+core.setProperty("ProphEBSCam", "EBS-ViewScale", original_scale)
+print("Goal 6: EBS-ViewOffset/EBS-ViewScale round-tripped (offset probe",
+      offset_probe, ", scale 2.5)")
+
+# Goal 6: software activity-noise filter properties.
+threshold_lo = int(core.getPropertyLowerLimit("ProphEBSCam", "EBS-ActivityFilter-Threshold-us"))
+threshold_hi = int(core.getPropertyUpperLimit("ProphEBSCam", "EBS-ActivityFilter-Threshold-us"))
+threshold_probe = threshold_lo + (threshold_hi - threshold_lo) // 2
+core.setProperty("ProphEBSCam", "EBS-ActivityFilter-Threshold-us", str(threshold_probe))
+assert int(core.getProperty("ProphEBSCam", "EBS-ActivityFilter-Threshold-us")) == threshold_probe
+core.setProperty("ProphEBSCam", "EBS-ActivityFilter-Enabled", "On")
+assert core.getProperty("ProphEBSCam", "EBS-ActivityFilter-Enabled") == "On"
+print("Goal 6: EBS-ActivityFilter-Enabled/-Threshold-us round-tripped (threshold probe",
+      threshold_probe, "us)")
+core.setProperty("ProphEBSCam", "EBS-ActivityFilter-Enabled", "Off")
+core.setProperty("ProphEBSCam", "EBS-ActivityFilter-Threshold-us", "10000")  # restore default
+
+# Goal 6: with a real EBS connected, confirm changing Exposure/EBS-ViewMode/
+# activity filter live (mid-stream, no restart) doesn't break the frame
+# pipeline -- snap before and after, check shape/dtype are still correct.
+# Pixel-level correctness of each view mode depends on real ambient
+# events landing on the sensor, so this only proves the plumbing survives a
+# live reconfiguration, matching the existing Goal 3 two-snaps-apart check.
+if connection_status == "Connected":
+    core.snapImage()
+    img_before = core.getImage()
+    core.setProperty("ProphEBSCam", "Exposure", "50")
+    core.setProperty("ProphEBSCam", "EBS-ViewMode", "Merged")
+    core.setProperty("ProphEBSCam", "EBS-ActivityFilter-Enabled", "On")
+    time.sleep(0.2)
+    core.snapImage()
+    img_after = core.getImage()
+    print("Goal 6: live reconfiguration OK -- before", img_before.shape, img_before.dtype,
+          ", after", img_after.shape, img_after.dtype)
+    assert img_before.shape == img_after.shape
+    assert img_before.dtype == img_after.dtype
+    core.setProperty("ProphEBSCam", "EBS-ActivityFilter-Enabled", "Off")
+    core.setProperty("ProphEBSCam", "EBS-ViewMode", "NetSigned")
+    core.setProperty("ProphEBSCam", "Exposure", original_exposure)
+else:
+    print("Goal 6: no EBS connected -- skipping live-reconfiguration frame check")
+
+# Goal 6 follow-up: sub-millisecond integration windows. Exposure's lower
+# limit dropped from 1.0 ms to 0.001 ms (1 microsecond -- the finest
+# resolution Metavision::EventCD::t itself can represent), and a new
+# EBS-DisplayRefreshMs property decouples "how long is one integration
+# window" from "how often is a frame actually published."
+assert abs(core.getPropertyLowerLimit("ProphEBSCam", "Exposure") - 0.001) < 1e-9, \
+    "expected Exposure's lower limit to be 0.001 ms after the sub-ms follow-up"
+core.setExposure("ProphEBSCam", 0.05)
+assert abs(float(core.getProperty("ProphEBSCam", "Exposure")) - 0.05) < 1e-9
+print("Goal 6 follow-up: Exposure round-tripped to 0.05 ms (sub-millisecond)")
+core.setProperty("ProphEBSCam", "Exposure", original_exposure)
+
+refresh_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-DisplayRefreshMs")
+refresh_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-DisplayRefreshMs")
+original_refresh = core.getProperty("ProphEBSCam", "EBS-DisplayRefreshMs")
+core.setProperty("ProphEBSCam", "EBS-DisplayRefreshMs", "5")
+assert float(core.getProperty("ProphEBSCam", "EBS-DisplayRefreshMs")) == 5.0
+print("Goal 6 follow-up: EBS-DisplayRefreshMs round-tripped to 5 ms (limits", refresh_lo, "-", refresh_hi, ")")
+core.setProperty("ProphEBSCam", "EBS-DisplayRefreshMs", original_refresh)
+
+# Goal 6 follow-up: with a real EBS connected, run genuinely sub-millisecond
+# integration windows (down to the 0.001 ms floor) with a fast 1 ms display
+# refresh for a short real-world burst -- this is the actual stress case the
+# design has to survive: OnEventsCD() closing windows via real event
+# timestamps far more often than the old wall-clock design ever did, while
+# only resetting touched pixels (not the whole sensor-sized array) each
+# time. Snap before/after to confirm the frame pipeline is still alive and
+# producing correctly-shaped frames, not hung or crashed.
+if connection_status == "Connected":
+    core.setProperty("ProphEBSCam", "EBS-DisplayRefreshMs", "1")
+    for sub_ms_exposure in (0.1, 0.01, 0.001):
+        core.setExposure("ProphEBSCam", sub_ms_exposure)
+        time.sleep(0.3)
+        core.snapImage()
+        img = core.getImage()
+        assert img.shape == img_before.shape and img.dtype == img_before.dtype
+        print("Goal 6 follow-up: Exposure =", sub_ms_exposure, "ms survived a 300ms burst, image",
+              img.shape, img.dtype)
+    core.setProperty("ProphEBSCam", "EBS-DisplayRefreshMs", original_refresh)
+    core.setProperty("ProphEBSCam", "Exposure", original_exposure)
+else:
+    print("Goal 6 follow-up: no EBS connected -- skipping sub-millisecond stress check")
+
+# Bug fix: Live view (unbounded StartSequenceAcquisition) must push frames at
+# max(Exposure, EBS-LiveViewMinIntervalMs), never at whatever interval
+# happens to be passed in -- MMCore's own "unused" parameter contract. New
+# EBS-LiveViewMinIntervalMs property (default 5 ms) round-trip first.
+minint_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-LiveViewMinIntervalMs")
+minint_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-LiveViewMinIntervalMs")
+original_min_interval = core.getProperty("ProphEBSCam", "EBS-LiveViewMinIntervalMs")
+assert abs(float(original_min_interval) - 5.0) < 1e-9, "expected EBS-LiveViewMinIntervalMs to default to 5.0 ms"
+core.setProperty("ProphEBSCam", "EBS-LiveViewMinIntervalMs", "20")
+assert float(core.getProperty("ProphEBSCam", "EBS-LiveViewMinIntervalMs")) == 20.0
+print("Goal 6 follow-up (Live-cadence bug fix): EBS-LiveViewMinIntervalMs round-tripped to 20 ms (limits",
+      minint_lo, "-", minint_hi, ", default 5)")
+core.setProperty("ProphEBSCam", "EBS-LiveViewMinIntervalMs", original_min_interval)
+
+# Simulates the exact failure mode found by the user: setting a
+# sub-millisecond Exposure, then starting continuous acquisition with that
+# same tiny value as the (supposed-to-be-ignored) interval argument, the way
+# a Live-view implementation that paces itself off the camera's exposure
+# would. Before the fix this made ProphEBSSequenceThread push ~1000
+# frames/sec, overwhelming MMCore's circular buffer and producing an
+# ever-growing display backlog/latency. After the fix, Live view is bounded
+# by EBS-LiveViewMinIntervalMs (default 5 ms -> ~200 frames/sec) even though
+# Exposure itself is sub-ms -- checked loosely (order-of-magnitude) since
+# real thread-wakeup jitter means an exact frame count isn't reproducible.
+if connection_status == "Connected":
+    core.setExposure("ProphEBSCam", 0.01)
+    core.startContinuousSequenceAcquisition(0.01)  # mimics a Live view that passes exposure as "interval"
+    time.sleep(1.0)
+    core.stopSequenceAcquisition()
+    n_buffered_sub_ms = core.getRemainingImageCount()
+    print("Goal 6 follow-up (Live-cadence bug fix): sub-ms Exposure (floor-bounded) + 1s of continuous "
+          "acquisition buffered", n_buffered_sub_ms, "frames")
+    assert n_buffered_sub_ms < 500, \
+        f"expected roughly ~200 frames/sec (bounded by the 5 ms EBS-LiveViewMinIntervalMs floor), " \
+        f"got {n_buffered_sub_ms} -- Live view may be pushing frames far faster than the GUI can consume again"
+    while core.getRemainingImageCount() > 0:
+        core.popNextImage()
+
+    # And when Exposure is comfortably above the floor, Live view should
+    # actually follow Exposure (like any other camera), not the floor.
+    core.setExposure("ProphEBSCam", 50.0)
+    core.startContinuousSequenceAcquisition(50.0)
+    time.sleep(1.0)
+    core.stopSequenceAcquisition()
+    n_buffered_normal = core.getRemainingImageCount()
+    print("Goal 6 follow-up (Live-cadence bug fix): Exposure=50ms (above floor) + 1s of continuous "
+          "acquisition buffered", n_buffered_normal, "frames")
+    assert 10 <= n_buffered_normal <= 30, \
+        f"expected roughly ~20 frames/sec (following the 50 ms Exposure), got {n_buffered_normal}"
+    while core.getRemainingImageCount() > 0:
+        core.popNextImage()
+
+    core.setProperty("ProphEBSCam", "Exposure", original_exposure)
+else:
+    print("Goal 6 follow-up: no EBS connected -- skipping Live-cadence bug-fix check")
+
 core.unloadDevice("ProphEBSCam")
 print("SUCCESS")

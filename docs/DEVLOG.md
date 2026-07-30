@@ -960,3 +960,333 @@ property's own reported limits instead of a hardcoded guess.
   0.0 default rather than blocking the other metrics).
 - Goal 6 ("custom view methods") is next per the roadmap — configurable
   integration window, offset, and common filters for the live view.
+
+## Goal 6 — Custom view methods
+
+### Status: self-tested on real hardware, awaiting user GUI confirmation before tagging v0.6
+
+### Requirement clarification (asked user before implementing)
+
+The roadmap wording ("configurable integration window, offset, common
+filters") left several things ambiguous, so these were clarified with the
+user via AskUserQuestion before writing any code:
+
+- **Integration time should be MM's own standard `Exposure` property**, not
+  a new bespoke `EBS-*` property — matching how every other camera
+  adapter's exposure control works, and letting existing MDA/scripting
+  paths that already set exposure "just work" for the EBS's integration
+  window too.
+- **The offset is a signed polarity ("net ON−OFF") baseline**: `pixel =
+  clamp(offset + rawValue * scale, 0, 255)`, default `offset = 10`, and
+  the user explicitly asked for `scale` to default to **1** (not the old
+  Goal 3 hardcoded 32) once it became a real polarity-aware view rather
+  than a merged count.
+- **Both** offered extras were wanted: a software activity-noise filter
+  (Metavision's `ActivityNoiseFilterAlgorithm`) and a view-mode selector
+  (Merged/OnOnly/OffOnly/NetSigned) rather than only the signed view.
+
+### What was built
+
+- **`Exposure` now drives the event-integration window.** Goals 1-5 created
+  `MM::g_Keyword_Exposure` with no `CPropertyAction` at all (`ProphEBS.cpp`
+  Initialize()), so changing it in the GUI never did anything —
+  `exposure_ms_` was a dead local cache. Now it has a real handler
+  (`OnExposure()`) that stores `AfterSet`'s value into a new
+  `std::atomic<double> integrationTimeMs_`; `SetPropertyLimits` clamps it
+  to 1-100000 ms. `ProphEBSFrameBuilderThread::svc()` no longer
+  snapshots an interval once at `Start()` — it now reads
+  `camera_->integrationTimeMs_.load()` fresh every loop iteration (`camera_`
+  is already a friend of `CProphEBSCamera`), so changing `Exposure` anywhere
+  (Device/Property Browser, MDA dialog, `core.setExposure()`) retunes the
+  integration window on the very next frame, no restart needed.
+  `g_EventIntegrationMs` is gone; `exposure_ms_` is gone (the property/atomic
+  pair is now the single source of truth, read through
+  `GetExposure()`/`SetExposure()` exactly as before).
+- **Per-polarity accumulation.** `OnEventsCD()`'s single merged
+  `eventCounts_` became two counters, `onCounts_`/`offCounts_`
+  (`std::vector<int32_t>`, same `eventCountsLock_`), incremented by
+  `ev->p != 0` (ON, per Metavision's `Event2d::p` convention: 1 = positive
+  contrast change) vs. OFF.
+- **`EBS-ViewMode`** (string, allowed values `Merged`/`OnOnly`/`OffOnly`/
+  `NetSigned`, **default `NetSigned`**) picks which raw per-pixel quantity
+  `BuildAndSwapFrame()` renders: `on+off`, `on`, `off`, or `on-off`
+  respectively. `NetSigned` is the default specifically because it's the
+  literal ask ("show offset +- found events"); `Merged` is kept selectable
+  for the old Goal 3/5 look.
+- **`EBS-ViewOffset`** (integer, default **10**, limits 0-255) and
+  **`EBS-ViewScale`** (float, default **1.0**, limits 0.01-1000) — plain
+  `std::atomic`-backed settable properties. `BuildAndSwapFrame()` computes
+  `pixel = clamp(offset + raw * scale, 0, 255)` per pixel using whichever
+  `raw` `EBS-ViewMode` selected.
+- **Software activity-noise filter**: `EBS-ActivityFilter-Enabled` (Off/On,
+  default Off) and `EBS-ActivityFilter-Threshold-us` (integer, default
+  10,000 µs, limits 100-10,000,000) via
+  `Metavision::ActivityNoiseFilterAlgorithm<>` (header-only template class,
+  confirmed present under the installed SDK's
+  `include/metavision/sdk/cv/algorithms/activity_noise_filter_algorithm.h`
+  — no new `.vcxproj` library dependency needed, the existing
+  `AdditionalIncludeDirectories` already covers `sdk/cv` since it's just a
+  subfolder of the SDK's `include/` root already on the include path).
+  Constructed in `StartEventStreaming()` once sensor geometry is known
+  (`std::unique_ptr<Metavision::ActivityNoiseFilterAlgorithm<>>
+  activityFilter_`), destroyed in `StopEventStreaming()`. When enabled,
+  `OnEventsCD()` runs each incoming CD event batch through
+  `activityFilter_->process_events()` into a reusable scratch buffer and
+  accumulates ON/OFF counts from the filtered output instead of the raw
+  batch; when disabled, the original direct-accumulation fast path is
+  unchanged. A new `activityFilterLock_` guards both `process_events()`
+  (called from `OnEventsCD()`, the Metavision SDK's callback thread) and
+  `set_threshold()`/reconstruction (called from the property handlers,
+  MMCore's thread) — the algorithm's internal threshold/state isn't
+  documented as safe against a concurrent setter, same caution as the
+  existing per-batch `eventCountsLock_`.
+
+### Design decisions (and why)
+
+- **`NetSigned` as the default view mode, not `Merged`.** This does change
+  the live view's default appearance from Goals 3/5 (a real, intentional
+  behavior change for this goal, not a regression) — it's what the user
+  actually described wanting ("integrate over whatever time is wanted, and
+  show offset +- found events"). `Merged` stays one property-set away for
+  anyone who wants the old look back.
+- **`ProphEBSFrameBuilderThread::svc()` re-reads `integrationTimeMs_` every
+  loop iteration instead of snapshotting it once at `Start()`.** This is
+  the same "plain member/atomic + live setter, re-read each frame" shape the
+  Metavision SDK's own `OnDemandFrameGenerationAlgorithm`/
+  `PeriodicFrameGenerationAlgorithm` classes use for their accumulation-time
+  controls (found while researching Goal 6 options) — adopted here without
+  pulling in either of those classes themselves, since a full swap to one of
+  them would be a much larger rewrite of the existing hand-rolled pipeline
+  than this goal's scope justified.
+- **`onCounts_`/`offCounts_` are `int32_t`, not `uint32_t` like the old
+  `eventCounts_`.** `NetSigned` mode computes `on - off`, which needs a
+  signed result; keeping both counters signed (rather than casting only at
+  the point of subtraction) avoids any signed/unsigned mismatch surprises.
+- **View-mode/offset/scale properties use plain atomics with no
+  `OnPropertyChanged()` push.** Unlike the Goal 5 live-stats properties
+  (written by a background thread the GUI wouldn't otherwise know to
+  re-poll), these are only ever written via the property system's own
+  `AfterSet` (a normal user-initiated `setProperty()` call) — MMCore already
+  updates its own `stateCache_` for that path, so no extra push is needed;
+  `BuildAndSwapFrame()` (the frame-builder thread) is the sole reader.
+- **Activity-filter lock held for the whole event batch, not per-event.**
+  Same per-batch (not per-event) locking granularity as the pre-existing
+  `eventCountsLock_`, to keep lock overhead off the sensor's actual
+  per-event rate.
+
+### Verified locally
+
+- **Build**: `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`
+  succeeded with 0 warnings/errors on the first attempt (VS2022 Preview
+  toolset, PowerShell tool, same as every prior goal) — including the new
+  `<metavision/sdk/cv/algorithms/activity_noise_filter_algorithm.h>`
+  include with no `.vcxproj` changes needed.
+- **Real hardware, via `tools/test_prophebs.py`** (extended with Goal 6
+  checks): all Goal 1-5 checks still passed unchanged (no regression) on
+  the connected IMX636. New checks: `Exposure` round-tripped to 50 ms
+  within its 1-100,000 ms limits; `EBS-ViewMode` round-tripped through all
+  four allowed values; `EBS-ViewOffset`/`EBS-ViewScale` round-tripped a
+  mid-range/explicit value; `EBS-ActivityFilter-Enabled`/`-Threshold-us`
+  round-tripped; and a live-reconfiguration check (change `Exposure`,
+  `EBS-ViewMode`, and turn the activity filter on, all while nothing is
+  restarted) snapped successfully before and after with unchanged image
+  shape/dtype `(720, 1280) uint8`. Full script printed `SUCCESS`, exit 0.
+- **Not yet verified**: a real walkthrough in the MicroManager Studio GUI —
+  per the usual handoff pattern, this is pending the user: visually
+  confirming the live view changes when switching `EBS-ViewMode`, dragging
+  `Exposure`/`EBS-ViewOffset`/`EBS-ViewScale`, and observing reduced
+  noise/flicker with the activity filter enabled. The self-test can only
+  confirm the plumbing runs without error, not that each view mode "looks
+  right" to a human.
+
+### Follow-up: sub-millisecond integration windows
+
+User reported no visible difference between a 1 ms and a 0.0001 ms
+`Exposure` and asked to investigate. Root-caused to **three stacked
+floors**, not one:
+
+1. `Initialize()`'s `SetPropertyLimits(MM::g_Keyword_Exposure, 1.0,
+   100000.0)` — MMCore's own `FloatProperty::Set()`
+   (`third_party/mmCoreAndDevices/MMDevice/Property.cpp:156-166`) silently
+   rejects (`return false`, i.e. `setProperty()` just fails) anything below
+   1.0 — `0.0001` never reached the device at all, the property just stayed
+   at its previous value.
+2. `OnExposure()`'s `AfterSet` had its own hardcoded `std::max(1.0, value)`
+   — a second, redundant floor, even if the property limit weren't there.
+3. `ProphEBSFrameBuilderThread::svc()` passed the interval to
+   `CDeviceUtils::SleepMs(long ms)` — confirmed via
+   `MMDevice/DeviceUtils.h:37` that this takes **whole milliseconds only**.
+   Even with both floors above removed, this wall-clock-Sleep()-based
+   design architecturally cannot represent a sub-millisecond window.
+
+**Design chosen** (confirmed with the user via AskUserQuestion, including a
+follow-up question about idle-scene behavior): decouple "how long is one
+integration window" from "how often is a frame published," and drive the
+window off real sensor timestamps instead of wall-clock sleep:
+
+- **Integration window (`Exposure`) is now event-timestamp-driven.**
+  `Metavision::EventCD::t` (confirmed `typedef long long timestamp;` in
+  `metavision/sdk/base/utils/timestamp.h`) is microsecond-resolution.
+  `OnEventsCD()` now checks, per event, whether `ev->t - windowStartT_ >=
+  exposureUs` (computed once per batch, not per event) and calls a new
+  `CloseCurrentWindowLocked()` when a window's time is up — this is what
+  makes genuinely sub-millisecond (down to the 1 microsecond floor, the
+  finest `EventCD::t` can represent) windows possible, with no Sleep() in
+  the loop at all.
+- **The naive version of window-close doesn't scale, so it isn't what got
+  built.** Clearing the whole `onCounts_`/`offCounts_` arrays (as Goal 6
+  did every ~100 ms) is fine at that cadence; it is not fine when a window
+  can close hundreds of thousands of times a second for a 720×1280 sensor.
+  Fix: a new `touchedIndices_` list records exactly which pixel indices
+  were written to since the window opened; `CloseCurrentWindowLocked()`
+  only resets those — cost proportional to real event activity in the
+  window, not sensor resolution.
+- **New `EBS-DisplayRefreshMs` property** (default 1.0 ms, limits
+  1-10000) decouples how often `ProphEBSFrameBuilderThread` actually
+  publishes a frame (`BuildAndSwapFrame()`) from the integration window
+  length — no point publishing faster than the display can show anyway.
+  `BuildAndSwapFrame()` no longer resets the accumulators itself (that's
+  now exclusively `CloseCurrentWindowLocked()`'s job) — it takes a locked
+  **copy** of `onCounts_`/`offCounts_` and renders from that.
+- **Idle-scene safety net**: since window-close is now driven by incoming
+  events, a sensor that goes fully quiet would otherwise never close its
+  last window, freezing the display on the last-active frame instead of
+  resetting to the `EBS-ViewOffset` baseline. Asked the user whether that
+  freeze was acceptable; they preferred the old "goes quiet → resets to
+  baseline" behavior, with the actual timeout value not needing to be a
+  property ("100ms or so" is fine as a constant). Implemented as a fixed
+  `g_IdleWindowTimeoutMs = 100.0` — `BuildAndSwapFrame()` checks
+  `lastWindowCloseWallTime_` (a `std::chrono::steady_clock::time_point`,
+  updated on every close, event-driven or forced) before rendering and
+  force-closes a stale window if 100 ms of wall-clock time has passed with
+  no event-driven close.
+- **`Exposure`'s floor is 0.001 ms (1 microsecond), not 0**, matching
+  `EventCD::t`'s own resolution — going finer couldn't mean anything real
+  anyway. Confirmed `MM::FloatProperty` defaults to 4 decimal places
+  (`Property.h:371`), so 0.001 is exactly representable, not silently
+  truncated to a coarser value.
+
+### Verified locally (follow-up)
+
+- **Build**: 0 warnings/errors, first attempt, no `.vcxproj` changes needed
+  (`<chrono>` is standard library).
+- **Real hardware, via `tools/test_prophebs.py`** (extended further): all
+  Goal 1-6 checks still passed (no regression). New checks: `Exposure`'s
+  lower limit confirmed at 0.001; round-tripped to 0.05 ms; new
+  `EBS-DisplayRefreshMs` round-tripped within its 1-10000 ms limits; and —
+  the actual stress case this design has to survive — three 300 ms bursts
+  against the connected IMX636 (streaming at its usual ~10 MEv/s) with
+  `Exposure` set to 0.1 ms, 0.01 ms, and the absolute floor **0.001 ms (1
+  microsecond)**, each with `EBS-DisplayRefreshMs = 1`. All three
+  completed without error, hang, or crash, snapping correctly-shaped
+  `(720, 1280) uint8` frames throughout — real validation that closing
+  windows via event timestamps (potentially extremely often) and resetting
+  only touched pixels holds up under genuine high-event-rate hardware, not
+  just synthetically.
+- **Not yet verified**: the idle-timeout reset itself (need a genuinely
+  dark/still scene to observe the display fall back to the `EBS-ViewOffset`
+  baseline after ~100 ms of no events) — self-test ran against a normal lit
+  room with continuous ambient activity, so the event-driven close path was
+  exercised throughout, not the idle-forced path. Also, as with the rest of
+  Goal 6, a real GUI walkthrough (dragging `Exposure` down into the
+  sub-millisecond range and watching the Live view) is still pending the
+  user.
+
+### Bug found and fixed: Live view backlog grew without bound once Exposure could go sub-ms
+
+User reported two symptoms after the sub-millisecond follow-up above: (a)
+setting `Exposure` under 1 ms still didn't visibly change the Live feed,
+and (b) the Live view developed a growing display delay, eventually
+exceeding 500 ms.
+
+**Root cause**: `ProphEBSSequenceThread::svc()` (used to push frames into
+MMCore during MicroManager's Live view) has, since Goal 1, used its
+caller-supplied `interval_ms` argument directly as its push cadence. That
+argument traces back to `CMMCore::startContinuousSequenceAcquisition(double
+unused)` — the parameter is literally named `unused` in MMCore's own public
+header (`third_party/mmCoreAndDevices/MMCore/MMCore.h:433`), and
+`MMCore.cpp:3238-3241` has a comment reading *"The MM::Camera contract now
+says new adapters must ignore it."* This adapter never did. As long as
+whatever value happened to be passed through stayed near ~100 ms, the bug
+was invisible. Once `Exposure` could go sub-millisecond (the follow-up
+above), and MicroManager's Live view plausibly passes the camera's own
+current exposure as this "unused" value (a common camera-adapter
+convention), `ProphEBSSequenceThread` started trying to push frames into
+MMCore's circular buffer up to ~1000 times/sec — far faster than the GUI
+can actually consume them. Since the display presumably drains that buffer
+roughly in order rather than always jumping to the newest entry, the
+backlog (and thus the visible delay between "what the sensor sees now" and
+"what's on screen") grew continuously, exactly matching both reported
+symptoms — the sub-ms setting "not working" was really the display
+showing increasingly stale, backlogged frames, not evidence that the
+integration window itself was broken.
+
+**Why self-testing didn't catch this**: the Goal 6 follow-up's sub-ms
+stress checks only used `snapImage()` (single-shot), never
+`startContinuousSequenceAcquisition()` — the combination of "sub-ms
+Exposure" and "Live view running" was never exercised together before this
+bug was reported.
+
+**Fix (v1)**: `ProphEBSSequenceThread::svc()` now checks whether the
+sequence is unbounded (`numImages_ == LONG_MAX`, MM's own signal for "this
+is Live view, not a finite MDA" — already used elsewhere in this adapter,
+e.g. Goal 4's recording-vs-Live distinction) — if so, it ignores the
+caller-supplied `intervalMs_` entirely and always sleeps a fixed 100 ms
+instead. A finite (MDA) sequence still honors its caller-supplied
+`intervalMs_` exactly as before, since that one is a real, user-configured
+value (e.g. "10 frames at 100 ms") with no equivalent "ignore this"
+contract.
+
+**Verified (v1)**: `tools/test_prophebs.py` (extended with a new check that
+explicitly reproduces the failure mode — sets `Exposure` to 0.01 ms, then
+calls `startContinuousSequenceAcquisition(0.01)` to mimic a Live view that
+paces itself off the camera's exposure) against the connected IMX636.
+Before the fix this would have buffered on the order of 1000 frames/sec;
+after the fix it buffered exactly 10 in 1 second (matching the fixed
+100 ms cadence). Incidentally, the pre-existing Goal 3
+continuous-acquisition check's buffered count also dropped from 34-39 (in a
+500 ms window, using the test harness's own
+`startContinuousSequenceAcquisition(0)` call — `0` being another value that
+should have been ignored per MMCore's contract but previously wasn't) down
+to a consistent 5 — meaning Live view's push cadence had actually been
+running faster than intended since Goal 1, just not fast enough to cause a
+*visible* problem until Exposure could go sub-millisecond. Full suite still
+passed.
+
+**Follow-up (v2, same session)**: user pushed back on the fixed 100 ms —
+correctly pointed out MM's Live view does not need a fixed cadence, and
+asked for Live view to just follow `Exposure` directly, bounded below by a
+configurable floor (e.g. 1-5 ms) for when `Exposure` itself is sub-ms.
+Replaced the fixed constant with:
+
+- New **`EBS-LiveViewMinIntervalMs`** property (default 5 ms, limits
+  1-1000), the floor.
+- `ProphEBSSequenceThread::svc()`'s unbounded-sequence case now computes
+  `max(integrationTimeMs_, liveViewMinIntervalMs_)` (both read directly —
+  `camera_` is already a friend) instead of a fixed value — Live view
+  naturally follows `Exposure` like any other camera whenever it's above
+  the floor, and is only clamped once `Exposure` drops below it.
+
+**Verified (v2)**: extended the test further — round-tripped
+`EBS-LiveViewMinIntervalMs` (confirmed default 5 ms); re-ran the sub-ms
+reproduction (`Exposure=0.01`) and got 74 buffered frames/sec (bounded by
+the 5 ms floor, nowhere near the old ~1000/sec runaway); then set
+`Exposure=50` (comfortably above the floor) and got 17 buffered frames/sec
+— confirming Live view actually tracks `Exposure` once it's above the floor,
+not just always clamped to some fixed rate. Full suite still passed
+(`SUCCESS`, exit 0), no regression.
+
+**Not yet verified**: the user's real GUI Live view, to confirm the display
+delay no longer grows and that sub-ms `Exposure` changes are now visibly
+reflected promptly.
+
+### Open questions / TODO for later goals
+
+- The idle-timeout path (`g_IdleWindowTimeoutMs`) is currently only
+  exercised implicitly (never triggered during self-testing, since the test
+  environment always has some ambient event activity) — worth deliberately
+  testing in a dark/still scene at some point, either by the user in the
+  GUI or with a lens cap in a future self-test run.
+- Goal 7 ("pixel-by-pixel differences") is next per the roadmap — per-pixel
+  masking (blocked-pixel list) and a sensor ROI, building on the geometry
+  and per-pixel accumulation infrastructure already in place from Goals 3/6.

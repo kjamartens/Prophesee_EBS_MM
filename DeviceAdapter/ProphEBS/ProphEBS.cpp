@@ -87,6 +87,19 @@ const char* g_PropTemperature = "EBS-Temperature-C";
 const char* g_PropIllumination = "EBS-Illumination-lux";
 const char* g_PropPixelDeadTime = "EBS-PixelDeadTime-us";
 
+// Goal 6 property names.
+const char* g_PropViewMode = "EBS-ViewMode";
+const char* g_PropViewOffset = "EBS-ViewOffset";
+const char* g_PropViewScale = "EBS-ViewScale";
+const char* g_PropActivityFilterEnabled = "EBS-ActivityFilter-Enabled";
+const char* g_PropActivityFilterThresholdUs = "EBS-ActivityFilter-Threshold-us";
+
+// Goal 6 follow-up property name.
+const char* g_PropDisplayRefreshMs = "EBS-DisplayRefreshMs";
+
+// Bug-fix property name (Live-view push-cadence floor).
+const char* g_PropLiveViewMinIntervalMs = "EBS-LiveViewMinIntervalMs";
+
 // Filter-type string values for EBS-AntiFlicker-FilterType. Metavision
 // Studio's UI calls Metavision::I_AntiFlickerModule::AntiFlickerMode::
 // BAND_STOP "Band Cut" and BAND_PASS "Band Pass" -- these strings match that
@@ -113,6 +126,28 @@ bool EventTrailFilterTypeFromString(const std::string& s, Metavision::I_EventTra
    if (s == "TRAIL") { outType = Metavision::I_EventTrailFilterModule::Type::TRAIL; return true; }
    if (s == "STC_CUT_TRAIL") { outType = Metavision::I_EventTrailFilterModule::Type::STC_CUT_TRAIL; return true; }
    if (s == "STC_KEEP_TRAIL") { outType = Metavision::I_EventTrailFilterModule::Type::STC_KEEP_TRAIL; return true; }
+   return false;
+}
+
+// Goal 6: EBS-ViewMode <-> ProphEBSViewMode string conversions.
+const char* ViewModeToString(ProphEBSViewMode mode)
+{
+   switch (mode)
+   {
+      case ProphEBSViewMode::Merged: return g_ViewModeMerged;
+      case ProphEBSViewMode::OnOnly: return g_ViewModeOnOnly;
+      case ProphEBSViewMode::OffOnly: return g_ViewModeOffOnly;
+      case ProphEBSViewMode::NetSigned: return g_ViewModeNetSigned;
+   }
+   return g_ViewModeNetSigned;
+}
+
+bool ViewModeFromString(const std::string& s, ProphEBSViewMode& outMode)
+{
+   if (s == g_ViewModeMerged) { outMode = ProphEBSViewMode::Merged; return true; }
+   if (s == g_ViewModeOnOnly) { outMode = ProphEBSViewMode::OnOnly; return true; }
+   if (s == g_ViewModeOffOnly) { outMode = ProphEBSViewMode::OffOnly; return true; }
+   if (s == g_ViewModeNetSigned) { outMode = ProphEBSViewMode::NetSigned; return true; }
    return false;
 }
 
@@ -566,7 +601,6 @@ namespace
  */
 CProphEBSCamera::CProphEBSCamera() :
    initialized_(false),
-   exposure_ms_(100.0),
    roiX_(0),
    roiY_(0),
    roiXSize_(g_TestImageWidth),
@@ -582,6 +616,16 @@ CProphEBSCamera::CProphEBSCamera() :
    sensorHeight_(g_TestImageHeight),
    frontImg_(&imgBufferA_),
    backImg_(&imgBufferB_),
+   windowStartT_(0),
+   lastWindowCloseWallTime_(std::chrono::steady_clock::now()),
+   integrationTimeMs_(100.0),
+   displayRefreshMs_(g_DefaultDisplayRefreshMs),
+   liveViewMinIntervalMs_(g_DefaultLiveViewMinIntervalMs),
+   viewMode_(static_cast<int>(ProphEBSViewMode::NetSigned)),
+   viewOffset_(static_cast<double>(g_DefaultViewOffset)),
+   viewScale_(g_DefaultViewScale),
+   activityFilterEnabled_(false),
+   activityFilterThresholdUs_(g_DefaultActivityFilterThresholdUs),
    streaming_(false),
    cdCallbackId_(),
    frameBuilderThd_(nullptr),
@@ -672,7 +716,43 @@ int CProphEBSCamera::Initialize()
    if (DEVICE_OK != nRet)
       return nRet;
 
-   nRet = CreateFloatProperty(MM::g_Keyword_Exposure, exposure_ms_, false);
+   // Goal 6: Exposure now doubles as the event-integration window --
+   // OnExposure() stores AfterSet's value into integrationTimeMs_. Goal 6
+   // follow-up: the lower limit is 0.001 ms (1 microsecond), not 1.0 ms --
+   // Metavision::EventCD::t (what OnEventsCD() compares this against) is
+   // itself only microsecond-resolution, so 1 us is the finest window that
+   // could ever mean anything; MM's FloatProperty defaults to 4 decimal
+   // places, so 0.001 is exactly representable (no silent truncation to a
+   // coarser value).
+   nRet = CreateFloatProperty(MM::g_Keyword_Exposure, integrationTimeMs_.load(), false,
+      new CPropertyAction(this, &CProphEBSCamera::OnExposure));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = SetPropertyLimits(MM::g_Keyword_Exposure, 0.001, 100000.0);
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   // Goal 6 follow-up: decoupled from Exposure -- how often a frame is
+   // actually published, independent of how long each integration window
+   // is. No point going below 1 ms; nothing downstream could show it.
+   nRet = CreateFloatProperty(g_PropDisplayRefreshMs, displayRefreshMs_.load(), false,
+      new CPropertyAction(this, &CProphEBSCamera::OnDisplayRefreshMs));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = SetPropertyLimits(g_PropDisplayRefreshMs, 1.0, 10000.0);
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   // Bug fix: floor on how fast Live view pushes frames into MMCore --
+   // ProphEBSSequenceThread::svc() uses max(Exposure, this) for unbounded
+   // (Live) sequences, so Live view naturally follows Exposure like any
+   // other camera for normal exposure times, but never faster than this
+   // once Exposure goes below it.
+   nRet = CreateFloatProperty(g_PropLiveViewMinIntervalMs, liveViewMinIntervalMs_.load(), false,
+      new CPropertyAction(this, &CProphEBSCamera::OnLiveViewMinIntervalMs));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = SetPropertyLimits(g_PropLiveViewMinIntervalMs, 1.0, 1000.0);
    if (DEVICE_OK != nRet)
       return nRet;
 
@@ -754,6 +834,62 @@ int CProphEBSCamera::Initialize()
       if (DEVICE_OK != nRet)
          return nRet;
    }
+
+   // Goal 6: view-mode/offset/scale and the software activity-noise filter.
+   // Created unconditionally (no camera needed) -- same as the Goal 5
+   // filter properties, they simply have no visible effect until a camera
+   // is connected and streaming.
+   nRet = CreateStringProperty(g_PropViewMode, ViewModeToString(static_cast<ProphEBSViewMode>(viewMode_.load())),
+      false, new CPropertyAction(this, &CProphEBSCamera::OnViewMode));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = AddAllowedValue(g_PropViewMode, g_ViewModeMerged);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = AddAllowedValue(g_PropViewMode, g_ViewModeOnOnly);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = AddAllowedValue(g_PropViewMode, g_ViewModeOffOnly);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = AddAllowedValue(g_PropViewMode, g_ViewModeNetSigned);
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   nRet = CreateIntegerProperty(g_PropViewOffset, g_DefaultViewOffset, false,
+      new CPropertyAction(this, &CProphEBSCamera::OnViewOffset));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = SetPropertyLimits(g_PropViewOffset, 0, 255);
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   nRet = CreateFloatProperty(g_PropViewScale, g_DefaultViewScale, false,
+      new CPropertyAction(this, &CProphEBSCamera::OnViewScale));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = SetPropertyLimits(g_PropViewScale, 0.01, 1000.0);
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   nRet = CreateStringProperty(g_PropActivityFilterEnabled, "Off", false,
+      new CPropertyAction(this, &CProphEBSCamera::OnActivityFilterEnabled));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = AddAllowedValue(g_PropActivityFilterEnabled, "Off");
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = AddAllowedValue(g_PropActivityFilterEnabled, "On");
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   nRet = CreateIntegerProperty(g_PropActivityFilterThresholdUs, g_DefaultActivityFilterThresholdUs, false,
+      new CPropertyAction(this, &CProphEBSCamera::OnActivityFilterThreshold));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = SetPropertyLimits(g_PropActivityFilterThresholdUs, 100, 10000000);
+   if (DEVICE_OK != nRet)
+      return nRet;
 
    if (cameraConnected_)
    {
@@ -1565,6 +1701,171 @@ int CProphEBSCamera::OnAntiFlickerHighFreq(MM::PropertyBase* pProp, MM::ActionTy
 }
 
 /**
+ * Goal 6: MM's standard Exposure property, now wired to a CPropertyAction
+ * (Goals 1-5 created it with none, so it never actually affected anything).
+ * AfterSet stores the new value into integrationTimeMs_. Goal 6 follow-up:
+ * this can be sub-millisecond -- OnEventsCD() converts it to microseconds
+ * and compares it against real Metavision::EventCD::t timestamps to decide
+ * when to close the current integration window, so changing Exposure (GUI,
+ * MDA, script) takes effect on the very next event batch without needing to
+ * restart streaming. The 0.001 floor here matches the property's own
+ * SetPropertyLimits() (see Initialize()) -- 1 microsecond, the finest
+ * resolution the sensor's own timestamps can represent anyway.
+ */
+int CProphEBSCamera::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      pProp->Set(integrationTimeMs_.load());
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      double value;
+      pProp->Get(value);
+      integrationTimeMs_ = std::max(0.001, value);
+   }
+   return DEVICE_OK;
+}
+
+/**
+ * Goal 6 follow-up: how often ProphEBSFrameBuilderThread actually publishes
+ * a frame, decoupled from integrationTimeMs_ (Exposure) above -- see
+ * g_PropDisplayRefreshMs.
+ */
+int CProphEBSCamera::OnDisplayRefreshMs(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      pProp->Set(displayRefreshMs_.load());
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      double value;
+      pProp->Get(value);
+      displayRefreshMs_ = std::max(1.0, value);
+   }
+   return DEVICE_OK;
+}
+
+/**
+ * Bug fix: floor on Live view's frame-push cadence -- see
+ * g_PropLiveViewMinIntervalMs and ProphEBSSequenceThread::svc(), which
+ * computes max(Exposure, this) for unbounded (Live) sequences.
+ */
+int CProphEBSCamera::OnLiveViewMinIntervalMs(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      pProp->Set(liveViewMinIntervalMs_.load());
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      double value;
+      pProp->Get(value);
+      liveViewMinIntervalMs_ = std::max(1.0, value);
+   }
+   return DEVICE_OK;
+}
+
+/**
+ * Goal 6: EBS-ViewMode -- selects which raw per-pixel quantity
+ * BuildAndSwapFrame() renders (Merged/OnOnly/OffOnly/NetSigned). Plain
+ * atomic-backed settable property; see g_PropViewMode for the formula.
+ */
+int CProphEBSCamera::OnViewMode(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      pProp->Set(ViewModeToString(static_cast<ProphEBSViewMode>(viewMode_.load())));
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      std::string value;
+      pProp->Get(value);
+      ProphEBSViewMode mode;
+      if (ViewModeFromString(value, mode))
+         viewMode_ = static_cast<int>(mode);
+   }
+   return DEVICE_OK;
+}
+
+int CProphEBSCamera::OnViewOffset(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      pProp->Set(viewOffset_.load());
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      double value;
+      pProp->Get(value);
+      viewOffset_ = value;
+   }
+   return DEVICE_OK;
+}
+
+int CProphEBSCamera::OnViewScale(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      pProp->Set(viewScale_.load());
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      double value;
+      pProp->Get(value);
+      viewScale_ = value;
+   }
+   return DEVICE_OK;
+}
+
+/**
+ * Goal 6: software activity-noise filter enable/threshold handlers. Both
+ * guard activityFilter_ under activityFilterLock_ -- the same lock
+ * OnEventsCD() takes while calling process_events() -- since the algorithm's
+ * threshold/state isn't documented as safe against a concurrent setter.
+ * activityFilter_ itself is only constructed once StartEventStreaming()
+ * knows the sensor geometry, so these are no-ops on the filter (beyond
+ * updating the user-facing state) until a camera is connected and
+ * streaming -- same pattern as the Goal 5 hardware filter properties.
+ */
+int CProphEBSCamera::OnActivityFilterEnabled(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      MMThreadGuard g(activityFilterLock_);
+      pProp->Set(activityFilterEnabled_ ? "On" : "Off");
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      std::string value;
+      pProp->Get(value);
+      MMThreadGuard g(activityFilterLock_);
+      activityFilterEnabled_ = (value == "On");
+   }
+   return DEVICE_OK;
+}
+
+int CProphEBSCamera::OnActivityFilterThreshold(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      MMThreadGuard g(activityFilterLock_);
+      pProp->Set(activityFilterThresholdUs_);
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      long value;
+      pProp->Get(value);
+      MMThreadGuard g(activityFilterLock_);
+      activityFilterThresholdUs_ = value;
+      if (activityFilter_)
+         activityFilter_->set_threshold(static_cast<Metavision::timestamp>(value));
+   }
+   return DEVICE_OK;
+}
+
+/**
  * Goal 3: starts real event-driven acquisition. Only called from
  * Initialize() when ConnectToCamera() has already set cameraConnected_ and
  * sensorWidth_/sensorHeight_. Sizes both frame buffers and the event
@@ -1579,9 +1880,23 @@ void CProphEBSCamera::StartEventStreaming()
    frontImg_ = &imgBufferA_;
    backImg_ = &imgBufferB_;
 
-   eventCounts_.assign(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+   onCounts_.assign(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+   offCounts_.assign(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+   touchedIndices_.clear();
+   windowStartT_ = 0;
+   lastWindowCloseWallTime_ = std::chrono::steady_clock::now();
    totalRawBytes_ = 0;
    totalEventCount_ = 0;
+
+   // Goal 6: (re)construct the software activity-noise filter now that the
+   // real sensor geometry is known -- reads the current
+   // activityFilterThresholdUs_ (whatever the property was last set to,
+   // possibly before a camera was ever connected).
+   {
+      MMThreadGuard g(activityFilterLock_);
+      activityFilter_ = std::make_unique<Metavision::ActivityNoiseFilterAlgorithm<>>(
+         sensorWidth_, sensorHeight_, static_cast<Metavision::timestamp>(activityFilterThresholdUs_));
+   }
 
    cdCallbackId_ = cam_.cd().add_callback(
       [this](const Metavision::EventCD* begin, const Metavision::EventCD* end)
@@ -1597,14 +1912,15 @@ void CProphEBSCamera::StartEventStreaming()
          totalRawBytes_ += size;
       });
 
-   frameBuilderThd_->Start(g_EventIntegrationMs);
+   frameBuilderThd_->Start();
    statsThd_->Start(g_StatsIntervalMs);
 
    cam_.start();
    streaming_ = true;
 
    std::ostringstream startMsg;
-   startMsg << "ProphEBS: event streaming started, integrating " << g_EventIntegrationMs << " ms per frame";
+   startMsg << "ProphEBS: event streaming started, integration window " << integrationTimeMs_.load()
+            << " ms, display refresh " << displayRefreshMs_.load() << " ms";
    LogMessage(startMsg.str(), false);
 }
 
@@ -1626,56 +1942,143 @@ void CProphEBSCamera::StopEventStreaming()
    cam_.cd().remove_callback(cdCallbackId_);
    cam_.raw_data().remove_callback(rawDataCallbackId_);
    streaming_ = false;
+
+   MMThreadGuard g(activityFilterLock_);
+   activityFilter_.reset();
 }
 
 /**
  * Called by the Metavision SDK on its own internal thread for each decoded
- * batch of CD events. Kept minimal -- just increments per-pixel counts under
- * eventCountsLock_, plus a single atomic add to totalEventCount_ for
- * EBS-AvgEventRate-MEvps -- since this runs on the hot path for however many
- * events/sec the sensor is producing; all actual frame rendering happens
- * later, in BuildAndSwapFrame(), off this thread.
+ * batch of CD events. When the Goal 6 software activity-noise filter is
+ * enabled, the batch is first run through it (into a small reusable scratch
+ * buffer) and only the filtered output is accumulated; otherwise the raw
+ * batch is accumulated directly (the original, unchanged fast path).
+ * Per-pixel ON/OFF counts are accumulated under eventCountsLock_, plus a
+ * single atomic add to totalEventCount_ for EBS-AvgEventRate-MEvps.
+ *
+ * Goal 6 follow-up: also checks each event's own sensor timestamp
+ * (microsecond resolution) against windowStartT_ and calls
+ * CloseCurrentWindowLocked() once integrationTimeMs_ worth of sensor-time
+ * has elapsed since the window opened -- this is what makes sub-millisecond
+ * integration windows possible without a wall-clock Sleep() loop. The
+ * threshold (exposureUs) is computed once per batch, not per event, since
+ * an atomic re-load for every single event would be wasteful at real
+ * event rates.
  */
 void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavision::EventCD* end)
 {
    totalEventCount_ += static_cast<uint64_t>(end - begin);
 
+   MMThreadGuard filterGuard(activityFilterLock_);
+   const Metavision::EventCD* filteredBegin = begin;
+   const Metavision::EventCD* filteredEnd = end;
+   std::vector<Metavision::EventCD> filtered;
+   if (activityFilterEnabled_ && activityFilter_)
+   {
+      filtered.reserve(static_cast<size_t>(end - begin));
+      activityFilter_->process_events(begin, end, std::back_inserter(filtered));
+      filteredBegin = filtered.data();
+      filteredEnd = filtered.data() + filtered.size();
+   }
+
+   auto exposureUs = static_cast<Metavision::timestamp>(integrationTimeMs_.load() * 1000.0);
+
    MMThreadGuard g(eventCountsLock_);
-   for (const Metavision::EventCD* ev = begin; ev != end; ++ev)
+   for (const Metavision::EventCD* ev = filteredBegin; ev != filteredEnd; ++ev)
    {
       if (ev->x < sensorWidth_ && ev->y < sensorHeight_)
       {
-         uint32_t& count = eventCounts_[static_cast<size_t>(ev->y) * sensorWidth_ + ev->x];
-         if (count < UINT32_MAX)
+         size_t idx = static_cast<size_t>(ev->y) * sensorWidth_ + ev->x;
+         int32_t& count = ev->p != 0 ? onCounts_[idx] : offCounts_[idx];
+         if (count < INT32_MAX)
             count++;
+         touchedIndices_.push_back(static_cast<uint32_t>(idx));
       }
+
+      if (ev->t - windowStartT_ >= exposureUs)
+         CloseCurrentWindowLocked(true, ev->t);
    }
 }
 
 /**
- * Called by ProphEBSFrameBuilderThread every g_EventIntegrationMs. Snapshots
- * and resets the event-count accumulator (briefly locking eventCountsLock_,
- * which OnEventsCD() also briefly locks per event batch), renders those
- * counts into backImg_ as an 8-bit grayscale frame, then swaps front/back
- * under frontImgLock_ so subsequent GetImageBuffer()/InsertImage() calls
- * return the newly-built frame. backImg_ (the old frontImg_) is only
- * written again on the next call to this function, one integration window
- * later, so readers of frontImg_ never see a partially-written buffer.
+ * Goal 6 follow-up: closes the current integration window. Rather than
+ * clearing the whole onCounts_/offCounts_ arrays (fine once every ~100 ms,
+ * not fine hundreds of thousands of times a second for a megapixel-class
+ * sensor), only the specific indices recorded in touchedIndices_ since the
+ * window opened are reset -- cost proportional to actual event activity in
+ * that window, not sensor resolution. Caller must already hold
+ * eventCountsLock_; this never locks it itself.
+ */
+void CProphEBSCamera::CloseCurrentWindowLocked(bool fromEvent, Metavision::timestamp eventT)
+{
+   for (uint32_t idx : touchedIndices_)
+   {
+      onCounts_[idx] = 0;
+      offCounts_[idx] = 0;
+   }
+   touchedIndices_.clear();
+   if (fromEvent)
+      windowStartT_ = eventT;
+   lastWindowCloseWallTime_ = std::chrono::steady_clock::now();
+}
+
+/**
+ * Called by ProphEBSFrameBuilderThread every EBS-DisplayRefreshMs -- Goal 6
+ * follow-up: decoupled from the Exposure/integration-window length
+ * (integrationTimeMs_), since publishing faster than the display can show
+ * is pure overhead. First, if no window has closed for
+ * g_IdleWindowTimeoutMs (a quiet/unchanging scene, so OnEventsCD() never
+ * got a chance to close one), force-closes the stale window so the display
+ * resets to the EBS-ViewOffset baseline instead of freezing on the last
+ * active frame. Then takes a quick locked *copy* of the per-polarity
+ * event-count accumulators (a copy, not a reset-via-swap like Goal 6 --
+ * window resets are now exclusively CloseCurrentWindowLocked()'s job, so
+ * BuildAndSwapFrame() must not clear onCounts_/offCounts_ itself), renders
+ * them into backImg_ as an 8-bit grayscale frame according to the current
+ * EBS-ViewMode/EBS-ViewOffset/EBS-ViewScale, then swaps front/back under
+ * frontImgLock_ so subsequent GetImageBuffer()/InsertImage() calls return
+ * the newly-built frame. backImg_ (the old frontImg_) is only written again
+ * on the next call to this function, so readers of frontImg_ never see a
+ * partially-written buffer.
  */
 void CProphEBSCamera::BuildAndSwapFrame()
 {
-   std::vector<uint32_t> counts(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+   size_t n = static_cast<size_t>(sensorWidth_) * sensorHeight_;
+   std::vector<int32_t> onCounts(n);
+   std::vector<int32_t> offCounts(n);
    {
       MMThreadGuard g(eventCountsLock_);
-      counts.swap(eventCounts_);
-      eventCounts_.assign(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+      auto idleMs = std::chrono::duration<double, std::milli>(
+         std::chrono::steady_clock::now() - lastWindowCloseWallTime_).count();
+      if (idleMs >= g_IdleWindowTimeoutMs)
+         CloseCurrentWindowLocked(false, 0);
+      onCounts = onCounts_;
+      offCounts = offCounts_;
    }
 
+   ProphEBSViewMode mode = static_cast<ProphEBSViewMode>(viewMode_.load());
+   double offset = viewOffset_.load();
+   double scale = viewScale_.load();
+
    unsigned char* pixels = backImg_->GetPixelsRW();
-   for (size_t i = 0; i < counts.size(); i++)
+   for (size_t i = 0; i < n; i++)
    {
-      unsigned value = counts[i] * g_EventIntensityScale;
-      pixels[i] = static_cast<unsigned char>(value > 255 ? 255 : value);
+      long raw;
+      switch (mode)
+      {
+         case ProphEBSViewMode::OnOnly: raw = onCounts[i]; break;
+         case ProphEBSViewMode::OffOnly: raw = offCounts[i]; break;
+         case ProphEBSViewMode::NetSigned: raw = onCounts[i] - offCounts[i]; break;
+         case ProphEBSViewMode::Merged:
+         default: raw = onCounts[i] + offCounts[i]; break;
+      }
+
+      double value = offset + static_cast<double>(raw) * scale;
+      if (value < 0.0)
+         value = 0.0;
+      else if (value > 255.0)
+         value = 255.0;
+      pixels[i] = static_cast<unsigned char>(value);
    }
 
    {
@@ -2133,8 +2536,12 @@ double CProphEBSCamera::GetExposure() const
 
 void CProphEBSCamera::SetExposure(double exp_ms)
 {
+   // Goes through the MM::g_Keyword_Exposure property (OnExposure(), added
+   // in Goal 6) rather than writing integrationTimeMs_ directly, so the
+   // property system's own state (what the GUI/getProperty() reads back)
+   // and the atomic the frame-builder thread reads stay in sync via the
+   // single AfterSet code path.
    SetProperty(MM::g_Keyword_Exposure, CDeviceUtils::ConvertToString(exp_ms));
-   exposure_ms_ = exp_ms;
 }
 
 int CProphEBSCamera::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
@@ -2312,7 +2719,24 @@ int ProphEBSSequenceThread::svc()
          ret = camera_->InsertImage();
          if (ret != DEVICE_OK)
             break;
-         CDeviceUtils::SleepMs(static_cast<long>(std::max(1.0, intervalMs_)));
+         // Bug fix: for an unbounded (Live view) sequence, intervalMs_ is
+         // whatever MMCore's "unused" startContinuousSequenceAcquisition
+         // parameter happened to be -- per MMCore's own contract, devices
+         // must ignore it. Use max(Exposure, EBS-LiveViewMinIntervalMs)
+         // instead (see g_PropLiveViewMinIntervalMs for the full story):
+         // Live view naturally follows Exposure like any other camera for
+         // normal exposure times, but never faster than the floor once
+         // Exposure goes below it -- trusting intervalMs_ directly here let
+         // Exposure's sub-ms follow-up accidentally drive Live view to push
+         // frames far faster than the GUI/circular buffer can consume,
+         // causing an ever-growing display backlog. camera_ is a friend, so
+         // this reads integrationTimeMs_/liveViewMinIntervalMs_ directly. A
+         // finite (MDA) sequence still honors the caller's real,
+         // user-configured intervalMs_ exactly as before.
+         double sleepMs = (numImages_ == LONG_MAX)
+            ? std::max(camera_->integrationTimeMs_.load(), camera_->liveViewMinIntervalMs_.load())
+            : intervalMs_;
+         CDeviceUtils::SleepMs(static_cast<long>(std::max(1.0, sleepMs)));
       } while (!IsStopped() && ++imageCounter_ < numImages_);
    }
    catch (...)
@@ -2339,7 +2763,6 @@ int ProphEBSSequenceThread::svc()
 
 ProphEBSFrameBuilderThread::ProphEBSFrameBuilderThread(CProphEBSCamera* pCamera) :
    camera_(pCamera),
-   intervalMs_(g_EventIntegrationMs),
    stop_(true)
 {
 }
@@ -2348,9 +2771,8 @@ ProphEBSFrameBuilderThread::~ProphEBSFrameBuilderThread()
 {
 }
 
-void ProphEBSFrameBuilderThread::Start(double intervalMs)
+void ProphEBSFrameBuilderThread::Start()
 {
-   intervalMs_ = intervalMs;
    {
       MMThreadGuard g(stopLock_);
       stop_ = false;
@@ -2379,7 +2801,17 @@ int ProphEBSFrameBuilderThread::svc()
    {
       while (!IsStopped())
       {
-         CDeviceUtils::SleepMs(static_cast<long>(std::max(1.0, intervalMs_)));
+         // Goal 6 follow-up: re-read the current display-refresh interval
+         // every iteration (rather than a value snapshotted once at
+         // Start()) -- camera_ is a friend, so this reads
+         // CProphEBSCamera::displayRefreshMs_ directly; it's an
+         // atomic<double>, so this is safe against OnDisplayRefreshMs()
+         // writing it concurrently from MMCore's thread. This is now
+         // decoupled from integrationTimeMs_ (Exposure) -- the integration
+         // window is driven by real event timestamps in OnEventsCD(), not
+         // by this wall-clock sleep.
+         double intervalMs = camera_->displayRefreshMs_.load();
+         CDeviceUtils::SleepMs(static_cast<long>(std::max(1.0, intervalMs)));
          if (!IsStopped())
             camera_->BuildAndSwapFrame();
       }

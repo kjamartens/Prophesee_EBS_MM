@@ -40,9 +40,45 @@
 //                MicroManager itself saves -- see g_PropRawFilePath/
 //                g_PropRawAutoPath/g_PropRawRecordingStatus below.
 //
-//                Tunable properties and ROI/pixel masking are added in later
-//                goals (see docs/DEVLOG.md at the repository root for the
-//                roadmap).
+//                Goal 5 (this revision) exposes the EBS's own hardware
+//                settings (biases, ERC, event trail filter, anti-flicker) as
+//                MM properties, plus live read-only monitoring properties
+//                (data/event rate, temperature, etc).
+//
+//                Goal 6 (this revision) makes the live view configurable
+//                instead of the Goal 3 fixed 100 ms/x32 constants: the
+//                integration window is now MM's own standard Exposure
+//                property (SetExposure() directly retunes how often
+//                BuildAndSwapFrame() runs); CD events are accumulated
+//                per-polarity (onCounts_/offCounts_ instead of one merged
+//                counter) so EBS-ViewMode can render Merged/OnOnly/OffOnly/
+//                NetSigned (ON minus OFF); EBS-ViewOffset/EBS-ViewScale turn
+//                that raw per-pixel value into pixel = clamp(offset + raw *
+//                scale, 0, 255); and an optional software
+//                Metavision::ActivityNoiseFilterAlgorithm
+//                (EBS-ActivityFilter-Enabled/-Threshold-us) can denoise the
+//                event stream before it's accumulated at all.
+//
+//                Goal 6 follow-up (this revision): Exposure's integration
+//                window can now go sub-millisecond, driven by real
+//                Metavision::EventCD::t sensor timestamps (microsecond
+//                resolution) instead of a wall-clock Sleep() loop -- the
+//                naive version of this (fully clearing the dense per-pixel
+//                onCounts_/offCounts_ arrays every time a sub-ms window
+//                closes) doesn't scale for a megapixel-class sensor, so
+//                window-close only resets the specific pixels actually
+//                touched since it opened (touchedIndices_). A new
+//                EBS-DisplayRefreshMs property decouples how often a frame
+//                is actually published (ProphEBSFrameBuilderThread) from
+//                how long each integration window is -- no point publishing
+//                faster than ~1 ms since nothing downstream can show it
+//                anyway. A fixed idle timeout (g_IdleWindowTimeoutMs) force-
+//                closes a stale window during a quiet scene, so the display
+//                still resets to the baseline offset rather than freezing on
+//                the last-active frame forever.
+//
+//                Pixel masking and sensor ROI are added in Goal 7 (see
+//                docs/DEVLOG.md at the repository root for the roadmap).
 //
 // COPYRIGHT:     Koen J.A. Martens, 2026
 // LICENSE:       This file is distributed under the BSD license, consistent
@@ -63,8 +99,12 @@
 #include <metavision/hal/facilities/i_erc_module.h>
 #include <metavision/hal/facilities/i_event_trail_filter_module.h>
 #include <metavision/hal/facilities/i_ll_biases.h>
+#include <metavision/sdk/cv/algorithms/activity_noise_filter_algorithm.h>
+
+#include <memory>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -177,17 +217,90 @@ const double g_StatsIntervalMs = 1000.0;
 const unsigned g_TestImageWidth = 640;
 const unsigned g_TestImageHeight = 480;
 
-// Goal 3: fixed event-integration window. Every g_EventIntegrationMs
-// milliseconds, the accumulated per-pixel CD event counts since the last
-// window are rendered into a frame and swapped in as the live image. Not yet
-// user-configurable -- that's Goal 6 ("custom view methods").
-const double g_EventIntegrationMs = 100.0;
+// Goal 6: how BuildAndSwapFrame() turns the per-pixel ON/OFF event counts
+// accumulated over one integration window (MM's own Exposure property, see
+// CProphEBSCamera::integrationTimeMs_) into an 8-bit grayscale value.
+// EBS-ViewMode picks which raw per-pixel quantity is used:
+//   Merged   -- onCount + offCount (the Goal 3/5 behavior)
+//   OnOnly   -- onCount only
+//   OffOnly  -- offCount only
+//   NetSigned -- onCount - offCount (signed; the default -- see below)
+// then pixel = clamp(EBS-ViewOffset + raw * EBS-ViewScale, 0, 255).
+// NetSigned is the default view mode because a quiet pixel then sits at the
+// gray level EBS-ViewOffset (default 10) and net ON/OFF activity visibly
+// pushes it up/down from there -- this is the actual Goal 6 ask ("integrate
+// over whatever time is wanted, and show offset +- found events"); Merged
+// is kept selectable for the old Goal 3/5 look.
+extern const char* g_PropViewMode;
+extern const char* g_PropViewOffset;
+extern const char* g_PropViewScale;
+const char* const g_ViewModeMerged = "Merged";
+const char* const g_ViewModeOnOnly = "OnOnly";
+const char* const g_ViewModeOffOnly = "OffOnly";
+const char* const g_ViewModeNetSigned = "NetSigned";
+const long g_DefaultViewOffset = 10;
+const double g_DefaultViewScale = 1.0;
 
-// Maps an accumulated per-pixel event count over one integration window to
-// an 8-bit grayscale value (count * scale, clamped to 255). Chosen so a
-// handful of events per pixel per 100 ms window is already visibly bright;
-// not derived from any calibration, just a reasonable default for Goal 3.
-const unsigned g_EventIntensityScale = 32;
+// Goal 6: software activity-noise filter (Metavision::
+// ActivityNoiseFilterAlgorithm), applied to each CD event batch in
+// OnEventsCD() before accumulation, when enabled. Off by default -- a
+// genuinely optional denoising step, not required for the base view.
+extern const char* g_PropActivityFilterEnabled;
+extern const char* g_PropActivityFilterThresholdUs;
+const long g_DefaultActivityFilterThresholdUs = 10000;
+
+// Goal 6 follow-up: decouples "how long is one integration window" (Exposure,
+// now sub-millisecond capable -- see CProphEBSCamera::integrationTimeMs_ and
+// OnEventsCD()'s window-close logic) from "how often is a frame actually
+// published" (EBS-DisplayRefreshMs, backing displayRefreshMs_ -- what
+// ProphEBSFrameBuilderThread now sleeps on instead of the integration time).
+// There is no value in publishing faster than about 1 ms since nothing
+// downstream (Live view, ImageJ, a human) can show it, hence the 1 ms floor.
+extern const char* g_PropDisplayRefreshMs;
+const double g_DefaultDisplayRefreshMs = 1.0;
+
+// Goal 6 follow-up: if no window has closed (i.e. no CD event has arrived)
+// for this many milliseconds of wall-clock time, BuildAndSwapFrame() force-
+// closes the current (stale) window itself before rendering, so a quiet/
+// unchanging scene still resets to the EBS-ViewOffset baseline instead of
+// freezing on the last-active frame forever. Fixed rather than a property,
+// per explicit user decision ("100ms or so" is fine as a constant).
+const double g_IdleWindowTimeoutMs = 100.0;
+
+// Bug fix (found after the sub-ms follow-up above): MMCore's own
+// CMMCore::startContinuousSequenceAcquisition(double unused) names its
+// parameter "unused" and its own MMCore.cpp comment says "the MM::Camera
+// contract now says new adapters must ignore it" -- but
+// ProphEBSSequenceThread::svc() used it directly as its push interval since
+// Goal 1. This was invisible as long as whatever value got passed through
+// stayed near ~100 ms, but once Exposure could go sub-millisecond (and
+// MicroManager's Live view plausibly passes the camera's own exposure as
+// this "unused" value), Live view started requesting a frame push up to
+// 1000 times/sec -- far faster than MMCore's circular buffer/the GUI can
+// actually consume -- causing an ever-growing display backlog/latency
+// instead of any visible sub-ms benefit. Fix: ignore the caller-supplied
+// interval entirely for unbounded (Live) sequences; instead push at
+// max(Exposure, EBS-LiveViewMinIntervalMs) -- Live view naturally follows
+// Exposure like any other camera for normal exposure times, but never
+// faster than the floor once Exposure goes below it (there's no reason to
+// push more Live frames/sec than the GUI can actually display, whatever
+// the sub-ms integration window is doing internally). Finite (MDA)
+// sequences still honor their caller-supplied interval exactly as before,
+// since that one is a real, user-configured setting (e.g. "10 frames at
+// 100 ms") with no equivalent "ignore this" contract.
+extern const char* g_PropLiveViewMinIntervalMs;
+const double g_DefaultLiveViewMinIntervalMs = 5.0;
+
+// Goal 6: the four selectable view modes, stored as CProphEBSCamera::
+// viewMode_ (a std::atomic<int> holding one of these values -- see there
+// for why plain int rather than std::atomic<ProphEBSViewMode>).
+enum class ProphEBSViewMode : int
+{
+   Merged = 0,
+   OnOnly = 1,
+   OffOnly = 2,
+   NetSigned = 3
+};
 
 class ProphEBSSequenceThread;
 class ProphEBSFrameBuilderThread;
@@ -262,6 +375,42 @@ public:
    int OnAntiFlickerLowFreq(MM::PropertyBase* pProp, MM::ActionType eAct);
    int OnAntiFlickerHighFreq(MM::PropertyBase* pProp, MM::ActionType eAct);
 
+   // Goal 6: MM's standard Exposure property now doubles as the
+   // event-integration window -- AfterSet stores the new value into
+   // integrationTimeMs_ (an atomic). Goal 6 follow-up: this can now be
+   // sub-millisecond -- OnEventsCD() closes a window based on real
+   // Metavision::EventCD::t sensor timestamps (microsecond resolution), not
+   // a wall-clock Sleep() loop, so changing Exposure takes effect on the
+   // next event batch without restarting streaming.
+   int OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Goal 6 follow-up: how often ProphEBSFrameBuilderThread actually
+   // publishes a frame (BuildAndSwapFrame()), decoupled from how long one
+   // integration window is (Exposure, above) -- see g_PropDisplayRefreshMs.
+   int OnDisplayRefreshMs(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Bug fix: floor on Live view's frame-push cadence -- see
+   // g_PropLiveViewMinIntervalMs and ProphEBSSequenceThread::svc().
+   int OnLiveViewMinIntervalMs(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Goal 6: view-mode/offset/scale handlers -- see g_PropViewMode above for
+   // what each does. All three are plain atomic-backed settable properties;
+   // AfterSet writes are single-writer (MMCore serializes property sets) and
+   // BuildAndSwapFrame() is the sole reader, so no additional locking is
+   // needed beyond the atomics themselves.
+   int OnViewMode(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnViewOffset(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnViewScale(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Goal 6: software activity-noise-filter handlers. Both guard
+   // activityFilter_ (constructed only once StartEventStreaming() knows the
+   // sensor geometry) under activityFilterLock_, the same lock OnEventsCD()
+   // takes while calling process_events() -- needed because the algorithm's
+   // internal threshold/state isn't documented as safe against a concurrent
+   // setter from the property system's thread.
+   int OnActivityFilterEnabled(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnActivityFilterThreshold(MM::PropertyBase* pProp, MM::ActionType eAct);
+
    // Goal 5: one shared read-only handler for all six live-stats
    // properties -- BeforeGet just reads the matching cached
    // std::atomic<double> (looked up via pProp->GetName(), same pattern as
@@ -308,15 +457,41 @@ private:
    void StopEventStreaming();
 
    // CD event callback, invoked by the Metavision SDK on its own internal
-   // thread whenever a batch of events has been decoded. Just accumulates
-   // per-pixel counts under eventCountsLock_ -- all the actual frame
-   // rendering happens in BuildAndSwapFrame(), off this hot path.
+   // thread whenever a batch of events has been decoded. Optionally runs the
+   // batch through the Goal 6 software activity-noise filter first, then
+   // accumulates per-pixel ON/OFF counts under eventCountsLock_. Goal 6
+   // follow-up: also checks each event's own sensor timestamp against the
+   // current window's start and calls CloseCurrentWindowLocked() once
+   // enough sensor-time has elapsed (Exposure, converted to microseconds) --
+   // this is what makes sub-millisecond integration windows possible, since
+   // it's driven by the sensor's own microsecond-resolution clock rather
+   // than a wall-clock Sleep(). All the actual frame rendering still happens
+   // in BuildAndSwapFrame(), off this hot path.
    void OnEventsCD(const Metavision::EventCD* begin, const Metavision::EventCD* end);
 
-   // Called by ProphEBSFrameBuilderThread every g_EventIntegrationMs: snapshots
-   // and resets the event-count accumulator, renders it into backImg_, then
-   // swaps front/back so GetImageBuffer()/InsertImage() start returning the
-   // newly-built frame. Readers of frontImg_ never see a partially-written
+   // Goal 6 follow-up: closes the current integration window -- resets only
+   // the specific pixels touched since it opened (touchedIndices_), not the
+   // whole onCounts_/offCounts_ arrays, since a sub-millisecond window can
+   // close far more often than a full-sensor-size clear could ever keep up
+   // with. Caller must already hold eventCountsLock_ (this never locks
+   // itself). If fromEvent, windowStartT_ is advanced to eventT (the event
+   // that triggered the close); otherwise (the idle-timeout path from
+   // BuildAndSwapFrame()) windowStartT_ is left as-is -- it'll simply look
+   // very stale to the next real event, which harmlessly triggers an
+   // immediate (already-empty) close and a fresh windowStartT_ right then.
+   void CloseCurrentWindowLocked(bool fromEvent, Metavision::timestamp eventT);
+
+   // Called by ProphEBSFrameBuilderThread every EBS-DisplayRefreshMs (Goal 6
+   // follow-up -- decoupled from the Exposure/integration-window length):
+   // first, if no window has closed for g_IdleWindowTimeoutMs (a quiet
+   // scene), force-closes the stale window so the display resets to the
+   // EBS-ViewOffset baseline rather than freezing; then takes a quick locked
+   // copy of the per-polarity event-count accumulators (a copy, not a
+   // reset-via-swap like Goal 6 -- window resets are now exclusively
+   // CloseCurrentWindowLocked()'s job), renders them into backImg_ per the
+   // current EBS-ViewMode/-Offset/-Scale, then swaps front/back so
+   // GetImageBuffer()/InsertImage() start returning the newly-built frame.
+   // Readers of frontImg_ never see a partially-written
    // buffer because the frame builder only ever writes to backImg_.
    void BuildAndSwapFrame();
 
@@ -365,7 +540,6 @@ private:
    void StopRawRecordingIfActive();
 
    bool initialized_;
-   double exposure_ms_;
    unsigned roiX_;
    unsigned roiY_;
    unsigned roiXSize_;
@@ -401,11 +575,81 @@ private:
    ImgBuffer* backImg_;
    mutable MMThreadLock frontImgLock_;
 
-   // Per-pixel CD event counts accumulated since the last integration
-   // window, written by OnEventsCD() (Metavision's callback thread) and
-   // consumed/reset by BuildAndSwapFrame() (frame-builder thread).
-   std::vector<uint32_t> eventCounts_;
+   // Goal 6: per-pixel ON/OFF CD event counts accumulated since the current
+   // integration window opened, written by OnEventsCD() (Metavision's
+   // callback thread) and read (copied, not reset -- see
+   // CloseCurrentWindowLocked()) by BuildAndSwapFrame() (frame-builder
+   // thread). Split by polarity (int32_t, not uint32_t -- Goal 3 only ever
+   // needed an unsigned merged count) so EBS-ViewMode's NetSigned mode can
+   // render onCounts_[i] - offCounts_[i] directly.
+   std::vector<int32_t> onCounts_;
+   std::vector<int32_t> offCounts_;
    MMThreadLock eventCountsLock_;
+
+   // Goal 6 follow-up: sub-millisecond integration-window state, all guarded
+   // by eventCountsLock_ (same lock as onCounts_/offCounts_ above).
+   // windowStartT_ is the sensor's own microsecond-resolution timestamp
+   // (Metavision::EventCD::t) at which the current window opened --
+   // OnEventsCD() closes the window once an event's timestamp is far enough
+   // past it. touchedIndices_ records which onCounts_/offCounts_ indices
+   // were actually written to since the window opened, so
+   // CloseCurrentWindowLocked() only has to reset those specific entries
+   // (cost proportional to real event activity in the window) rather than
+   // the whole sensor-sized array -- a full clear on every window-close
+   // doesn't scale once windows can close hundreds of thousands of times a
+   // second. lastWindowCloseWallTime_ is a plain (non-sensor) wall-clock
+   // timestamp of the last close, used only by BuildAndSwapFrame()'s idle
+   // timeout (g_IdleWindowTimeoutMs).
+   Metavision::timestamp windowStartT_;
+   std::vector<uint32_t> touchedIndices_;
+   std::chrono::steady_clock::time_point lastWindowCloseWallTime_;
+
+   // Goal 6: event-integration window length, driven by MM's own Exposure
+   // property (see OnExposure()) instead of the old fixed
+   // g_EventIntegrationMs constant. Goal 6 follow-up: now sub-millisecond
+   // capable -- OnEventsCD() converts this to microseconds and compares it
+   // against real event timestamps (see windowStartT_ above) rather than a
+   // separate thread sleeping this many milliseconds, so changing Exposure
+   // takes effect on the very next event batch.
+   std::atomic<double> integrationTimeMs_;
+
+   // Goal 6 follow-up: how often ProphEBSFrameBuilderThread actually
+   // publishes a frame (BuildAndSwapFrame()) -- decoupled from
+   // integrationTimeMs_ above, since publishing faster than the display can
+   // show is pure overhead. The friend ProphEBSFrameBuilderThread::svc()
+   // reads this atomic every loop iteration, same pattern as
+   // integrationTimeMs_ was read in Goal 6.
+   std::atomic<double> displayRefreshMs_;
+
+   // Bug fix: floor on how fast ProphEBSSequenceThread pushes frames into
+   // MMCore during Live view (unbounded sequences only) -- see
+   // g_PropLiveViewMinIntervalMs. The friend ProphEBSSequenceThread::svc()
+   // reads this (and integrationTimeMs_ above) directly every loop
+   // iteration to compute max(Exposure, this floor).
+   std::atomic<double> liveViewMinIntervalMs_;
+
+   // Goal 6: view-rendering parameters read by BuildAndSwapFrame() -- see
+   // g_PropViewMode for the formula. viewMode_ stores a ProphEBSViewMode
+   // value as a plain int (std::atomic<enum class> needs no extra machinery
+   // in C++17, but keeping the atomic's value_type as int sidesteps any
+   // enum-atomic edge cases across compilers).
+   std::atomic<int> viewMode_;
+   std::atomic<double> viewOffset_;
+   std::atomic<double> viewScale_;
+
+   // Goal 6: software activity-noise filter. Constructed only inside
+   // StartEventStreaming() (needs sensorWidth_/sensorHeight_, known only
+   // once connected) and destroyed in StopEventStreaming(); null the rest of
+   // the time, so OnEventsCD() and the property handlers both null-check
+   // before using it. activityFilterEnabled_/-ThresholdUs_ are the
+   // user-facing state (settable any time, even with no camera connected,
+   // mirroring EBS-EventTrailFilter-* from Goal 5); activityFilterLock_
+   // guards activityFilter_ itself (both process_events() from OnEventsCD()
+   // and set_threshold()/reconstruction from the property handlers).
+   std::unique_ptr<Metavision::ActivityNoiseFilterAlgorithm<>> activityFilter_;
+   MMThreadLock activityFilterLock_;
+   bool activityFilterEnabled_;
+   long activityFilterThresholdUs_;
 
    bool streaming_;
    Metavision::CallbackId cdCallbackId_;
@@ -511,12 +755,17 @@ private:
 // ProphEBSFrameBuilderThread
 //
 // Goal 3: runs continuously (independent of MicroManager's Live/Snap state)
-// once a real EBS is connected and streaming. Every g_EventIntegrationMs it
-// calls CProphEBSCamera::BuildAndSwapFrame() to turn the events accumulated
-// over that window into the next displayable frame. This models the real
-// sensor's own behavior of continuously producing frames while streaming --
-// SnapImage()/Live view just read whatever the latest built frame is,
-// rather than driving the integration themselves.
+// once a real EBS is connected and streaming, calling
+// CProphEBSCamera::BuildAndSwapFrame() to turn the events accumulated over
+// one integration window into the next displayable frame. This models the
+// real sensor's own behavior of continuously producing frames while
+// streaming -- SnapImage()/Live view just read whatever the latest built
+// frame is, rather than driving the integration themselves.
+//
+// Goal 6: the integration window is no longer fixed -- svc() (a friend of
+// CProphEBSCamera) reads camera_->integrationTimeMs_ fresh every loop
+// iteration instead of a value snapshotted once at Start(), so changing MM's
+// Exposure property takes effect on the very next frame.
 //////////////////////////////////////////////////////////////////////////////
 class ProphEBSFrameBuilderThread : public MMDeviceThreadBase
 {
@@ -524,7 +773,7 @@ public:
    explicit ProphEBSFrameBuilderThread(CProphEBSCamera* pCamera);
    ~ProphEBSFrameBuilderThread();
 
-   void Start(double intervalMs);
+   void Start();
    void Stop();
    bool IsStopped();
 
@@ -532,7 +781,6 @@ private:
    int svc();
 
    CProphEBSCamera* camera_;
-   double intervalMs_;
    bool stop_;
    MMThreadLock stopLock_;
 };
