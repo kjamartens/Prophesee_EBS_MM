@@ -23,8 +23,21 @@ assert core.isPropertyPreInit("ProphEBSCam", "EBS-BiasRangeCheckBypass"), \
     "EBS-BiasRangeCheckBypass should be flagged as a pre-init property"
 core.setProperty("ProphEBSCam", "EBS-BiasRangeCheckBypass", "Off")
 
+# Goal 8 follow-up: EBS-SyncMode is also pre-init-only -- see ProphEBS.h.
+# Metavision::I_CameraSynchronization documents that the mode must be set
+# before the camera starts streaming, and this adapter's one cam_.start()
+# call happens once, permanently, inside Initialize() -- so there is no
+# post-init moment at which changing it could ever take effect. It used to
+# be a live-settable property that silently reverted after Initialize()
+# (confusing, reported during a user GUI walkthrough); now it's pre-init,
+# same convention as EBS-BiasRangeCheckBypass.
+assert core.isPropertyPreInit("ProphEBSCam", "EBS-SyncMode"), \
+    "EBS-SyncMode should be flagged as a pre-init property"
+core.setProperty("ProphEBSCam", "EBS-SyncMode", "Standalone")
+
 core.initializeDevice("ProphEBSCam")
 print("Goal 5: EBS-BiasRangeCheckBypass is flagged pre-init, as expected")
+print("Goal 8: EBS-SyncMode is flagged pre-init, as expected")
 
 # Goal 2: connection/identification properties. These are populated whether
 # or not a real EBS is plugged in -- ConnectionStatus reports either
@@ -820,6 +833,105 @@ else:
 #    cropping reached the recording, not just the live display.
 print("Goal 7: GUI/visual-only checks (Live-view ROI crop, visual hot-pixel masking, "
       ".raw content inspection) require the user, see docs/DEVLOG.md")
+
+# Goal 8: real spatial binning. Exercised unconditionally (works against the
+# no-hardware fallback checkerboard too, since ApplyRoiToBuffers() is what
+# actually resizes the buffers) -- ROI is full-frame at this point in the
+# script either way (both branches above end with clearROI()).
+full_x, full_y, full_w, full_h = core.getROI("ProphEBSCam")
+assert core.getProperty("ProphEBSCam", "Binning") == "1"
+for bin_factor in (2, 4, 1):
+    core.setProperty("ProphEBSCam", "Binning", str(bin_factor))
+    assert core.getProperty("ProphEBSCam", "Binning") == str(bin_factor)
+    core.snapImage()
+    binned_img = core.getImage()
+    expected_shape = (full_h // bin_factor, full_w // bin_factor)
+    assert binned_img.shape == expected_shape, \
+        f"Binning={bin_factor}: expected image shape {expected_shape}, got {binned_img.shape}"
+print("Goal 8: Binning round-tripped 1 -> 2 -> 4 -> 1, image shape scaled as expected each time "
+      f"(full frame {full_h}x{full_w})")
+
+# Goal 8: hardware trigger in/out properties. Present and round-trippable
+# whether or not a camera is connected (state-only fallback otherwise).
+trigger_channels = ["Main"]
+try:
+    core.setProperty("ProphEBSCam", "EBS-TriggerIn-Channel", "Main")
+except Exception:
+    pass
+for prop, value in (
+    ("EBS-TriggerIn-Enabled", "On"),
+    ("EBS-TriggerOut-Enabled", "On"),
+    ("EBS-TriggerOut-PeriodUs", "2000"),
+    ("EBS-TriggerOut-DutyCycle", "0.25"),
+):
+    core.setProperty("ProphEBSCam", prop, value)
+    readback = core.getProperty("ProphEBSCam", prop)
+    print(f"Goal 8: {prop} set to {value}, read back {readback}")
+# Leave everything disabled again -- no reason to leave a trigger output
+# actively pulsing after the self-test finishes.
+core.setProperty("ProphEBSCam", "EBS-TriggerIn-Enabled", "Off")
+core.setProperty("ProphEBSCam", "EBS-TriggerOut-Enabled", "Off")
+print("Goal 8: hardware trigger in/out properties round-tripped")
+
+# Goal 8 follow-up: EBS-TriggerIn-Count -- the diagnostic that lets
+# EBS-TriggerIn-Enabled actually be confirmed working without external
+# trigger hardware wired up. With nothing wired to the trigger-in pin on
+# this dev machine, no real EventExtTrigger events can arrive -- so this
+# only checks the property exists and reads back a non-negative number
+# (staying at 0 the whole time is the expected/correct result here, not a
+# failure), not that it counts something real. A user with a signal
+# generator on the trigger-in pin is the only way to verify the count
+# actually increments.
+trigger_in_count = float(core.getProperty("ProphEBSCam", "EBS-TriggerIn-Count"))
+assert trigger_in_count >= 0.0
+print("Goal 8: EBS-TriggerIn-Count readable, current value:", trigger_in_count,
+      "(expected to be 0 on this dev machine -- nothing physically wired to trigger-in)")
+
+# Goal 8: sensor-level event-rate band-pass filter. Round-trip all four
+# thresholds plus Enabled; note the *value* actually accepted may be clamped
+# by the hardware's own supported range when connected, so this only checks
+# the round-trip doesn't error and Enabled reflects what was set.
+for prop, value in (
+    ("EBS-EventRateFilter-LowerStart", "1000"),
+    ("EBS-EventRateFilter-LowerStop", "5000"),
+):
+    core.setProperty("ProphEBSCam", prop, value)
+    print(f"Goal 8: {prop} set to {value}, read back {core.getProperty('ProphEBSCam', prop)}")
+core.setProperty("ProphEBSCam", "EBS-EventRateFilter-Enabled", "On")
+assert core.getProperty("ProphEBSCam", "EBS-EventRateFilter-Enabled") == "On"
+core.setProperty("ProphEBSCam", "EBS-EventRateFilter-Enabled", "Off")
+assert core.getProperty("ProphEBSCam", "EBS-EventRateFilter-Enabled") == "Off"
+print("Goal 8: sensor-level event-rate band-pass filter properties round-tripped")
+
+# Goal 8 follow-up: EBS-SyncMode is pre-init (checked/set near the top of
+# this script, before initializeDevice()) -- its own I_CameraSynchronization
+# contract means it can never take effect after Initialize()'s one and only
+# cam_.start() call, so it's no longer live-settable here at all. Just
+# confirm it still reads back the value it was set to before init.
+sync_value = core.getProperty("ProphEBSCam", "EBS-SyncMode")
+assert sync_value == "Standalone", f"expected EBS-SyncMode to still read back its pre-init value, got {sync_value}"
+print("Goal 8: EBS-SyncMode (pre-init) still reads back its configured value:", sync_value)
+
+# Goal 8: time-decay view mode. Switches EBS-ViewMode to TimeDecay, adjusts
+# the new time-constant property, and confirms Snap still produces a
+# correctly-shaped/typed frame (pixel-level decay behavior itself needs a
+# real, changing scene to observe meaningfully -- see the user's GUI
+# walkthrough for that).
+original_view_mode3 = core.getProperty("ProphEBSCam", "EBS-ViewMode")
+original_decay_us = core.getProperty("ProphEBSCam", "EBS-TimeDecay-TimeConstant-us")
+core.setProperty("ProphEBSCam", "EBS-ViewMode", "TimeDecay")
+assert core.getProperty("ProphEBSCam", "EBS-ViewMode") == "TimeDecay"
+core.setProperty("ProphEBSCam", "EBS-TimeDecay-TimeConstant-us", "5000")
+assert float(core.getProperty("ProphEBSCam", "EBS-TimeDecay-TimeConstant-us")) == 5000.0
+if connection_status == "Connected":
+    time.sleep(0.3)  # let a few real events accumulate under the new mode
+core.snapImage()
+decay_img = core.getImage()
+assert decay_img.shape == (full_h, full_w) and decay_img.dtype == np.uint8, \
+    f"TimeDecay mode: expected shape {(full_h, full_w)} uint8, got {decay_img.shape} {decay_img.dtype}"
+core.setProperty("ProphEBSCam", "EBS-ViewMode", original_view_mode3)
+core.setProperty("ProphEBSCam", "EBS-TimeDecay-TimeConstant-us", original_decay_us)
+print("Goal 8: TimeDecay view mode round-tripped, snap shape/dtype:", decay_img.shape, decay_img.dtype)
 
 core.unloadDevice("ProphEBSCam")
 print("SUCCESS")

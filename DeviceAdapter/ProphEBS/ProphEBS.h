@@ -114,12 +114,16 @@
 
 #include <metavision/sdk/stream/camera.h>
 #include <metavision/hal/facilities/i_antiflicker_module.h>
+#include <metavision/hal/facilities/i_camera_synchronization.h>
 #include <metavision/hal/facilities/i_erc_module.h>
+#include <metavision/hal/facilities/i_event_rate_activity_filter_module.h>
 #include <metavision/hal/facilities/i_event_trail_filter_module.h>
 #include <metavision/hal/facilities/i_ll_biases.h>
 #include <metavision/hal/facilities/i_digital_event_mask.h>
 #include <metavision/hal/facilities/i_roi.h>
 #include <metavision/hal/facilities/i_roi_pixel_mask.h>
+#include <metavision/hal/facilities/i_trigger_in.h>
+#include <metavision/hal/facilities/i_trigger_out.h>
 #include <metavision/sdk/cv/algorithms/activity_noise_filter_algorithm.h>
 
 #include <memory>
@@ -391,16 +395,105 @@ extern const char* g_PropHotPixelCalibStatus;
 const double g_DefaultHotPixelCalibDurationMs = 5000.0;
 const double g_DefaultHotPixelStddevK = 10.0;
 
-// Goal 6: the four selectable view modes, stored as CProphEBSCamera::
-// viewMode_ (a std::atomic<int> holding one of these values -- see there
-// for why plain int rather than std::atomic<ProphEBSViewMode>).
+// Goal 8: a fifth view mode -- an exponential time-decay visualization
+// (inspired by Metavision::TimeDecayFrameGenerationAlgorithm, but
+// hand-rolled rather than adopting that class directly, since it renders
+// into a cv::Mat and this project deliberately has no OpenCV link
+// dependency -- see Goal 2's design notes on avoiding an OpenCV .lib).
+// Rather than the window-integrated ON/OFF counts the other four modes use,
+// each pixel remembers only the timestamp and polarity of its own
+// most-recent event (lastEventTimeUs_/lastEventPolarity_, full-sensor-sized,
+// updated directly in OnEventsCD() alongside onCounts_/offCounts_) and
+// BuildAndSwapFrame() renders brightness = sign * exp(-(now - lastEventT) /
+// EBS-TimeDecay-TimeConstant-us) through the same offset/scale formula the
+// other modes use. "now" is extrapolated forward from the latest processed
+// event's sensor timestamp (nowT_) by however much wall-clock time has
+// elapsed since (nowWallAnchor_) -- see BuildAndSwapFrame() -- so the decay
+// keeps advancing smoothly between event batches instead of only updating
+// once per batch, and still visibly decays to the EBS-ViewOffset baseline
+// during a genuinely idle scene.
+extern const char* g_PropTimeDecayTimeConstantUs;
+const double g_DefaultTimeDecayTimeConstantUs = 20000.0; // 20 ms
+const char* const g_ViewModeTimeDecay = "TimeDecay";
+
+// Goal 6: the selectable view modes, stored as CProphEBSCamera::viewMode_ (a
+// std::atomic<int> holding one of these values -- see there for why plain
+// int rather than std::atomic<ProphEBSViewMode>).
 enum class ProphEBSViewMode : int
 {
    Merged = 0,
    OnOnly = 1,
    OffOnly = 2,
-   NetSigned = 3
+   NetSigned = 3,
+   TimeDecay = 4 // Goal 8
 };
+
+// Goal 8: hardware trigger in/out (Metavision::I_TriggerIn/I_TriggerOut).
+// EBS-TriggerIn-Channel picks which external-trigger channel
+// EBS-TriggerIn-Enabled applies to -- restricted to whatever
+// I_TriggerIn::get_available_channels() actually reports when a camera is
+// connected (typically just "Main"), or all three enum values as a
+// state-only fallback with no camera. EBS-TriggerOut-* configure the
+// camera's own output pulse (period/duty cycle) -- I_TriggerOut has no
+// range-query API, so no SetPropertyLimits() call is possible for those two;
+// an out-of-range value is simply rejected by the hardware (set_period()/
+// set_duty_cycle() return false, logged, previous value kept in the local
+// fallback state either way since this file never re-reads hardware state
+// back into a property except in BeforeGet).
+extern const char* g_PropTriggerInChannel;
+extern const char* g_PropTriggerInEnabled;
+extern const char* g_PropTriggerOutEnabled;
+extern const char* g_PropTriggerOutPeriodUs;
+extern const char* g_PropTriggerOutDutyCycle;
+
+// Goal 8 follow-up: read-only diagnostic so EBS-TriggerIn-Enabled can
+// actually be confirmed working without an oscilloscope -- counts real
+// Metavision::EventExtTrigger events received via cam_.ext_trigger(),
+// regardless of which channel EBS-TriggerIn-Channel currently selects.
+// Incremented on the SDK's own ext_trigger callback thread (a single atomic
+// add per batch, same "off the hot path" shape as totalRawBytes_/
+// totalEventCount_); pushed to the GUI on the existing Goal 5 stats cadence
+// by UpdateStats(), same as EBS-CallbackLagMs/EBS-BacklogFlushCount.
+extern const char* g_PropTriggerInCount;
+const long g_DefaultTriggerOutPeriodUs = 1000; // 1 kHz
+const double g_DefaultTriggerOutDutyCycle = 0.5;
+
+// Goal 8: sensor-level event-rate band-pass filter
+// (Metavision::I_EventRateActivityFilterModule) -- distinct from the Goal 6
+// software EBS-ActivityFilter-* (a host-side algorithm run on already-
+// decoded events) and the Goal 5 EBS-EventTrailFilter-* (HAL, but per-pixel
+// STC/trail-based, not rate-based). This one drops all events at the sensor
+// itself whenever the overall event rate falls below or rises above
+// configured thresholds -- saving USB bandwidth/power on both a too-quiet
+// and a too-busy scene. Hysteresis: the four thresholds are lower_bound_start/
+// lower_bound_stop/upper_bound_start/upper_bound_stop (evt/s), see
+// Metavision::I_EventRateActivityFilterModule::thresholds. Applied via
+// set_thresholds() with a freshly get_thresholds()'d struct (only the one
+// changed field overwritten) rather than one built from scratch, per the
+// header's own warning that a partially-initialized struct risks random
+// threshold values for whichever fields aren't supported on this sensor.
+extern const char* g_PropEventRateFilterEnabled;
+extern const char* g_PropEventRateFilterLowerStart;
+extern const char* g_PropEventRateFilterLowerStop;
+extern const char* g_PropEventRateFilterUpperStart;
+extern const char* g_PropEventRateFilterUpperStop;
+
+// Goal 8: camera master/slave/standalone synchronization mode
+// (Metavision::I_CameraSynchronization). Per the facility's own doc comment
+// this must be set before the camera starts streaming -- and this adapter's
+// one and only cam_.start() call happens inside StartEventStreaming(),
+// called once from Initialize() and never again for the lifetime of the
+// device, so there is no later point at which changing this could ever take
+// effect. Rather than leave it live-settable and silently do nothing (or
+// get logged-and-ignored) after that point -- confusing behavior a user
+// actually hit during self-review -- EBS-SyncMode is a pre-init-only
+// property, exactly like g_PropBiasRangeCheckBypass: created in the
+// constructor with isPreInitProperty=true, applied to hardware once in
+// Initialize() (see ApplySyncModeToHardware()), and left alone afterward.
+extern const char* g_PropSyncMode;
+const char* const g_SyncModeStandalone = "Standalone";
+const char* const g_SyncModeMaster = "Master";
+const char* const g_SyncModeSlave = "Slave";
 
 class ProphEBSSequenceThread;
 class ProphEBSFrameBuilderThread;
@@ -445,6 +538,15 @@ public:
    int GetBinning() const;
    int SetBinning(int binSize);
    int IsExposureSequenceable(bool& isSequenceable) const;
+
+   // Goal 8: EBS-Binning-backed handler for MM's standard Binning property --
+   // see g_DefaultBinning/binning_ below. GetBinning()/SetBinning() (the
+   // MM::Camera API proper) just read/write the same binning_ atomic; this
+   // handler exists only so the Binning property itself round-trips through
+   // MM's normal property system (Device/Property Browser, scripting) in
+   // addition to the dedicated API calls, same as every other camera adapter
+   // in the mmCoreAndDevices kit.
+   int OnBinning(MM::PropertyBase* pProp, MM::ActionType eAct);
 
    // Continuous/sequence acquisition (used by MicroManager's Live view)
    int StartSequenceAcquisition(double interval_ms);
@@ -511,6 +613,25 @@ public:
    int OnActivityFilterEnabled(MM::PropertyBase* pProp, MM::ActionType eAct);
    int OnActivityFilterThreshold(MM::PropertyBase* pProp, MM::ActionType eAct);
 
+   // Goal 8: time-decay view-mode parameter -- see g_PropTimeDecayTimeConstantUs.
+   int OnTimeDecayTimeConstant(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Goal 8: hardware trigger in/out handlers -- see g_PropTriggerInChannel
+   // above for what each does.
+   int OnTriggerInChannel(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnTriggerInEnabled(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnTriggerOutEnabled(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnTriggerOutPeriodUs(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnTriggerOutDutyCycle(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Goal 8: sensor-level event-rate band-pass filter handlers -- see
+   // g_PropEventRateFilterEnabled above.
+   int OnEventRateFilterEnabled(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnEventRateFilterLowerStart(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnEventRateFilterLowerStop(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnEventRateFilterUpperStart(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnEventRateFilterUpperStop(MM::PropertyBase* pProp, MM::ActionType eAct);
+
    // Follow-up: settable threshold (see g_PropBacklogFlushThresholdMs) for
    // OnEventsCD()'s backlog detection -- plain atomic-backed, same shape as
    // OnViewOffset()/OnViewScale() above. EBS-CallbackLagMs/EBS-BacklogFlushCount
@@ -571,6 +692,20 @@ private:
    void CreateErcProperties();
    void CreateEventTrailFilterProperties();
    void CreateAntiFlickerProperties();
+
+   // Goal 8: creates the hardware trigger in/out and event-rate band-pass
+   // filter properties -- same calling convention/placement as the Goal 5
+   // Create*Properties() methods above (called from Initialize(), after
+   // ConnectToCamera()).
+   void CreateTriggerProperties();
+   void CreateEventRateFilterProperties();
+
+   // Goal 8: reads the pre-init EBS-SyncMode property (see g_PropSyncMode)
+   // and applies it once via Metavision::I_CameraSynchronization -- called
+   // from Initialize() after ConnectToCamera(), before StartEventStreaming()
+   // runs cam_.start(), the only point at which this facility's own
+   // "must be set before the camera starts" contract can ever be honored.
+   void ApplySyncModeToHardware();
 
    // Goal 7: creates EBS-BlockedPixels and the hot-pixel calibration
    // properties. Called from Initialize() alongside the other
@@ -766,6 +901,27 @@ private:
    std::vector<int32_t> offCounts_;
    MMThreadLock eventCountsLock_;
 
+   // Goal 8: time-decay view-mode state, full-sensor-sized like onCounts_/
+   // offCounts_ above, updated in the same OnEventsCD() per-event loop under
+   // the same eventCountsLock_. lastEventTimeUs_[idx] is the sensor
+   // timestamp (Metavision::EventCD::t) of that pixel's most recent event
+   // (-1 sentinel = never fired this session); lastEventPolarity_[idx] is
+   // +1 (ON) or -1 (OFF) for that same event. Unlike onCounts_/offCounts_,
+   // these are never reset by CloseCurrentWindowLocked()/FlushBacklogLocked()
+   // -- the time-decay visualization is intentionally independent of the
+   // Exposure-driven integration-window/backlog machinery, since "how long
+   // ago did this pixel last fire" is meaningful across window boundaries.
+   // nowT_/nowWallAnchor_ are the (sensor-time, wall-time) anchor pair
+   // BuildAndSwapFrame() uses to extrapolate "now" forward between event
+   // batches -- same anchor-pair shape as streamWallStart_/streamSensorStart_
+   // below, updated once per OnEventsCD() batch (and in FlushBacklogLocked(),
+   // so the decay clock keeps advancing through a flush instead of freezing).
+   std::vector<int64_t> lastEventTimeUs_;
+   std::vector<int8_t> lastEventPolarity_;
+   Metavision::timestamp nowT_;
+   std::chrono::steady_clock::time_point nowWallAnchor_;
+   std::atomic<double> timeDecayTimeConstantUs_;
+
    // Goal 6 follow-up: sub-millisecond integration-window state, all guarded
    // by eventCountsLock_ (same lock as onCounts_/offCounts_ above).
    // windowStartT_ is the sensor's own microsecond-resolution timestamp
@@ -920,6 +1076,33 @@ private:
    long localAntiFlickerLowFreq_;
    long localAntiFlickerHighFreq_;
 
+   // Goal 8: local fallback storage for trigger in/out, event-rate
+   // band-pass filter, and sync-mode properties when no camera is
+   // connected -- same "mirrors the bias fallback" pattern as the Goal 5
+   // members above.
+   std::string localTriggerInChannel_;
+   bool localTriggerInEnabled_;
+   bool localTriggerOutEnabled_;
+   long localTriggerOutPeriodUs_;
+   double localTriggerOutDutyCycle_;
+   bool localEventRateFilterEnabled_;
+   long localEventRateFilterLowerStart_;
+   long localEventRateFilterLowerStop_;
+   long localEventRateFilterUpperStart_;
+   long localEventRateFilterUpperStop_;
+
+   // Goal 8: real spatial binning of the event-count grid (sums, not
+   // averages -- an event-camera analog of a real sensor's charge binning:
+   // more raw event count per output pixel, effectively higher apparent
+   // sensitivity at the cost of resolution). Atomic because
+   // BuildAndSwapFrame() reads it every frame on ProphEBSFrameBuilderThread's
+   // own thread while SetBinning()/OnBinning() write it from whatever thread
+   // MMCore calls the binning system from -- same cross-thread shape as
+   // roiX_/roiY_/roiXSize_/roiYSize_ in Goal 7. Only 1/2/4 are offered (MM's
+   // own Binning property is a string enum of allowed values, not a free
+   // integer).
+   std::atomic<int> binning_;
+
    // Goal 7: canonical blocked/hot-pixel list, always in absolute sensor
    // coordinates. blockedPixelsLock_ guards it against
    // OnDetectHotPixelsNow()'s calibration path racing a manual
@@ -949,6 +1132,13 @@ private:
    Metavision::CallbackId rawDataCallbackId_;
    ProphEBSStatsThread* statsThd_;
    friend class ProphEBSStatsThread;
+
+   // Goal 8 follow-up: EBS-TriggerIn-Count backing state -- see
+   // g_PropTriggerInCount. triggerInCallbackId_ is only valid while
+   // streaming_ (registered/removed in Start/StopEventStreaming(), same as
+   // cdCallbackId_/rawDataCallbackId_ above).
+   std::atomic<uint64_t> triggerInCount_;
+   Metavision::CallbackId triggerInCallbackId_;
 
    // Goal 5: cached stat values, written only by UpdateStats() (on
    // statsThd_'s thread) and read only by OnStat() (called synchronously by

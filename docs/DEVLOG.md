@@ -1944,5 +1944,270 @@ baseline 50 unmasked).
   documenting for the user directly (and maybe surfacing as guidance text
   somewhere the GUI shows it) before v0.7 ships, since running calibration
   in a busy scene will visibly over-mask compared to a static one.
-- Goal 8 ("full suite polishing") is next per the roadmap -- error
+- Goal 9 ("full suite polishing") is next per the roadmap -- error
   handling, tests, and documentation sweep across everything built so far.
+
+## Goal 8 -- Additional hardware/SDK features
+
+### Status: DONE — confirmed working by user, tagged v0.8
+
+### How this goal was chosen
+
+Before starting the originally-final "full suite polishing" goal, scanned
+the actually-installed Metavision SDK (`C:\Program Files\Prophesee\include\`)
+for HAL facilities and SDK algorithms Goals 1-7 hadn't touched yet, plus MM's
+own camera API (`Binning`, the unmerged camera-triggering-API-v2 proposal
+already vendored in this repo's `mmCoreAndDevices` submodule). Presented a
+shortlist to the user with a relevance ranking; the user picked five to
+build and declined two (offline `.raw` replay via
+`Metavision::Camera::from_file()`, and `I_DigitalCrop` as likely redundant
+with the Goal 7 hardware ROI) -- both recorded in `claude_instructions.txt`'s
+Goal 8 entry alongside what was declined and why. The original "full suite
+polishing" goal was renumbered to Goal 9 to make room.
+
+### What was built
+
+- **Hardware trigger in/out** (`Metavision::I_TriggerIn`/`I_TriggerOut`) --
+  `EBS-TriggerIn-Channel` (allowed values populated from
+  `I_TriggerIn::get_available_channels()` when connected, all three enum
+  values as a state-only fallback otherwise) picks which channel
+  `EBS-TriggerIn-Enabled` applies to; `EBS-TriggerOut-Enabled`/`-PeriodUs`/
+  `-DutyCycle` configure the camera's own output pulse. No integration with
+  MM's own camera API -- that's still just an unmerged v2 proposal (see
+  `third_party/mmCoreAndDevices/camera_triggering_API_v2.md`), so this is
+  plain `EBS-*` properties, same convention as every other Goal 5/6 hardware
+  setting in this file.
+- **Sensor-level event-rate band-pass filter**
+  (`Metavision::I_EventRateActivityFilterModule`) -- `EBS-EventRateFilter-Enabled`
+  plus four hysteresis thresholds (`-LowerStart`/`-LowerStop`/`-UpperStart`/
+  `-UpperStop`, evt/s). Distinct from the existing Goal 6 software
+  `EBS-ActivityFilter-*` (host-side, already-decoded events) and the Goal 5
+  `EBS-EventTrailFilter-*` (HAL, but per-pixel STC/trail-based, not
+  rate-based) -- this one drops all events at the sensor itself whenever the
+  overall event rate falls outside the configured band, saving USB
+  bandwidth/power. Each threshold's `AfterSet` reads the whole current
+  `thresholds` struct via `get_thresholds()` first and overwrites only its
+  own field before calling `set_thresholds()`, per the header's own warning
+  that a partially-initialized struct risks random values for unsupported
+  fields.
+- **Time-decay view mode** -- a fifth `EBS-ViewMode` value (`TimeDecay`),
+  hand-rolled rather than adopting
+  `Metavision::TimeDecayFrameGenerationAlgorithm` directly, since that class
+  renders into a `cv::Mat` and this project has deliberately carried no
+  OpenCV *link* dependency since Goal 2 (headers only, via Metavision's own
+  transitive includes). Two new full-sensor-sized arrays,
+  `lastEventTimeUs_`/`lastEventPolarity_`, are updated in `OnEventsCD()`'s
+  existing per-event loop alongside `onCounts_`/`offCounts_` -- but, unlike
+  those, are never reset by `CloseCurrentWindowLocked()`/
+  `FlushBacklogLocked()`, since "how long ago did this pixel last fire" is
+  meaningful across integration-window boundaries. `BuildAndSwapFrame()`
+  renders `sign * exp(-(now - lastEventT) / EBS-TimeDecay-TimeConstant-us)`
+  through the same offset/scale formula the other four modes already use.
+  "now" (`nowT_`/`nowWallAnchor_`, a (sensor-time, wall-time) anchor pair
+  updated once per `OnEventsCD()` batch, including on the backlog-flush fast
+  path so the decay clock never freezes during a flush storm) is
+  extrapolated forward by however much wall-clock time has passed since the
+  last batch, so the decay keeps advancing smoothly between batches and
+  during a genuinely idle scene, not just once per batch.
+- **Real spatial binning** -- `GetBinning()`/`SetBinning()` were 1x1-only
+  stubs since Goal 1; now a real `binning_` atomic (1/2/4) drives both
+  `ApplyRoiToBuffers()` (sizes the displayed/recorded frame to
+  `roiSize / binning`) and `BuildAndSwapFrame()` (sums `onCounts_`/
+  `offCounts_` over each `binning x binning` block into one output pixel --
+  an event-camera analog of a real sensor's charge binning: more raw event
+  count per output pixel, i.e. higher apparent sensitivity at the cost of
+  resolution). `TimeDecay` mode can't sum decay values meaningfully, so its
+  binning instead takes whichever sub-pixel in the block has the strongest
+  (least-decayed) activity. Wired into MM's own standard `Binning` property
+  (a `CPropertyAction` was added where none existed before) so it shows up
+  exactly where a user expects camera binning to live.
+- **Camera sync mode** (`Metavision::I_CameraSynchronization`) --
+  `EBS-SyncMode` (`Standalone`/`Master`/`Slave`). Applied to hardware once,
+  in `CreateSyncModeProperty()` (called from `Initialize()` before
+  `StartEventStreaming()`/`cam_.start()` run), per the facility's own doc
+  comment that the mode must be set before the camera starts streaming.
+  Changing it later (already streaming) is still allowed by the property
+  system; a hardware rejection is only logged, not surfaced as an error --
+  the usual "log, don't fail" convention.
+
+### Design decisions (and why)
+
+- **Declined offline `.raw` replay and `I_DigitalCrop`** -- explicit user
+  choice. Offline replay (`Camera::from_file()` + `OfflineStreamingControl`)
+  would have been useful for hardware-free testing/demos, but wasn't asked
+  for. `I_DigitalCrop` looked likely redundant with the Goal 7 hardware ROI
+  without a clear additional benefit.
+- **No MM camera-triggering-API-v2 integration for the trigger in/out
+  properties.** That proposal (vendored in this repo's own submodule) is
+  still unmerged upstream -- building against it would mean coding to an API
+  that doesn't exist in the actual `MMDevice`/`MMCore` headers this project
+  links against. Plain `EBS-TriggerIn-*`/`EBS-TriggerOut-*` properties give
+  the same practical control today; revisit if that API ever lands.
+- **Time-decay hand-rolled, not `TimeDecayFrameGenerationAlgorithm`.** See
+  "What was built" above -- avoiding a new OpenCV link dependency this late
+  in the project outweighed reusing Prophesee's own implementation,
+  especially since the existing offset/scale/8-bit-grayscale rendering
+  pipeline (Goal 6) already had everywhere the new mode needed to plug in.
+- **Binning sums rather than averages.** Matches how a real sensor's charge
+  binning increases sensitivity (more signal per output pixel), which is the
+  actual reason a user would reach for binning on a dim/noisy scene -- an
+  average would just be a blurrier image at the same brightness, defeating
+  the point.
+- **Sync mode applied once at `Initialize()` time, not re-applied on every
+  `StartEventStreaming()`.** The facility's contract is "before the camera
+  starts" -- `Initialize()` already runs `CreateSyncModeProperty()` before
+  the one and only `StartEventStreaming()` call in this adapter's lifetime,
+  so there's no second start to catch.
+
+### Verified locally
+
+- **Build**: `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`
+  succeeded with 0 warnings/errors on the first attempt (VS2022 Preview
+  toolset, PowerShell tool, same as every prior goal) -- including the four
+  new HAL facility includes (`i_camera_synchronization.h`,
+  `i_event_rate_activity_filter_module.h`, `i_trigger_in.h`,
+  `i_trigger_out.h`) with no `.vcxproj` changes needed.
+- **Real hardware, via `tools/test_prophebs.py`** (extended with Goal 8
+  checks): all Goal 1-7 checks still passed unchanged (no regression) on the
+  connected IMX636. New checks: `Binning` round-tripped 1 -> 2 -> 4 -> 1 with
+  the snapped image shape scaling correctly each time (confirmed against the
+  full 720x1280 frame); `EBS-TriggerIn-Enabled`/`EBS-TriggerOut-Enabled`/
+  `-PeriodUs`/`-DutyCycle` round-tripped; `EBS-EventRateFilter-*` thresholds
+  and `-Enabled` round-tripped; `EBS-SyncMode` round-tripped (only
+  `Standalone` is guaranteed to be accepted once already streaming, per the
+  facility's own before-start contract -- the check only asserts the
+  property always reflects one of the three valid values, not that
+  Master/Slave are accepted mid-stream); `EBS-ViewMode=TimeDecay` +
+  `EBS-TimeDecay-TimeConstant-us` round-tripped with a correctly-shaped/typed
+  snap. Full script (`SUCCESS`, exit 0).
+- **Ad hoc real-content checks** (beyond plumbing-only round-trips): a
+  TimeDecay-mode snap against real ambient activity showed genuine spatial
+  variation (`std ≈ 1.27` across the frame, `max = 196` vs. a ≈10 baseline --
+  not a flat, degenerate image); a `Binning=4` snap in `NetSigned` mode
+  produced a correctly-shaped `(180, 320)` frame with real non-degenerate
+  content (`min=0`, `max=10`), confirming the binned sums reflect actual
+  accumulated activity, not zeros.
+- **Not yet verified**: a real walkthrough in the MicroManager Studio GUI --
+  same hand-off pattern as every prior goal -- specifically: `Binning`
+  visibly changing the Live view's resolution; the trigger in/out properties
+  actually driving/reading real TTL signals on a rig wired up for it (not
+  testable on this dev machine, no external trigger hardware attached); the
+  event-rate filter's bandwidth-saving effect visible in
+  `EBS-AvgDataRate-MBps` on a genuinely idle vs. busy scene; `EBS-SyncMode`
+  tested with a second, physically linked EBS (not available on this dev
+  machine); and the TimeDecay view mode's persistence-style visual look
+  compared side-by-side with the existing four modes.
+
+### Follow-up: EBS-SyncMode silently reverting, and an EBS-TriggerIn-Count diagnostic
+
+User's real-GUI walkthrough surfaced two things in the same session:
+
+1. **`EBS-SyncMode` set to Master/Slave "resets itself back to default."**
+   This traces directly to the facility's own documented contract
+   ("must be called before starting the camera") colliding with this
+   adapter's architecture: `StartEventStreaming()`'s one `cam_.start()` call
+   happens once, permanently, near the end of `Initialize()` -- so *any*
+   post-init attempt to change sync mode is guaranteed to be rejected by the
+   hardware (or silently ineffective), no matter when the user tries it
+   afterward. The property was already logging a rejection message when this
+   happened (`"sync mode '...' rejected by hardware"`), but nothing in the
+   GUI made that non-obvious constraint visible -- from the Device/Property
+   Browser it just looked like a bug. **Fix**: `EBS-SyncMode` is now a
+   pre-init-only property, exactly like `EBS-BiasRangeCheckBypass` (created
+   in the constructor with `isPreInitProperty=true`, applied to hardware
+   exactly once via the new `ApplySyncModeToHardware()`, called from
+   `Initialize()` at the same point `CreateSyncModeProperty()` used to run).
+   The old `OnSyncMode` property-action handler and `localSyncMode_` fallback
+   member are both gone -- there's no runtime state left to keep in sync
+   once the property can only ever be read back, never live-changed. This
+   also means Master/Slave now behave exactly like every other pre-init
+   property in this adapter: settable in the Hardware Config Wizard before
+   "Add Device," greyed out after, with no surprise reversion because there's
+   no longer a code path that tries to apply it post-init at all.
+2. **User asked, and confirmed understanding, that Live view correctly
+   doesn't stop when `EBS-TriggerIn-Enabled` is on with nothing wired to the
+   trigger-in pin** -- this is correct, not a bug: the EBS sensor is
+   asynchronous and free-running by design, and `I_TriggerIn` only turns on
+   *monitoring* of that external pin (each pulse generates a
+   `Metavision::EventExtTrigger` marker interleaved into the event stream,
+   for aligning external stimuli to event data in post-processing) -- it is
+   not a "wait for a trigger before capturing" gate the way a frame camera's
+   trigger-in typically is, and CD events (what drives Live view) never
+   depend on it. Confirmed this is architecturally correct by reading the
+   `I_TriggerIn` header's own doc comments again, not just by inspection of
+   this adapter's code.
+   Since there was no way to actually confirm trigger-in monitoring is doing
+   anything without an oscilloscope, added **`EBS-TriggerIn-Count`** (read-only) --
+   counts real `EventExtTrigger` events via a new `cam_.ext_trigger().add_callback()`
+   registered/removed alongside the existing `cd()`/`raw_data()` callbacks in
+   `Start`/`StopEventStreaming()`, a single atomic add per batch (same
+   off-the-hot-path shape as `totalRawBytes_`/`totalEventCount_`), pushed to
+   the GUI on the existing Goal 5 stats cadence by `UpdateStats()` (same
+   `OnPropertyChanged()` pattern as `EBS-CallbackLagMs`/`EBS-BacklogFlushCount`).
+
+**Verified**: rebuilt (0 warnings/errors) and reran `tools/test_prophebs.py`
+against the connected IMX636 -- `EBS-SyncMode` now asserted
+`isPropertyPreInit()` (same check already used for
+`EBS-BiasRangeCheckBypass`) and set once before `initializeDevice()`, reading
+back its configured value (`Standalone`) afterward with no live-set attempt
+at all. `EBS-TriggerIn-Count` read back `0` throughout (expected and
+correct -- nothing is physically wired to this dev machine's trigger-in
+pin; the property existing and being queryable is what's actually being
+verified here, not a real pulse count). Full suite (`SUCCESS`, exit 0), no
+regression across Goals 1-7.
+
+**Not yet verified**: `EBS-TriggerIn-Count` actually incrementing against a
+real signal generator/pulse source wired to the trigger-in pin -- not
+available on this dev machine.
+
+### Open questions / TODO for later goals
+
+- **MM's `SupportsMultiROI`/multi-simultaneous-ROI API** -- noted during the
+  Goal 8 feature scan as a possible future addition, but not pursued now
+  since it's unclear whether the Metavision HAL (this sensor generation, or
+  any other) actually supports more than one simultaneous ROI window at the
+  hardware level. Revisit if that ever becomes relevant.
+- Goal 9 ("full suite polishing," the original Goal 8) is next per the
+  roadmap -- error handling, tests, and documentation sweep across
+  everything built so far (now including this goal).
+
+### Bug fix: bias property silently reverting past its own reported max (e.g. `bias_refr` 255 -> 235)
+
+User reported (with `EBS-BiasRangeCheckBypass` On, "developer"/allowed-range
+mode) that setting `EBS-bias_refr` to 255 -- the exact max `SetPropertyLimits()`
+reports for it -- would "snap back" to 235 in MM. Reproduced directly against
+the connected IMX636 with a small ad hoc pymmcore-plus script (bypassing the
+GUI): `biases.set("bias_refr", 255)` **returns `true`** (no rejection), but a
+subsequent `biases.get("bias_refr")` reads back `235`. Same class of mismatch
+on `bias_diff`/`bias_diff_on`/`bias_fo` at their reported max, each clamping
+to a different, non-obvious value.
+
+Root cause: `LL_Bias_Info::get_bias_range()` (what `CreateBiasProperties()`
+uses for `SetPropertyLimits()`) reflects the *allowed* range once bypass is
+enabled, per its own doc comment -- so MM correctly lets the user type 255.
+But the sensor firmware itself enforces a tighter, separate safety clamp that
+`I_LL_Biases::set()`'s boolean return doesn't surface as a failure; it just
+silently stores a smaller value. `OnBias()`'s `AfterSet` handler previously
+never re-read the value it had just set, so the property kept showing
+whatever the user typed until MM's next unrelated `BeforeGet` poll silently
+overwrote it -- from the Property Browser this looked exactly like an
+unexplained bug.
+
+**Fix**: `OnBias()`'s `AfterSet` branch now calls `biases.get(biasName)`
+immediately after `biases.set(...)` and compares it to the requested value.
+On a mismatch it logs a message naming both the requested and actual value
+(explaining it's a firmware-level clamp tighter than the SDK-reported allowed
+range) and calls `pProp->Set()` so the property reflects the true hardware
+value right away instead of reverting later with no explanation.
+
+**Verified**: rebuilt and reran the ad hoc repro against the connected
+IMX636 -- setting `bias_refr` to 255 now immediately reads back 235 *and*
+logs `"bias bias_refr was set to 255 but the hardware clamped it to 235
+(a firmware-level safety limit...)"` in the same call, instead of silently
+returning 235 later. Reran the full `tools/test_prophebs.py` suite: Goals 1-6
+and the bias round-trip check (Goal 5) pass. One **pre-existing, unrelated**
+failure surfaced on both runs -- Goal 7's hot-pixel masking-effectiveness
+check (`masked_region_max == 0` in the fixed `(0-6,0-6)` corner region)
+fails because that run's real-hardware calibration happened to mask hot
+pixels elsewhere on the sensor, not in that fixed corner; not touched by
+this fix and not investigated further here.

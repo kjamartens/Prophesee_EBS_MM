@@ -46,7 +46,35 @@ Get inspired by the EBS documentation to offer multiple view methods. Most impor
 I want to be able to block out individual pixels (basically just a list of indeces - this individual pixel blocking is hot-pixel related, it would be AMAZING if this can be automated somehow, finding hot pixels from within MM and setting these in there somehow), as well as give a ROI of the EBS which is recorded.
 - this ROI selection has some MM-based things, i.e. selecting a fov or zooming in on the center. assure that these will work.
 
-8. Full suite polishing
+8. Additional hardware/SDK features
+Found by scanning the Metavision SDK's HAL facilities and algorithms against
+what Goals 1-7 already expose, then reviewed with the user (2026-07-30) to
+pick which were worth doing. Selected:
+ - Hardware trigger in/out (`I_TriggerIn`/`I_TriggerOut`) as EBS-* properties
+   to enable/disable/configure each channel/signal (no full MM trigger-API
+   integration -- MM's own camera trigger API is still just an unmerged v2
+   proposal, see `third_party/mmCoreAndDevices/camera_triggering_API_v2.md`).
+ - A time-decay live-view mode (`TimeDecayFrameGenerationAlgorithm`) as a new
+   `EBS-ViewMode` option alongside the existing Merged/OnOnly/OffOnly/NetSigned.
+ - Sensor-level event-rate band-pass filter (`I_EventRateActivityFilterModule`)
+   as EBS-* properties -- distinct from the existing software activity filter
+   and the HAL event-trail (STC) filter; drops events at the sensor itself
+   when the rate is below/above configured thresholds.
+ - Real spatial binning (`GetBinning()`/`SetBinning()` are currently 1x1-only
+   stubs) -- implement actual 2x2/4x4 binning of the event-count grid, using
+   MM's standard Binning property.
+ - Multi-camera sync mode (`I_CameraSynchronization`, standalone/master/slave)
+   as EBS-* properties.
+
+Declined for now: offline `.raw` replay (`Metavision::Camera::from_file()` +
+`OfflineStreamingControl`), `I_DigitalCrop` (likely redundant with the Goal 7
+hardware ROI), MM's `SupportsMultiROI`/multi-simultaneous-ROI API.
+
+Noted for possible later work: MM's MultiROI API (multiple simultaneous ROI
+windows) -- revisit if the Metavision HAL for a future sensor generation
+turns out to support more than one ROI window at once.
+
+9. Full suite polishing
 Do a full sweep over everything and make proper tests, documentation, handle errors, etc etc.
  - what if no sdk is found? error message or something
  - have the properties that are related to each other start with the same text so they are usefully ordered alphabetically (i.e. for hot pixels all start with HotPixel...)
