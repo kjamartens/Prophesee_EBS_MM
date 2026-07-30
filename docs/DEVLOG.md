@@ -963,7 +963,7 @@ property's own reported limits instead of a hardcoded guess.
 
 ## Goal 6 — Custom view methods
 
-### Status: self-tested on real hardware, awaiting user GUI confirmation before tagging v0.6
+### Status: confirmed working by user in the MicroManager GUI — tagged v0.6
 
 ### Requirement clarification (asked user before implementing)
 
@@ -1091,13 +1091,11 @@ user via AskUserQuestion before writing any code:
   `EBS-ViewMode`, and turn the activity filter on, all while nothing is
   restarted) snapped successfully before and after with unchanged image
   shape/dtype `(720, 1280) uint8`. Full script printed `SUCCESS`, exit 0.
-- **Not yet verified**: a real walkthrough in the MicroManager Studio GUI —
-  per the usual handoff pattern, this is pending the user: visually
-  confirming the live view changes when switching `EBS-ViewMode`, dragging
-  `Exposure`/`EBS-ViewOffset`/`EBS-ViewScale`, and observing reduced
-  noise/flicker with the activity filter enabled. The self-test can only
-  confirm the plumbing runs without error, not that each view mode "looks
-  right" to a human.
+- **Confirmed by the user in the MicroManager Studio GUI**: the live view
+  visibly responds to `EBS-ViewMode`/`EBS-ViewOffset`/`EBS-ViewScale`
+  changes, sub-millisecond `Exposure` no longer shows a growing display
+  lag, and the idle-timeout reset to the `EBS-ViewOffset` baseline behaves
+  as expected in a dark/still scene.
 
 ### Follow-up: sub-millisecond integration windows
 
@@ -1183,14 +1181,10 @@ window off real sensor timestamps instead of wall-clock sleep:
   windows via event timestamps (potentially extremely often) and resetting
   only touched pixels holds up under genuine high-event-rate hardware, not
   just synthetically.
-- **Not yet verified**: the idle-timeout reset itself (need a genuinely
-  dark/still scene to observe the display fall back to the `EBS-ViewOffset`
-  baseline after ~100 ms of no events) — self-test ran against a normal lit
-  room with continuous ambient activity, so the event-driven close path was
-  exercised throughout, not the idle-forced path. Also, as with the rest of
-  Goal 6, a real GUI walkthrough (dragging `Exposure` down into the
-  sub-millisecond range and watching the Live view) is still pending the
-  user.
+- **Confirmed by the user**: the idle-timeout reset (dark/still scene
+  falling back to the `EBS-ViewOffset` baseline after ~100 ms of no
+  events) and the sub-millisecond `Exposure` range in a real GUI
+  walkthrough both behave as expected.
 
 ### Bug found and fixed: Live view backlog grew without bound once Exposure could go sub-ms
 
