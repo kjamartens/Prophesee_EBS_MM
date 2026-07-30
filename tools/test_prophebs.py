@@ -1,6 +1,7 @@
 import os
 import time
 
+import numpy as np
 from pymmcore_plus import CMMCorePlus
 
 mm_dir = r"C:\Users\kjamartens\AppData\Local\pymmcore-plus\pymmcore-plus\mm\Micro-Manager_2.0.3_20260724"
@@ -484,6 +485,341 @@ if connection_status == "Connected":
     print("Follow-up: snap after backlog flush still succeeded, shape unaffected")
 else:
     print("Follow-up: no EBS connected -- skipping backlog-flush trigger check")
+
+# Goal 7: EBS-BlockedPixels -- round-trip a valid list, then confirm a
+# malformed string is rejected wholesale (the previous valid value is
+# retained, not partially applied).
+original_blocked = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
+core.setProperty("ProphEBSCam", "EBS-BlockedPixels", "5:5;10:20")
+assert core.getProperty("ProphEBSCam", "EBS-BlockedPixels") == "5:5;10:20"
+print("Goal 7: EBS-BlockedPixels round-tripped '5:5;10:20'")
+try:
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", "abc")
+    malformed_rejected = False
+except Exception:
+    malformed_rejected = True
+assert malformed_rejected, "expected a malformed EBS-BlockedPixels value to be rejected"
+assert core.getProperty("ProphEBSCam", "EBS-BlockedPixels") == "5:5;10:20", \
+    "expected the previous valid EBS-BlockedPixels value to be retained after a rejected malformed set"
+print("Goal 7: malformed EBS-BlockedPixels ('abc') correctly rejected, previous value retained")
+core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+
+# Goal 7: hot-pixel calibration properties/trigger exist and round-trip.
+# With no camera streaming, triggering calibration must complete promptly
+# (not hang) and report a clean failure.
+duration_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-HotPixelCalibDurationMs")
+duration_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-HotPixelCalibDurationMs")
+assert abs(float(core.getProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs")) - 5000.0) < 1e-9
+core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "150")
+assert abs(float(core.getProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs")) - 150.0) < 1e-9
+print("Goal 7: EBS-HotPixelCalibDurationMs round-tripped to 150 ms (limits", duration_lo, "-", duration_hi, ")")
+
+k_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-HotPixelStddevK")
+k_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-HotPixelStddevK")
+original_hotpixel_k = core.getProperty("ProphEBSCam", "EBS-HotPixelStddevK")
+assert abs(float(original_hotpixel_k) - 10.0) < 1e-9
+core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", "2.5")
+assert abs(float(core.getProperty("ProphEBSCam", "EBS-HotPixelStddevK")) - 2.5) < 1e-9
+print("Goal 7: EBS-HotPixelStddevK round-tripped to 2.5 (limits", k_lo, "-", k_hi, ")")
+# Restore -- a low k dramatically loosens the outlier threshold (by design:
+# threshold = mean + k*stddev), and the real-hardware calibration check
+# below needs a realistic k, not this round-trip probe value.
+core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", original_hotpixel_k)
+
+assert set(core.getAllowedPropertyValues("ProphEBSCam", "EBS-DetectHotPixelsNow")) == {"Idle", "Run"}
+
+if connection_status != "Connected":
+    t0 = time.time()
+    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
+    elapsed = time.time() - t0
+    assert elapsed < 5.0, f"calibration with no camera should fail promptly, took {elapsed:.1f}s"
+    status = core.getProperty("ProphEBSCam", "EBS-HotPixelCalibStatus")
+    assert status.startswith("Failed:"), f"expected a clean failure with no camera, got: {status}"
+    assert core.getProperty("ProphEBSCam", "EBS-DetectHotPixelsNow") == "Idle"
+    print("Goal 7: EBS-DetectHotPixelsNow with no camera failed promptly and cleanly:", status)
+else:
+    print("Goal 7: skipping the no-camera calibration-failure check (a camera is connected)")
+
+# Goal 7: hardware ROI + hot-pixel calibration, real hardware only.
+if connection_status == "Connected":
+    full_x, full_y, full_w, full_h = core.getROI("ProphEBSCam")
+    print("Goal 7: full-sensor ROI is", (full_x, full_y, full_w, full_h))
+
+    roi_w, roi_h = full_w // 4, full_h // 4
+    roi_x, roi_y = full_w // 4, full_h // 4
+    core.setROI("ProphEBSCam", roi_x, roi_y, roi_w, roi_h)
+    got_x, got_y, got_w, got_h = core.getROI("ProphEBSCam")
+    assert (got_x, got_y, got_w, got_h) == (roi_x, roi_y, roi_w, roi_h), \
+        f"expected GetROI to report back {(roi_x, roi_y, roi_w, roi_h)}, got {(got_x, got_y, got_w, got_h)}"
+    core.snapImage()
+    roi_img = core.getImage()
+    assert roi_img.shape == (roi_h, roi_w), f"expected image shape {(roi_h, roi_w)}, got {roi_img.shape}"
+    print("Goal 7: SetROI/GetROI round-tripped to", (roi_x, roi_y, roi_w, roi_h),
+          ", snapped image shape", roi_img.shape)
+
+    # Soft signal only (ambient-light dependent): print event/data rate
+    # before vs. after a small ROI, as evidence of real data reduction at
+    # the sensor, not display-level cropping.
+    time.sleep(2.0)
+    rate_with_roi = float(core.getProperty("ProphEBSCam", "EBS-AvgEventRate-MEvps"))
+    core.clearROI()
+    got_x, got_y, got_w, got_h = core.getROI("ProphEBSCam")
+    assert (got_x, got_y, got_w, got_h) == (full_x, full_y, full_w, full_h), \
+        "expected ClearROI to restore the full sensor geometry"
+    core.snapImage()
+    full_img = core.getImage()
+    assert full_img.shape == (full_h, full_w)
+    time.sleep(2.0)
+    rate_full = float(core.getProperty("ProphEBSCam", "EBS-AvgEventRate-MEvps"))
+    print("Goal 7: ClearROI restored full geometry", (full_x, full_y, full_w, full_h),
+          "; EBS-AvgEventRate-MEvps was", rate_with_roi, "MEv/s with a quarter-frame ROI vs.",
+          rate_full, "MEv/s at full frame (ambient-light dependent, informational only)")
+
+    # On-demand hot-pixel calibration against real hardware, using the
+    # actual defaults (EBS-HotPixelCalibDurationMs=5000ms,
+    # EBS-HotPixelStddevK=10) -- not an artificially short probe -- since
+    # the mean+k*stddev threshold assumes roughly-Gaussian statistics that
+    # only hold up once each pixel has accumulated enough events; a very
+    # short window (e.g. ~200ms, only 1-2 events/pixel/polarity at this
+    # sensor's ambient event rate) makes the per-pixel counts closer to a
+    # sparse Poisson distribution, whose thicker tail triggers far more
+    # "outliers" than the same k would at the real default duration --
+    # found by this exact test initially using a short explicit override.
+    # Also scoped to whatever ROI is currently active (full sensor here,
+    # since ClearROI() was just called above), not the whole chip
+    # unconditionally -- see ProphEBS.cpp's OnDetectHotPixelsNow().
+    t0 = time.time()
+    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
+    elapsed = time.time() - t0
+    calib_status = core.getProperty("ProphEBSCam", "EBS-HotPixelCalibStatus")
+    print("Goal 7: real-hardware calibration (default 5000ms/k=10) took", f"{elapsed:.2f}s", ", status:",
+          calib_status)
+    assert calib_status.startswith("Done:") or calib_status.startswith("Failed:"), \
+        f"expected calibration to finish in a well-defined state, got: {calib_status}"
+    assert core.getProperty("ProphEBSCam", "EBS-DetectHotPixelsNow") == "Idle"
+    blocked_after_calib = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
+    print("Goal 7: EBS-BlockedPixels after calibration:", blocked_after_calib)
+    # Sanity-check the serialized format is well-formed (parseable pairs).
+    if blocked_after_calib:
+        for pair in blocked_after_calib.split(";"):
+            px, py = pair.split(":")
+            int(px)
+            int(py)
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+
+    # Confirm calibration REPLACES EBS-BlockedPixels rather than merging
+    # into it (a deliberate change: calibration now unblocks everything
+    # first, then re-detects from a clean population -- see
+    # ProphEBS.cpp's OnDetectHotPixelsNow()). Manually block an arbitrary
+    # pixel unrelated to any real hot pixel, run calibration with a short
+    # duration/high threshold (so it's unlikely to itself flag much), and
+    # confirm the manually-added pixel is gone afterward -- if calibration
+    # still merged, it would still be present.
+    sentinel_pixel = "500:500"
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", sentinel_pixel)
+    assert core.getProperty("ProphEBSCam", "EBS-BlockedPixels") == sentinel_pixel
+    core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "200")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", original_hotpixel_k)
+    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
+    blocked_after_replace = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
+    print("Goal 7: EBS-BlockedPixels after calibration following a manual set of", sentinel_pixel, ":",
+          blocked_after_replace)
+    assert sentinel_pixel not in (blocked_after_replace or "").split(";"), \
+        f"expected calibration to REPLACE EBS-BlockedPixels (clearing the manually-set {sentinel_pixel} " \
+        f"first), but it's still present after a run -- calibration is still merging, not replacing"
+    print("Goal 7: confirmed -- calibration replaced EBS-BlockedPixels rather than merging into it")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "5000")
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+
+    # Confirm calibration is actually scoped to the active ROI, not the
+    # whole chip: set a small ROI, run calibration, and check every
+    # resulting EBS-BlockedPixels coordinate falls inside that ROI's
+    # bounds (with the loosest possible k, so *something* is very likely
+    # to be flagged even in a short window -- this checks scoping, not
+    # detection sensitivity).
+    core.setROI("ProphEBSCam", roi_x, roi_y, roi_w, roi_h)
+    core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", str(k_lo))
+    core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "200")
+    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
+    roi_scoped_blocked = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
+    print("Goal 7: ROI-scoped calibration (ROI", (roi_x, roi_y, roi_w, roi_h), ") found:", roi_scoped_blocked)
+    if roi_scoped_blocked:
+        for pair in roi_scoped_blocked.split(";"):
+            px_str, py_str = pair.split(":")
+            px, py = int(px_str), int(py_str)
+            assert roi_x <= px < roi_x + roi_w and roi_y <= py < roi_y + roi_h, \
+                f"pixel ({px},{py}) from ROI-scoped calibration falls outside the active ROI " \
+                f"{(roi_x, roi_y, roi_w, roi_h)} -- calibration should never scan beyond it"
+        print("Goal 7: all", len(roi_scoped_blocked.split(";")), "ROI-scoped hot pixels fall within the active ROI")
+    else:
+        print("Goal 7: ROI-scoped calibration found no outliers this run (nothing to check bounds on)")
+    core.clearROI()
+    core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", original_hotpixel_k)
+    core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "5000")
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+
+    # Deliberately loose-threshold stress test: force EBS-HotPixelStddevK to
+    # its floor with a short duration so a large fraction of pixels statistically
+    # qualify as "outliers," exercising the truncation-safety-cap path
+    # (EBS-BlockedPixels must never be allowed to grow past what MMCore's
+    # MM::MaxStrLength property-value limit can hold -- see ProphEBS.cpp's
+    # OnDetectHotPixelsNow()/the "found via self-testing" comment there).
+    core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", str(k_lo))
+    core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "200")
+    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
+    stress_status = core.getProperty("ProphEBSCam", "EBS-HotPixelCalibStatus")
+    stress_blocked = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
+    print("Goal 7: loose-threshold stress calibration status:", stress_status)
+    assert len(stress_blocked) <= 1024, \
+        f"EBS-BlockedPixels must never exceed MMCore's 1024-char property limit, got {len(stress_blocked)} chars"
+    if stress_status.startswith("Done:") and "dropped" in stress_status:
+        print("Goal 7: truncation-safety cap engaged as expected under a deliberately loose threshold:",
+              stress_status)
+    core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", original_hotpixel_k)
+    core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "5000")
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+
+    # Manually setting EBS-BlockedPixels against real hardware shouldn't
+    # break subsequent snaps.
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", "3:3;7:9")
+    core.snapImage()
+    core.getImage()
+    print("Goal 7: manual EBS-BlockedPixels set against real hardware, snap still succeeded")
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+
+    # Does blocking a pixel actually stop it from generating events, or just
+    # get recorded in EBS-BlockedPixels without hardware effect? Block a
+    # 7x7 region (0,0)-(6,6) -- 49 entries, deliberately kept under this
+    # sensor's 64-slot I_DigitalEventMask hardware limit (see
+    # ApplyBlockedPixelsToHardware()) so every single one of these pixels
+    # is actually pushed to hardware, not just listed in EBS-BlockedPixels
+    # -- and watch that exact region in the live view: with
+    # EBS-ViewOffset=0 and a large EBS-ViewScale, even a single CD event in
+    # a window makes its pixel visibly nonzero. Critically, this needs a
+    # real BEFORE/AFTER comparison of the *same* region, not just "is it
+    # zero" -- a corner of the sensor could easily show zero activity on
+    # its own (dark/no motion there), which would make the assertion pass
+    # without proving masking did anything at all. So: first confirm this
+    # exact region shows real activity while UNMASKED (retrying with a
+    # longer window if the first attempt sees none, since ambient activity
+    # there isn't guaranteed), then block it and confirm that same region
+    # goes to zero while the rest of the frame keeps showing activity.
+    original_view_mode2 = core.getProperty("ProphEBSCam", "EBS-ViewMode")
+    original_view_offset2 = core.getProperty("ProphEBSCam", "EBS-ViewOffset")
+    original_view_scale2 = core.getProperty("ProphEBSCam", "EBS-ViewScale")
+    original_exposure2 = core.getProperty("ProphEBSCam", "Exposure")
+    MASK_TEST_REGION = 7  # 7*7 = 49, comfortably under the 64-slot hardware limit
+    block_region = ";".join(f"{x}:{y}" for x in range(MASK_TEST_REGION) for y in range(MASK_TEST_REGION))
+
+    # Push the ON/OFF contrast-detection biases toward maximum sensitivity so
+    # the test isn't at the mercy of whatever's actually happening in front
+    # of the sensor right now -- lower bias_diff_on/bias_diff_off means more
+    # sensitive (more events, including pure noise), which is exactly what's
+    # wanted here: a reliable, real baseline signal in an arbitrary 10x10
+    # corner, not a genuine low-noise imaging setting. Clamped to whatever
+    # this sensor actually reports as its supported range.
+    original_bias_on = core.getProperty("ProphEBSCam", "EBS-bias_diff_on")
+    original_bias_off = core.getProperty("ProphEBSCam", "EBS-bias_diff_off")
+
+    def clamp_to_prop_limits(prop, value):
+        if core.hasPropertyLimits("ProphEBSCam", prop):
+            lo = int(core.getPropertyLowerLimit("ProphEBSCam", prop))
+            hi = int(core.getPropertyUpperLimit("ProphEBSCam", prop))
+            return max(lo, min(hi, value))
+        return value
+
+    bias_on_target = clamp_to_prop_limits("EBS-bias_diff_on", -40)
+    bias_off_target = clamp_to_prop_limits("EBS-bias_diff_off", -20)
+    core.setProperty("ProphEBSCam", "EBS-bias_diff_on", str(bias_on_target))
+    core.setProperty("ProphEBSCam", "EBS-bias_diff_off", str(bias_off_target))
+    print("Goal 7: boosted sensitivity for the masking-effectiveness check -- EBS-bias_diff_on =",
+          core.getProperty("ProphEBSCam", "EBS-bias_diff_on"), ", EBS-bias_diff_off =",
+          core.getProperty("ProphEBSCam", "EBS-bias_diff_off"))
+
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", "")
+    core.setProperty("ProphEBSCam", "EBS-ViewMode", "Merged")
+    core.setProperty("ProphEBSCam", "EBS-ViewOffset", "0")
+    core.setProperty("ProphEBSCam", "EBS-ViewScale", "50")
+
+    def sample_region_max(region_slice, exposure_ms, n_snaps):
+        core.setProperty("ProphEBSCam", "Exposure", str(exposure_ms))
+        time.sleep(0.3)  # let the new Exposure take effect on a fresh window
+        peak = 0
+        for _ in range(n_snaps):
+            core.snapImage()
+            img = core.getImage()
+            peak = max(peak, int(img[region_slice].max()))
+            time.sleep(exposure_ms / 1000.0 + 0.05)
+        return peak
+
+    region_slice = np.s_[0:MASK_TEST_REGION, 0:MASK_TEST_REGION]
+    region_label = f"(0-{MASK_TEST_REGION - 1},0-{MASK_TEST_REGION - 1})"
+    baseline_max = 0
+    for exposure_ms in (100, 300, 1000):
+        baseline_max = sample_region_max(region_slice, exposure_ms, 10)
+        if baseline_max > 0:
+            break
+    print("Goal 7: baseline (UNMASKED) activity in region", region_label, ":", baseline_max,
+          "(exposure that found it:", exposure_ms, "ms)")
+    if baseline_max == 0:
+        print("Goal 7: WARNING -- region", region_label, "showed no activity even unmasked after escalating "
+              "exposure up to 1000ms; masking effectiveness cannot be conclusively tested this run "
+              "(inconclusive, not a pass or fail) -- likely just a quiet/dark corner of the current scene")
+    else:
+        core.setProperty("ProphEBSCam", "EBS-BlockedPixels", block_region)
+        assert core.getProperty("ProphEBSCam", "EBS-BlockedPixels") == block_region
+        masked_region_max = sample_region_max(region_slice, exposure_ms, 10)
+        rest_of_frame_max = 0
+        core.snapImage()
+        rest_of_frame_max = int(core.getImage()[MASK_TEST_REGION:, :].max())
+        print("Goal 7: hot-pixel masking effectiveness check -- same region", region_label,
+              "MASKED max pixel value:", masked_region_max, "(baseline unmasked was", baseline_max,
+              "), rest-of-frame max:", rest_of_frame_max)
+        assert rest_of_frame_max > 0, \
+            "expected real activity somewhere outside the blocked region as a sanity control -- got none at all"
+        assert masked_region_max == 0, \
+            f"EBS-BlockedPixels claims {MASK_TEST_REGION * MASK_TEST_REGION} pixels in {region_label} are " \
+            f"masked, but events are still landing there (max pixel value {masked_region_max}, vs " \
+            f"{baseline_max} unmasked at the same exposure) -- hardware masking is not actually suppressing them"
+        print("Goal 7: confirmed -- region", region_label, "went from real activity (unmasked) to zero events "
+              "(masked), while the rest of the frame kept showing activity")
+
+    core.setProperty("ProphEBSCam", "EBS-ViewMode", original_view_mode2)
+    core.setProperty("ProphEBSCam", "EBS-ViewOffset", original_view_offset2)
+    core.setProperty("ProphEBSCam", "EBS-ViewScale", original_view_scale2)
+    core.setProperty("ProphEBSCam", "Exposure", original_exposure2)
+    core.setProperty("ProphEBSCam", "EBS-bias_diff_on", original_bias_on)
+    core.setProperty("ProphEBSCam", "EBS-bias_diff_off", original_bias_off)
+    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+else:
+    print("Goal 7: no EBS connected -- skipping hardware ROI/hot-pixel-calibration checks "
+          "(GetROI/SetROI/ClearROI round-trip still exercised via the fallback checkerboard below)")
+    full_x, full_y, full_w, full_h = core.getROI("ProphEBSCam")
+    roi_w, roi_h = full_w // 4, full_h // 4
+    roi_x, roi_y = full_w // 4, full_h // 4
+    core.setROI("ProphEBSCam", roi_x, roi_y, roi_w, roi_h)
+    core.snapImage()
+    roi_img = core.getImage()
+    assert roi_img.shape == (roi_h, roi_w), \
+        f"expected fallback image shape {(roi_h, roi_w)}, got {roi_img.shape}"
+    core.clearROI()
+    core.snapImage()
+    full_img = core.getImage()
+    assert full_img.shape == (full_h, full_w)
+    print("Goal 7: SetROI/GetROI/ClearROI round-tripped against the no-hardware fallback checkerboard, shapes",
+          roi_img.shape, "->", full_img.shape)
+
+# GUI/visual-only, not verifiable by this harness (per the same caveat as
+# every earlier goal's GUI-only behaviors):
+#  - actually dragging/zooming an ROI rectangle in MicroManager's Live view
+#    and visually confirming the displayed image crops;
+#  - visually confirming a masked hot pixel actually disappears (not
+#    intensifies) -- the only way to fully resolve the set_pixel()
+#    enable=true/false semantics ambiguity noted in ProphEBS.cpp;
+#  - inspecting a recorded .raw file's actual event content to confirm ROI
+#    cropping reached the recording, not just the live display.
+print("Goal 7: GUI/visual-only checks (Live-view ROI crop, visual hot-pixel masking, "
+      ".raw content inspection) require the user, see docs/DEVLOG.md")
 
 core.unloadDevice("ProphEBSCam")
 print("SUCCESS")

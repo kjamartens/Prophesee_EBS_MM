@@ -43,12 +43,13 @@ I want to add all properties that can be changed on the event-based sensor as mi
 Get inspired by the EBS documentation to offer multiple view methods. Most importantly, I just want to be able to integrate for the past X time, maybe have an offset value so that it's never <0, maybe do some filters that are commonly used.
 
 7. Pixel-by-pixel differences
-I want to be able to block out individual pixels (basically just a list of indeces), as well as give a ROI of the EBS which is recorded.
+I want to be able to block out individual pixels (basically just a list of indeces - this individual pixel blocking is hot-pixel related, it would be AMAZING if this can be automated somehow, finding hot pixels from within MM and setting these in there somehow), as well as give a ROI of the EBS which is recorded.
 - this ROI selection has some MM-based things, i.e. selecting a fov or zooming in on the center. assure that these will work.
 
 8. Full suite polishing
 Do a full sweep over everything and make proper tests, documentation, handle errors, etc etc.
  - what if no sdk is found? error message or something
+ - have the properties that are related to each other start with the same text so they are usefully ordered alphabetically (i.e. for hot pixels all start with HotPixel...)
 
 I also have some guidelines for you about the coding:
 For each goal, I want a full 'Current Status', and 'Build/Installation/Usage Tutorial'. Assume I'm a dummy and that you need to explain me *everything* about building a C++ program. What software do i need to have, what buttons to press, how to handle error messages, etc?

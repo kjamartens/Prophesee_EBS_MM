@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cmath>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -104,6 +106,12 @@ const char* g_PropLiveViewMinIntervalMs = "EBS-LiveViewMinIntervalMs";
 const char* g_PropCallbackLagMs = "EBS-CallbackLagMs";
 const char* g_PropBacklogFlushCount = "EBS-BacklogFlushCount";
 const char* g_PropBacklogFlushThresholdMs = "EBS-BacklogFlushThresholdMs";
+
+const char* g_PropBlockedPixels = "EBS-BlockedPixels";
+const char* g_PropDetectHotPixelsNow = "EBS-DetectHotPixelsNow";
+const char* g_PropHotPixelCalibDurationMs = "EBS-HotPixelCalibDurationMs";
+const char* g_PropHotPixelStddevK = "EBS-HotPixelStddevK";
+const char* g_PropHotPixelCalibStatus = "EBS-HotPixelCalibStatus";
 
 // Follow-up: how many events OnEventsCD()'s per-event loop processes between
 // wall-clock lag rechecks -- see FlushBacklogLocked()/g_PropBacklogFlushThresholdMs
@@ -662,6 +670,8 @@ CProphEBSCamera::CProphEBSCamera() :
    localAntiFlickerFilterType_(g_AntiFlickerFilterTypeBandCut),
    localAntiFlickerLowFreq_(50),
    localAntiFlickerHighFreq_(60),
+   hotPixelCalibDurationMs_(g_DefaultHotPixelCalibDurationMs),
+   hotPixelStddevK_(g_DefaultHotPixelStddevK),
    generation_("N/A"),
    dataEncodingFormat_("N/A"),
    totalRawBytes_(0),
@@ -839,6 +849,12 @@ int CProphEBSCamera::Initialize()
    CreateErcProperties();
    CreateEventTrailFilterProperties();
    CreateAntiFlickerProperties();
+
+   // Goal 7: EBS-BlockedPixels + on-demand hot-pixel calibration properties.
+   // Created here (before the cameraConnected_ branch below) so they exist
+   // and are hardware-backed the same way EBS-ERC-* etc. already are,
+   // independent of whether streaming has started yet.
+   CreateHotPixelAndRoiProperties();
 
    // Goal 5: live-stats properties are read-only, backed by the
    // avgDataRateMBps_ etc. atomics UpdateStats() writes -- see
@@ -1730,6 +1746,482 @@ int CProphEBSCamera::OnAntiFlickerHighFreq(MM::PropertyBase* pProp, MM::ActionTy
 }
 
 /**
+ * Goal 7: creates EBS-BlockedPixels and the hot-pixel calibration
+ * properties. Called from Initialize() alongside the other
+ * Create*Properties() methods, before the cameraConnected_ branch below
+ * calls StartEventStreaming().
+ */
+void CProphEBSCamera::CreateHotPixelAndRoiProperties()
+{
+   CPropertyAction* pActBlocked = new CPropertyAction(this, &CProphEBSCamera::OnBlockedPixels);
+   CreateStringProperty(g_PropBlockedPixels, "", false, pActBlocked);
+
+   CPropertyAction* pActDetect = new CPropertyAction(this, &CProphEBSCamera::OnDetectHotPixelsNow);
+   CreateStringProperty(g_PropDetectHotPixelsNow, "Idle", false, pActDetect);
+   AddAllowedValue(g_PropDetectHotPixelsNow, "Idle");
+   AddAllowedValue(g_PropDetectHotPixelsNow, "Run");
+
+   CPropertyAction* pActDuration = new CPropertyAction(this, &CProphEBSCamera::OnHotPixelCalibDurationMs);
+   CreateFloatProperty(g_PropHotPixelCalibDurationMs, hotPixelCalibDurationMs_.load(), false, pActDuration);
+   SetPropertyLimits(g_PropHotPixelCalibDurationMs, 20.0, 10000.0);
+
+   CPropertyAction* pActK = new CPropertyAction(this, &CProphEBSCamera::OnHotPixelStddevK);
+   CreateFloatProperty(g_PropHotPixelStddevK, hotPixelStddevK_.load(), false, pActK);
+   SetPropertyLimits(g_PropHotPixelStddevK, 0.1, 100.0);
+
+   // Plain settable status string, same pattern as g_PropRawRecordingStatus
+   // (Goal 4) -- updated by the device itself via SetProperty()+
+   // OnPropertyChanged() from OnDetectHotPixelsNow(), not through a
+   // CPropertyAction.
+   CreateStringProperty(g_PropHotPixelCalibStatus, "Idle", false);
+}
+
+int CProphEBSCamera::OnHotPixelCalibDurationMs(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+      pProp->Set(hotPixelCalibDurationMs_.load());
+   else if (eAct == MM::AfterSet)
+   {
+      double value;
+      pProp->Get(value);
+      hotPixelCalibDurationMs_ = value;
+   }
+   return DEVICE_OK;
+}
+
+int CProphEBSCamera::OnHotPixelStddevK(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+      pProp->Set(hotPixelStddevK_.load());
+   else if (eAct == MM::AfterSet)
+   {
+      double value;
+      pProp->Get(value);
+      hotPixelStddevK_ = value;
+   }
+   return DEVICE_OK;
+}
+
+/**
+ * Goal 7: EBS-BlockedPixels serialization -- "x:y" pairs separated by ';',
+ * e.g. "120:340;121:341". Always absolute sensor coordinates. Uses ':'
+ * (not ',') between x and y -- see g_PropBlockedPixels for why: MMCore
+ * itself rejects any property value containing a comma (found while
+ * self-testing this property for the first time).
+ */
+std::string CProphEBSCamera::SerializeBlockedPixels() const
+{
+   std::ostringstream oss;
+   MMThreadGuard g(const_cast<MMThreadLock&>(blockedPixelsLock_));
+   for (size_t i = 0; i < blockedPixels_.size(); i++)
+   {
+      if (i > 0)
+         oss << ";";
+      oss << blockedPixels_[i].first << ":" << blockedPixels_[i].second;
+   }
+   return oss.str();
+}
+
+/**
+ * Parses the EBS-BlockedPixels format. Returns false (leaving out
+ * unchanged) on any malformed token or out-of-range coordinate (checked
+ * against sensorWidth_/sensorHeight_ only when cameraConnected_, since the
+ * no-hardware fallback geometry is just the test-image size) -- the whole
+ * string is rejected atomically rather than partially applied, since a
+ * malformed hand-typed string is a real user input error, not a
+ * recoverable hardware condition (see g_PropBlockedPixels).
+ */
+bool CProphEBSCamera::ParseBlockedPixels(const std::string& text,
+   std::vector<std::pair<unsigned, unsigned>>& out, std::string& errorOut) const
+{
+   out.clear();
+   std::string trimmed = text;
+   // Strip whitespace entirely so "120: 340; 121: 341" also parses.
+   trimmed.erase(std::remove_if(trimmed.begin(), trimmed.end(),
+      [](unsigned char c) { return std::isspace(c) != 0; }), trimmed.end());
+   if (trimmed.empty())
+      return true;
+
+   std::stringstream ss(trimmed);
+   std::string pairToken;
+   while (std::getline(ss, pairToken, ';'))
+   {
+      if (pairToken.empty())
+         continue;
+      size_t commaPos = pairToken.find(':');
+      if (commaPos == std::string::npos || commaPos == 0 || commaPos == pairToken.size() - 1)
+      {
+         errorOut = "malformed pixel token '" + pairToken + "' (expected 'x:y')";
+         return false;
+      }
+      std::string xStr = pairToken.substr(0, commaPos);
+      std::string yStr = pairToken.substr(commaPos + 1);
+      if (!std::all_of(xStr.begin(), xStr.end(), [](unsigned char c) { return std::isdigit(c) != 0; }) ||
+          !std::all_of(yStr.begin(), yStr.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+      {
+         errorOut = "non-numeric pixel token '" + pairToken + "'";
+         return false;
+      }
+      unsigned long x = std::strtoul(xStr.c_str(), nullptr, 10);
+      unsigned long y = std::strtoul(yStr.c_str(), nullptr, 10);
+      if (cameraConnected_ && (x >= sensorWidth_ || y >= sensorHeight_))
+      {
+         errorOut = "pixel (" + xStr + "," + yStr + ") is outside the sensor (" +
+            std::to_string(sensorWidth_) + "x" + std::to_string(sensorHeight_) + ")";
+         return false;
+      }
+      out.emplace_back(static_cast<unsigned>(x), static_cast<unsigned>(y));
+   }
+   return true;
+}
+
+/**
+ * Goal 7 follow-up: pushes blockedPixels_ to the sensor via
+ * Metavision::I_DigitalEventMask -- the facility that actually suppresses
+ * events at the hardware level on this Gen4.1/IMX636 sensor (confirmed by
+ * self-testing: I_RoiPixelMask alone accepted every set_pixel()/
+ * apply_pixels() call without error, but events kept landing on masked
+ * pixels regardless -- see docs/DEVLOG.md for the before/after evidence).
+ * I_RoiPixelMask is still also written to (harmless if inert here, and
+ * per the official metavision_active_pixel_detection.cpp sample it *is*
+ * the live-masking mechanism on other sensor generations, e.g. GenX320) --
+ * belt and suspenders, not an either/or.
+ *
+ * I_DigitalEventMask exposes a fixed number of hardware mask slots
+ * (get_pixel_masks(), 64 on Gen4.1 per Gen41DigitalEventMask's own
+ * NUM_MASK_REGISTERS_), not an arbitrary-length list -- if
+ * blockedPixels_ has more entries than there are slots, only the first
+ * ones (in blockedPixels_'s own order -- existing/manually-set entries
+ * first, then calibration-found ones in the hotness order
+ * OnDetectHotPixelsNow() built) actually get masked; the rest remain
+ * listed in EBS-BlockedPixels but aren't hardware-enforced, logged so
+ * this isn't silently invisible.
+ *
+ * No-op (state-only) if !cameraConnected_ -- the list is still remembered
+ * and gets applied the next time ApplyBlockedPixelsToHardware() runs with a
+ * camera connected. Both facility calls are try/catch-logged like every
+ * other facility call in this file; never fail/propagate.
+ */
+void CProphEBSCamera::ApplyBlockedPixelsToHardware()
+{
+   if (!cameraConnected_)
+      return;
+
+   MMThreadGuard g(blockedPixelsLock_);
+
+   bool digitalMaskApplied = false;
+   try
+   {
+      Metavision::I_DigitalEventMask& dem = cam_.get_facility<Metavision::I_DigitalEventMask>();
+      const std::vector<Metavision::I_DigitalEventMask::I_PixelMaskPtr>& slots = dem.get_pixel_masks();
+      size_t applied = std::min(blockedPixels_.size(), slots.size());
+      for (size_t i = 0; i < slots.size(); i++)
+      {
+         if (i < applied)
+            slots[i]->set_mask(blockedPixels_[i].first, blockedPixels_[i].second, true);
+         else
+            slots[i]->set_mask(0, 0, false); // clear any previously-used slot no longer needed
+      }
+      digitalMaskApplied = true;
+      if (blockedPixels_.size() > slots.size())
+         LogMessage("ProphEBS: EBS-BlockedPixels has " + std::to_string(blockedPixels_.size()) +
+            " entries, but this sensor's I_DigitalEventMask only has " + std::to_string(slots.size()) +
+            " hardware mask slots -- only the first " + std::to_string(slots.size()) +
+            " are actually being suppressed", false);
+   }
+   catch (const std::exception& e)
+   {
+      LogMessage(std::string("ProphEBS: I_DigitalEventMask unavailable (") + e.what() +
+         "), falling back to I_RoiPixelMask only", false);
+   }
+
+   // Metavision::I_RoiPixelMask::set_pixel()'s header doc comment says
+   // "Pixel will be masked when true," but the official
+   // metavision_active_pixel_detection.cpp sample calls set_pixel(x, y,
+   // false) to mask a pixel -- a real contradiction, moot on this sensor
+   // (see above) but still implemented against the header's documented
+   // contract for whatever generation actually enforces it via this path.
+   const bool kMaskPixelValue = true;
+   try
+   {
+      Metavision::I_RoiPixelMask& mask = cam_.get_facility<Metavision::I_RoiPixelMask>();
+      mask.reset_pixels();
+      for (const auto& px : blockedPixels_)
+         mask.set_pixel(px.first, px.second, kMaskPixelValue);
+      mask.apply_pixels();
+   }
+   catch (const std::exception& e)
+   {
+      if (!digitalMaskApplied)
+         LogMessage(std::string("ProphEBS: could not apply blocked-pixel mask via I_RoiPixelMask either: ") +
+            e.what(), false);
+   }
+}
+
+int CProphEBSCamera::OnBlockedPixels(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      pProp->Set(SerializeBlockedPixels().c_str());
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      std::string value;
+      pProp->Get(value);
+      std::vector<std::pair<unsigned, unsigned>> parsed;
+      std::string error;
+      if (!ParseBlockedPixels(value, parsed, error))
+      {
+         LogMessage("ProphEBS: rejected EBS-BlockedPixels value: " + error, false);
+         // Reject the whole string -- restore the previous (still valid)
+         // value so the Property Browser doesn't show the bad input as if
+         // it had taken effect.
+         pProp->Set(SerializeBlockedPixels().c_str());
+         return DEVICE_INVALID_PROPERTY_VALUE;
+      }
+      {
+         MMThreadGuard g(blockedPixelsLock_);
+         blockedPixels_ = parsed;
+      }
+      ApplyBlockedPixelsToHardware();
+   }
+   return DEVICE_OK;
+}
+
+/**
+ * Goal 7: on-demand hot-pixel calibration, triggered by setting
+ * EBS-DetectHotPixelsNow to "Run". Runs synchronously on the calling
+ * thread -- there is no precedent in this codebase for a property handler
+ * spawning a throwaway thread, and the calibration window is short and
+ * user-configured (EBS-HotPixelCalibDurationMs). See g_PropDetectHotPixelsNow
+ * for the full workflow.
+ */
+int CProphEBSCamera::OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct != MM::AfterSet)
+      return DEVICE_OK;
+
+   std::string value;
+   pProp->Get(value);
+   if (value != "Run")
+      return DEVICE_OK;
+
+   auto setStatus = [this](const std::string& status)
+   {
+      SetProperty(g_PropHotPixelCalibStatus, status.c_str());
+      OnPropertyChanged(g_PropHotPixelCalibStatus, status.c_str());
+   };
+   auto resetTrigger = [this, pProp]()
+   {
+      pProp->Set("Idle");
+      OnPropertyChanged(g_PropDetectHotPixelsNow, "Idle");
+   };
+
+   if (!cameraConnected_ || !streaming_)
+   {
+      setStatus("Failed: no camera streaming");
+      resetTrigger();
+      return DEVICE_OK;
+   }
+
+   setStatus("Running");
+
+   // Goal 7 follow-up: unblock every currently-blocked pixel *before*
+   // scanning, not after. Found by the user running calibration repeatedly:
+   // since a masked pixel generates zero events by design, leaving previous
+   // masks in place during a new scan silently removes them from the
+   // population the mean/stddev are computed over -- each successive run
+   // then measured a shrinking, ever-quieter population, which drags the
+   // threshold down and starts flagging genuinely normal pixels as
+   // outliers (especially visible in a small ROI with few real events to
+   // begin with). Clearing first guarantees every run's statistics come
+   // from the same full, honest population, and this also means the result
+   // below fully *replaces* EBS-BlockedPixels rather than merging into it
+   // -- calibration is now a clean "redetect from scratch" every time, not
+   // an accumulate-forever union. A pixel added by hand right before
+   // running calibration will *not* survive a calibration run -- that's
+   // the explicit, intended behavior of this follow-up, a deliberate
+   // change from the original merge-only design.
+   {
+      MMThreadGuard g(blockedPixelsLock_);
+      blockedPixels_.clear();
+   }
+   ApplyBlockedPixelsToHardware();
+
+   // Goal 7 follow-up: scans only the currently active ROI, not the whole
+   // chip -- explicit user decision, so a calibration run against a small
+   // ROI is both faster (fewer pixels to accumulate/scan) and statistically
+   // tighter (mean/stddev aren't diluted by a huge sea of pixels outside
+   // the region actually being viewed/recorded). Unlike the original
+   // version, the hardware ROI is left exactly as-is -- no
+   // disable-then-restore -- since scanning is now deliberately scoped to
+   // whatever it's currently letting through.
+   unsigned roiX = roiX_.load();
+   unsigned roiY = roiY_.load();
+   unsigned roiW = roiXSize_.load();
+   unsigned roiH = roiYSize_.load();
+
+   // Accumulated per-polarity, not merged -- a pixel that's only
+   // abnormally hot in one polarity (e.g. stuck firing excess ON events
+   // but with a perfectly normal OFF rate) needs its own mean/stddev
+   // computed over that polarity alone; combining ON+OFF into one total
+   // first could dilute exactly that kind of one-sided outlier into the
+   // combined distribution's noise. A pixel is masked if it's an outlier
+   // in *either* channel (see the OR below). Indexed ROI-locally (not by
+   // full-sensor coordinates) so mean/stddev are computed only over the
+   // active ROI's own pixels -- converted back to absolute sensor
+   // coordinates only when merging into blockedPixels_ below.
+   std::vector<uint32_t> calibOnCounts(static_cast<size_t>(roiW) * roiH, 0);
+   std::vector<uint32_t> calibOffCounts(static_cast<size_t>(roiW) * roiH, 0);
+   MMThreadLock calibLock;
+   Metavision::CallbackId calibCallbackId = cam_.cd().add_callback(
+      [this, &calibOnCounts, &calibOffCounts, &calibLock, roiX, roiY, roiW, roiH](
+         const Metavision::EventCD* begin, const Metavision::EventCD* end)
+      {
+         MMThreadGuard g(calibLock);
+         for (const Metavision::EventCD* ev = begin; ev != end; ++ev)
+         {
+            if (ev->x < roiX || ev->x >= roiX + roiW || ev->y < roiY || ev->y >= roiY + roiH)
+               continue; // outside the ROI being scanned -- shouldn't normally happen
+                         // while a hardware ROI is active, but guards against any
+                         // in-flight events from just before it was applied.
+            size_t idx = static_cast<size_t>(ev->y - roiY) * roiW + (ev->x - roiX);
+            std::vector<uint32_t>& counts = ev->p != 0 ? calibOnCounts : calibOffCounts;
+            if (counts[idx] < 0xFFFFFFFFu)
+               counts[idx]++;
+         }
+      });
+
+   double durationMs = hotPixelCalibDurationMs_.load();
+   CDeviceUtils::SleepMs(static_cast<long>(durationMs));
+
+   cam_.cd().remove_callback(calibCallbackId);
+
+   // Single-pass mean/stddev, computed independently for each polarity --
+   // no OpenCV linked into this project (unlike the official sample, which
+   // uses cv::meanStdDev).
+   size_t n = calibOnCounts.size();
+   auto meanStddev = [n](const std::vector<uint32_t>& counts) -> std::pair<double, double>
+   {
+      double sum = 0.0, sumSq = 0.0;
+      for (uint32_t c : counts)
+      {
+         sum += c;
+         sumSq += static_cast<double>(c) * c;
+      }
+      double mean = n > 0 ? sum / n : 0.0;
+      double variance = n > 0 ? (sumSq / n) - (mean * mean) : 0.0;
+      return { mean, variance > 0.0 ? std::sqrt(variance) : 0.0 };
+   };
+   double k = hotPixelStddevK_.load();
+   auto [onMean, onStddev] = meanStddev(calibOnCounts);
+   auto [offMean, offStddev] = meanStddev(calibOffCounts);
+   double onThreshold = onMean + k * onStddev;
+   double offThreshold = offMean + k * offStddev;
+
+   size_t foundCount = 0;
+   size_t skippedCount = 0;
+   size_t totalBlocked = 0;
+   size_t hardwareSlotCap = std::numeric_limits<size_t>::max();
+   {
+      MMThreadGuard g(blockedPixelsLock_);
+      // blockedPixels_ was already cleared above (before scanning), so
+      // this run's result *replaces* it outright -- there is no existing
+      // list to merge into or exclude candidates against anymore. Still
+      // capped on two independent budgets: (1) the serialized
+      // EBS-BlockedPixels string can never exceed MMCore's
+      // MM::MaxStrLength (1024) property-value limit -- found via
+      // self-testing with a deliberately loose threshold, which flagged
+      // tens of thousands of "hot" pixels and silently truncated the
+      // property string mid-pair; (2) this sensor's own
+      // I_DigitalEventMask hardware mask slot count (64 on Gen4.1) -- past
+      // that count, ApplyBlockedPixelsToHardware() can't actually enforce
+      // any more entries anyway (see there). Candidates are ranked by how
+      // far they exceed their polarity's own threshold (the "hottest"
+      // first) so that if a budget runs out, it's the most marginal
+      // outliers that get dropped, not an arbitrary cutoff.
+      std::vector<std::pair<unsigned, unsigned>> result;
+      const size_t kMaxSerializedLen = static_cast<size_t>(MM::MaxStrLength) - 16;
+      size_t serializedLen = 0;
+
+      try
+      {
+         hardwareSlotCap = cam_.get_facility<Metavision::I_DigitalEventMask>().get_pixel_masks().size();
+      }
+      catch (const std::exception&)
+      {
+         // No I_DigitalEventMask on this sensor -- fall back to the
+         // property-length budget alone.
+      }
+
+      struct Candidate { double score; std::pair<unsigned, unsigned> px; };
+      std::vector<Candidate> candidates;
+      for (size_t idx = 0; idx < n; idx++)
+      {
+         // A pixel is masked if it's an outlier in ON, OFF, or both -- see
+         // the comment above the calibration callback for why these are
+         // never combined into one merged count first. Its "hotness" is
+         // whichever polarity's excess over its own threshold is larger.
+         double onExcess = static_cast<double>(calibOnCounts[idx]) - onThreshold;
+         double offExcess = static_cast<double>(calibOffCounts[idx]) - offThreshold;
+         if (onExcess <= 0.0 && offExcess <= 0.0)
+            continue;
+         // idx is ROI-local -- convert back to absolute sensor coordinates
+         // (what EBS-BlockedPixels/I_RoiPixelMask both expect) before
+         // storing.
+         std::pair<unsigned, unsigned> px{
+            roiX + static_cast<unsigned>(idx % roiW), roiY + static_cast<unsigned>(idx / roiW) };
+         candidates.push_back({ std::max(onExcess, offExcess), px });
+      }
+      std::sort(candidates.begin(), candidates.end(),
+         [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+
+      for (const Candidate& c : candidates)
+      {
+         size_t entryLen = std::to_string(c.px.first).size() + 1 + std::to_string(c.px.second).size() + 1;
+         if (serializedLen + entryLen > kMaxSerializedLen || result.size() >= hardwareSlotCap)
+         {
+            skippedCount++;
+            continue;
+         }
+         result.push_back(c.px);
+         serializedLen += entryLen;
+         foundCount++;
+      }
+
+      blockedPixels_ = result;
+      totalBlocked = blockedPixels_.size();
+   }
+
+   if (skippedCount > 0)
+   {
+      std::string slotDesc = hardwareSlotCap == std::numeric_limits<size_t>::max()
+         ? std::string("no hardware slot limit known") : (std::to_string(hardwareSlotCap) + "-slot I_DigitalEventMask limit");
+      LogMessage("ProphEBS: hot-pixel calibration found " + std::to_string(foundCount + skippedCount) +
+         " outlier pixels but only " + std::to_string(foundCount) +
+         " fit within EBS-BlockedPixels' property-length limit and/or this sensor's " + slotDesc +
+         " -- " + std::to_string(skippedCount) +
+         " were dropped this run (a lower EBS-HotPixelStddevK finds fewer, more significant outliers)",
+         false);
+   }
+
+   ApplyBlockedPixelsToHardware();
+
+   std::string serialized = SerializeBlockedPixels();
+   SetProperty(g_PropBlockedPixels, serialized.c_str());
+   OnPropertyChanged(g_PropBlockedPixels, serialized.c_str());
+
+   std::ostringstream statusMsg;
+   statusMsg << "Done: " << totalBlocked << " masked";
+   if (skippedCount > 0)
+      statusMsg << ", " << skippedCount << " dropped (length/hardware-slot limit)";
+   setStatus(statusMsg.str());
+   resetTrigger();
+
+   return DEVICE_OK;
+}
+
+/**
  * Goal 6: MM's standard Exposure property, now wired to a CPropertyAction
  * (Goals 1-5 created it with none, so it never actually affected anything).
  * AfterSet stores the new value into integrationTimeMs_. Goal 6 follow-up:
@@ -1904,8 +2396,12 @@ int CProphEBSCamera::OnActivityFilterThreshold(MM::PropertyBase* pProp, MM::Acti
  */
 void CProphEBSCamera::StartEventStreaming()
 {
-   imgBufferA_.Resize(sensorWidth_, sensorHeight_, 1);
-   imgBufferB_.Resize(sensorWidth_, sensorHeight_, 1);
+   // Goal 7: routed through the shared helper instead of an unconditional
+   // full-size Resize() -- degenerates to the same thing right after
+   // Initialize() resets roiX_/roiY_/roiXSize_/roiYSize_ to full-frame on a
+   // fresh connect, but keeps ApplyRoiToBuffers() as the single place that
+   // knows how to size these buffers.
+   ApplyRoiToBuffers();
    frontImg_ = &imgBufferA_;
    backImg_ = &imgBufferB_;
 
@@ -2185,6 +2681,14 @@ void CProphEBSCamera::CloseCurrentWindowLocked(bool fromEvent, Metavision::times
  */
 void CProphEBSCamera::BuildAndSwapFrame()
 {
+   // Goal 7: onCounts_/offCounts_ stay full-sensor-sized and indexed in
+   // absolute sensor coordinates always -- Metavision::I_ROI only discards
+   // events outside its window, it never remaps surviving events'
+   // coordinates (confirmed via the SDK headers/samples), so OnEventsCD()
+   // needs no ROI-awareness at all. Only the rendered/displayed frame
+   // (backImg_, sized to roiXSize_ x roiYSize_ by ApplyRoiToBuffers()) is
+   // cropped -- this loop just reads the ROI sub-window out of the
+   // full-size accumulators below.
    size_t n = static_cast<size_t>(sensorWidth_) * sensorHeight_;
    std::vector<int32_t> onCounts(n);
    std::vector<int32_t> offCounts(n);
@@ -2202,25 +2706,36 @@ void CProphEBSCamera::BuildAndSwapFrame()
    double offset = viewOffset_.load();
    double scale = viewScale_.load();
 
-   unsigned char* pixels = backImg_->GetPixelsRW();
-   for (size_t i = 0; i < n; i++)
-   {
-      long raw;
-      switch (mode)
-      {
-         case ProphEBSViewMode::OnOnly: raw = onCounts[i]; break;
-         case ProphEBSViewMode::OffOnly: raw = offCounts[i]; break;
-         case ProphEBSViewMode::NetSigned: raw = onCounts[i] - offCounts[i]; break;
-         case ProphEBSViewMode::Merged:
-         default: raw = onCounts[i] + offCounts[i]; break;
-      }
+   unsigned roiX = roiX_.load();
+   unsigned roiY = roiY_.load();
+   unsigned roiW = roiXSize_.load();
+   unsigned roiH = roiYSize_.load();
 
-      double value = offset + static_cast<double>(raw) * scale;
-      if (value < 0.0)
-         value = 0.0;
-      else if (value > 255.0)
-         value = 255.0;
-      pixels[i] = static_cast<unsigned char>(value);
+   unsigned char* pixels = backImg_->GetPixelsRW();
+   for (unsigned j = 0; j < roiH; j++)
+   {
+      size_t rowBase = static_cast<size_t>(roiY + j) * sensorWidth_ + roiX;
+      unsigned char* outRow = pixels + static_cast<size_t>(j) * roiW;
+      for (unsigned i = 0; i < roiW; i++)
+      {
+         size_t idx = rowBase + i;
+         long raw;
+         switch (mode)
+         {
+            case ProphEBSViewMode::OnOnly: raw = onCounts[idx]; break;
+            case ProphEBSViewMode::OffOnly: raw = offCounts[idx]; break;
+            case ProphEBSViewMode::NetSigned: raw = onCounts[idx] - offCounts[idx]; break;
+            case ProphEBSViewMode::Merged:
+            default: raw = onCounts[idx] + offCounts[idx]; break;
+         }
+
+         double value = offset + static_cast<double>(raw) * scale;
+         if (value < 0.0)
+            value = 0.0;
+         else if (value > 255.0)
+            value = 255.0;
+         outRow[i] = static_cast<unsigned char>(value);
+      }
    }
 
    {
@@ -2713,15 +3228,53 @@ void CProphEBSCamera::SetExposure(double exp_ms)
    SetProperty(MM::g_Keyword_Exposure, CDeviceUtils::ConvertToString(exp_ms));
 }
 
+/**
+ * Goal 7: applies a real hardware ROI via Metavision::I_ROI, so the
+ * recorded .raw genuinely only contains events from within the window (not
+ * just a display-level crop) -- per explicit user decision, see
+ * docs/DEVLOG.md. Confirmed via the metavision_viewer.cpp sample that
+ * I_ROI's window can be changed live, without stopping cam_.start() first.
+ *
+ * The rectangle is clamped to the sensor bounds before anything else --
+ * the one deliberate deviation from DemoCamera's no-validation SetROI/
+ * GetROI/ClearROI convention, justified because (unlike DemoCamera's pure
+ * software canvas) an out-of-bounds window handed to I_ROI::set_window() is
+ * a real hardware call that could throw.
+ */
 int CProphEBSCamera::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
 {
    if (xSize == 0 || ySize == 0)
       return ClearROI();
 
+   unsigned maxW = sensorWidth_;
+   unsigned maxH = sensorHeight_;
+   if (x >= maxW) x = maxW > 0 ? maxW - 1 : 0;
+   if (y >= maxH) y = maxH > 0 ? maxH - 1 : 0;
+   if (x + xSize > maxW) xSize = maxW - x;
+   if (y + ySize > maxH) ySize = maxH - y;
+
    roiX_ = x;
    roiY_ = y;
    roiXSize_ = xSize;
    roiYSize_ = ySize;
+
+   if (cameraConnected_)
+   {
+      try
+      {
+         Metavision::I_ROI& roi = cam_.get_facility<Metavision::I_ROI>();
+         roi.set_mode(Metavision::I_ROI::Mode::ROI);
+         roi.set_window(Metavision::I_ROI::Window(
+            static_cast<int>(x), static_cast<int>(y), static_cast<int>(xSize), static_cast<int>(ySize)));
+         roi.enable(true);
+      }
+      catch (const std::exception& e)
+      {
+         LogMessage(std::string("ProphEBS: could not apply hardware ROI: ") + e.what(), false);
+      }
+   }
+
+   ApplyRoiToBuffers();
    return DEVICE_OK;
 }
 
@@ -2740,7 +3293,57 @@ int CProphEBSCamera::ClearROI()
    roiY_ = 0;
    roiXSize_ = sensorWidth_;
    roiYSize_ = sensorHeight_;
+
+   if (cameraConnected_)
+   {
+      try
+      {
+         // Mirrors the official metavision_active_pixel_detection.cpp
+         // sample's own clearROI() helper: disable rather than re-set a
+         // full-frame window.
+         cam_.get_facility<Metavision::I_ROI>().enable(false);
+      }
+      catch (const std::exception& e)
+      {
+         LogMessage(std::string("ProphEBS: could not clear hardware ROI: ") + e.what(), false);
+      }
+   }
+
+   ApplyRoiToBuffers();
    return DEVICE_OK;
+}
+
+/**
+ * Goal 7: resizes imgBufferA_/imgBufferB_ to the current ROI, and -- with no
+ * camera connected -- re-renders the cropped checkerboard test pattern
+ * directly into frontImg_ (the only buffer actually read in that path, same
+ * as GenerateTestImage()) so the ROI contract is visibly testable without
+ * hardware. onCounts_/offCounts_/touchedIndices_ are deliberately untouched
+ * here -- see BuildAndSwapFrame() for why they stay full-sensor-sized.
+ */
+void CProphEBSCamera::ApplyRoiToBuffers()
+{
+   unsigned x = roiX_, y = roiY_, w = roiXSize_, h = roiYSize_;
+   MMThreadGuard g(frontImgLock_);
+   imgBufferA_.Resize(w, h, 1);
+   imgBufferB_.Resize(w, h, 1);
+
+   if (!cameraConnected_)
+   {
+      unsigned char* pixels = frontImg_->GetPixelsRW();
+      const unsigned checkerSize = 32;
+      for (unsigned j = 0; j < h; j++)
+      {
+         unsigned sensorY = y + j;
+         for (unsigned i = 0; i < w; i++)
+         {
+            unsigned sensorX = x + i;
+            bool checker = ((sensorX / checkerSize) + (sensorY / checkerSize)) % 2 == 0;
+            unsigned char gradient = static_cast<unsigned char>((sensorX * 255) / (sensorWidth_ - 1));
+            pixels[j * w + i] = checker ? gradient : static_cast<unsigned char>(255 - gradient);
+         }
+      }
+   }
 }
 
 int CProphEBSCamera::GetBinning() const

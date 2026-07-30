@@ -77,8 +77,26 @@
 //                still resets to the baseline offset rather than freezing on
 //                the last-active frame forever.
 //
-//                Pixel masking and sensor ROI are added in Goal 7 (see
-//                docs/DEVLOG.md at the repository root for the roadmap).
+//                Goal 7 (this revision) adds a real hardware sensor ROI
+//                (Metavision::I_ROI -- SetROI()/GetROI()/ClearROI() now
+//                actually crop what the sensor itself streams, not just
+//                what's displayed, so the recorded .raw genuinely only
+//                contains the cropped region) and per-pixel hot-pixel
+//                masking via Metavision::I_RoiPixelMask, either edited by
+//                hand (EBS-BlockedPixels, a semicolon-separated list of
+//                "x,y" pairs in absolute sensor coordinates, unaffected by
+//                the active ROI) or found automatically by an on-demand
+//                calibration (EBS-DetectHotPixelsNow): first unblocks every
+//                currently-masked pixel (so the scan measures a clean,
+//                full population), then a short window of streaming
+//                scoped to whatever ROI is currently active (not the whole
+//                chip), followed by a mean+k*stddev outlier threshold --
+//                computed separately per polarity (ON/OFF) -- over each
+//                pixel's own event count, replacing EBS-BlockedPixels with
+//                whatever's found (not merged -- see docs/DEVLOG.md for
+//                why re-blocking from a clean slate every run matters).
+//                See docs/DEVLOG.md at the repository root for the
+//                roadmap.
 //
 // COPYRIGHT:     Koen J.A. Martens, 2026
 // LICENSE:       This file is distributed under the BSD license, consistent
@@ -99,6 +117,9 @@
 #include <metavision/hal/facilities/i_erc_module.h>
 #include <metavision/hal/facilities/i_event_trail_filter_module.h>
 #include <metavision/hal/facilities/i_ll_biases.h>
+#include <metavision/hal/facilities/i_digital_event_mask.h>
+#include <metavision/hal/facilities/i_roi.h>
+#include <metavision/hal/facilities/i_roi_pixel_mask.h>
 #include <metavision/sdk/cv/algorithms/activity_noise_filter_algorithm.h>
 
 #include <memory>
@@ -314,6 +335,62 @@ extern const char* g_PropBacklogFlushCount;
 extern const char* g_PropBacklogFlushThresholdMs;
 const double g_DefaultBacklogFlushThresholdMs = 250.0;
 
+// Goal 7: blocked/hot-pixel list, a single string property so the whole list
+// is one Property-Browser-editable value (per explicit user preference).
+// Format: "x:y" pairs separated by ';', e.g. "120:340;121:341" -- always
+// absolute sensor coordinates, regardless of the currently active ROI (the
+// note: ',' cannot be used as the within-pair separator -- MMCore itself
+// rejects any property value containing a comma (MM::g_FieldDelimiters is
+// "," -- confirmed via MMCore.cpp's IsPropertyValueValid()/setProperty(),
+// found while self-testing this property for the first time), so ':' is
+// used between x and y instead of the originally-planned ','.
+// user explicitly asked for these to stay "global" so a pixel blocked while
+// zoomed into one region is still blocked after the ROI changes or clears).
+// Applied to hardware primarily via Metavision::I_DigitalEventMask -- the
+// facility confirmed by self-testing to actually suppress events on this
+// Gen4.1/IMX636 sensor (I_RoiPixelMask alone accepted every call without
+// error but did not stop events from landing on masked pixels; also still
+// written to as a secondary/no-harm path, since it's the real mechanism on
+// some other sensor generations per Prophesee's own sample code -- see
+// ApplyBlockedPixelsToHardware()). I_DigitalEventMask has a limited number
+// of hardware mask slots (64 on Gen4.1); a no-op (state-only) when no
+// camera is connected. Malformed input is rejected atomically (the whole
+// string, not just the bad token) -- unlike most properties in this file,
+// AfterSet can genuinely fail here and leave the previous valid list in
+// place, since a bad hand-typed string is a real user input error, not a
+// recoverable hardware condition.
+extern const char* g_PropBlockedPixels;
+
+// Goal 7: on-demand hot-pixel calibration. Setting EBS-DetectHotPixelsNow to
+// "Run" synchronously (blocking the calling thread for
+// EBS-HotPixelCalibDurationMs) first unblocks every currently-masked pixel
+// (clears blockedPixels_ and pushes that to hardware) -- see
+// OnDetectHotPixelsNow() for why: a masked pixel generates zero events by
+// design, so leaving old masks in place while scanning would shrink the
+// population mean/stddev are computed over on every successive run,
+// eventually flagging normal pixels as outliers. Then streams for a short
+// window, scanning only the currently active ROI
+// (roiX_/roiY_/roiXSize_/roiYSize_) -- not the whole chip -- per explicit
+// user decision: a smaller ROI means fewer pixels to scan and mean/stddev
+// that aren't diluted by pixels outside the region actually being
+// viewed/recorded. Accumulates a separate ROI-sized, per-polarity event
+// count (independent of onCounts_/offCounts_ -- see OnDetectHotPixelsNow()),
+// computes threshold = mean + EBS-HotPixelStddevK * stddev independently for
+// ON and OFF, and **replaces** EBS-BlockedPixels with every pixel that's an
+// outlier in either polarity (not merged -- per explicit user decision, a
+// deliberate change from this property's original merge-only design;
+// always converted back to absolute sensor coordinates before storing).
+// EBS-HotPixelCalibStatus mirrors the g_PropRawRecordingStatus pattern
+// from Goal 4 (plain settable string, updated by the device itself via
+// SetProperty()+OnPropertyChanged()) -- "Idle" / "Running" /
+// "Done: <N> masked" / "Failed: <reason>".
+extern const char* g_PropDetectHotPixelsNow;
+extern const char* g_PropHotPixelCalibDurationMs;
+extern const char* g_PropHotPixelStddevK;
+extern const char* g_PropHotPixelCalibStatus;
+const double g_DefaultHotPixelCalibDurationMs = 5000.0;
+const double g_DefaultHotPixelStddevK = 10.0;
+
 // Goal 6: the four selectable view modes, stored as CProphEBSCamera::
 // viewMode_ (a std::atomic<int> holding one of these values -- see there
 // for why plain int rather than std::atomic<ProphEBSViewMode>).
@@ -442,6 +519,21 @@ public:
    // Goal 5 live-stats properties.
    int OnBacklogFlushThresholdMs(MM::PropertyBase* pProp, MM::ActionType eAct);
 
+   // Goal 7: EBS-BlockedPixels handler -- BeforeGet serializes
+   // blockedPixels_, AfterSet parses the incoming string and, only if it's
+   // entirely well-formed, replaces blockedPixels_ and pushes it to hardware
+   // via ApplyBlockedPixelsToHardware(). See g_PropBlockedPixels for the
+   // format and why a malformed string is rejected rather than tolerated.
+   int OnBlockedPixels(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Goal 7: triggers/reads back the on-demand hot-pixel calibration
+   // (EBS-DetectHotPixelsNow) and its two parameters. See
+   // g_PropDetectHotPixelsNow for the full workflow -- OnDetectHotPixelsNow()
+   // runs synchronously on whatever thread calls AfterSet.
+   int OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnHotPixelCalibDurationMs(MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnHotPixelStddevK(MM::PropertyBase* pProp, MM::ActionType eAct);
+
    // Goal 5: one shared read-only handler for all six live-stats
    // properties -- BeforeGet just reads the matching cached
    // std::atomic<double> (looked up via pProp->GetName(), same pattern as
@@ -479,6 +571,41 @@ private:
    void CreateErcProperties();
    void CreateEventTrailFilterProperties();
    void CreateAntiFlickerProperties();
+
+   // Goal 7: creates EBS-BlockedPixels and the hot-pixel calibration
+   // properties. Called from Initialize() alongside the other
+   // Create*Properties() methods, before the cameraConnected_ branch that
+   // calls StartEventStreaming() -- these are hardware-backed the same way
+   // EBS-ERC-* etc. already are, independent of whether streaming has
+   // started yet.
+   void CreateHotPixelAndRoiProperties();
+
+   // Goal 7: resizes imgBufferA_/imgBufferB_ to the current ROI
+   // (roiXSize_ x roiYSize_) under frontImgLock_, and -- in the no-hardware
+   // fallback path -- re-renders the cropped checkerboard test pattern too,
+   // so SetROI()/GetROI()/ClearROI() are visibly testable even without a
+   // camera. Called from SetROI()/ClearROI() and once from
+   // StartEventStreaming() (replacing its old unconditional full-size
+   // Resize() call). onCounts_/offCounts_/touchedIndices_ are deliberately
+   // NOT touched here -- they stay full-sensor-sized always, see
+   // BuildAndSwapFrame()'s comment for why.
+   void ApplyRoiToBuffers();
+
+   // Goal 7: pushes blockedPixels_ to the sensor via
+   // Metavision::I_RoiPixelMask (reset_pixels() -> set_pixel() per absolute
+   // (x,y) entry -> apply_pixels()). Try/catch-logged, like every other
+   // facility call in this file; a no-op if !cameraConnected_ (the blocked
+   // list is still remembered and re-applied the next time a camera
+   // connects, just never touches hardware in the meantime).
+   void ApplyBlockedPixelsToHardware();
+
+   // Goal 7: EBS-BlockedPixels string <-> blockedPixels_ conversion. Parse
+   // returns false (leaving out unchanged) on any malformed token or
+   // out-of-range coordinate -- see g_PropBlockedPixels for why a malformed
+   // string is rejected wholesale rather than partially applied.
+   std::string SerializeBlockedPixels() const;
+   bool ParseBlockedPixels(const std::string& text,
+      std::vector<std::pair<unsigned, unsigned>>& out, std::string& errorOut) const;
 
    // Goal 3: starts real event-driven acquisition once ConnectToCamera() has
    // succeeded -- queries sensor geometry, sizes the frame buffers/event
@@ -585,10 +712,18 @@ private:
    void StopRawRecordingIfActive();
 
    bool initialized_;
-   unsigned roiX_;
-   unsigned roiY_;
-   unsigned roiXSize_;
-   unsigned roiYSize_;
+   // Goal 7: roiX_/roiY_/roiXSize_/roiYSize_ now drive a real hardware crop
+   // (Metavision::I_ROI), applied by SetROI()/ClearROI() -- previously
+   // (Goals 1-6) these were bookkeeping-only. Always absolute sensor
+   // coordinates. Atomic (not plain unsigned) because BuildAndSwapFrame()
+   // now reads them every frame on ProphEBSFrameBuilderThread's own thread
+   // while SetROI()/ClearROI() write them from whatever thread MMCore calls
+   // the property/ROI system from -- same cross-thread read/write shape as
+   // viewMode_/viewOffset_/viewScale_ in Goal 6.
+   std::atomic<unsigned> roiX_;
+   std::atomic<unsigned> roiY_;
+   std::atomic<unsigned> roiXSize_;
+   std::atomic<unsigned> roiYSize_;
    MM::MMTime sequenceStartTime_;
 
    ProphEBSSequenceThread* thd_;
@@ -784,6 +919,21 @@ private:
    std::string localAntiFlickerFilterType_;
    long localAntiFlickerLowFreq_;
    long localAntiFlickerHighFreq_;
+
+   // Goal 7: canonical blocked/hot-pixel list, always in absolute sensor
+   // coordinates. blockedPixelsLock_ guards it against
+   // OnDetectHotPixelsNow()'s calibration path racing a manual
+   // EBS-BlockedPixels edit (both can run on MMCore's calling thread, but
+   // never concurrently with each other by construction -- this lock is
+   // defensive, matching this file's general practice of never assuming a
+   // property handler runs alone). hotPixelCalibDurationMs_/
+   // hotPixelStddevK_ back their two settable properties; plain atomics
+   // since OnDetectHotPixelsNow() reads them once at the start of a run,
+   // same pattern as every other plain-atomic-backed property in this file.
+   std::vector<std::pair<unsigned, unsigned>> blockedPixels_;
+   MMThreadLock blockedPixelsLock_;
+   std::atomic<double> hotPixelCalibDurationMs_;
+   std::atomic<double> hotPixelStddevK_;
 
    // Goal 5: static read-only info, read once in ConnectToCamera().
    std::string generation_;

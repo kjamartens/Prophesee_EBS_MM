@@ -1451,3 +1451,498 @@ Build: 0 warnings/errors, first attempt, no `.vcxproj` changes needed.
 pending) — this time specifically re-checking that `EBS-CallbackLagMs`
 stays non-negative and the flush now visibly kicks in close to the
 configured 250 ms default rather than several seconds late.
+
+## Goal 7 — Pixel-by-pixel differences (hot-pixel masking + sensor ROI)
+
+### Status: DONE — confirmed working by user — tagged v0.7
+
+### Requirement clarification (asked user before implementing)
+
+The roadmap wording added a new detail since Goal 6: hot-pixel blocking
+should ideally be automated ("finding hot pixels from within MM and
+setting these in there somehow"), not just a manually-typed index list.
+Three design points were clarified with the user via `AskUserQuestion`
+before writing any code:
+
+- **ROI must be a real hardware crop** (Metavision's `I_ROI` HAL facility),
+  not a display-level crop — because the roadmap explicitly asks for "a
+  ROI of the EBS which is recorded," and only a hardware ROI actually
+  reduces what lands in the `.raw` file.
+- **Hot-pixel detection is on-demand**, triggered by a property
+  (`EBS-DetectHotPixelsNow`), not a continuous background process.
+- **Blocked pixels are a single string property**, and — the user's own
+  addition — must be **global** (absolute sensor coordinates) so the list
+  stays meaningful as the active ROI changes; a later follow-up question
+  settled that re-running calibration **merges** (union) into the existing
+  list rather than replacing it, so a manually-added pixel is never
+  silently un-masked by a later calibration run.
+
+### What was built
+
+- **Hardware ROI** (`ProphEBS.h`/`ProphEBS.cpp`): `SetROI()`/`GetROI()`/
+  `ClearROI()` — bookkeeping-only stubs since Goal 1 — now drive
+  `Metavision::I_ROI` for real: `SetROI()` clamps the requested rectangle
+  to the sensor bounds (the one deliberate deviation from
+  `DemoCamera`'s no-validation convention, since an out-of-bounds window
+  handed to `set_window()` is a real hardware call), then calls
+  `set_mode(ROI)`/`set_window()`/`enable(true)`; `ClearROI()` calls
+  `enable(false)` (mirroring the official
+  `metavision_active_pixel_detection.cpp` sample's own `clearROI()`
+  helper) rather than re-setting a full-frame window. Both always return
+  `DEVICE_OK` and log-not-fail on any HAL exception, per this project's
+  established convention. Confirmed via the `metavision_viewer.cpp`
+  sample that `I_ROI`'s window can be changed live, with no
+  `cam_.stop()`/restart cycle needed.
+- **Coordinate strategy**: `onCounts_`/`offCounts_`/`touchedIndices_`
+  (Goal 6's per-pixel accumulators) stay **full-sensor-sized and indexed
+  in absolute sensor coordinates always**, regardless of the active ROI —
+  `Metavision::I_ROI` only discards events outside its window, it never
+  remaps surviving events' coordinates (confirmed via the SDK
+  headers/samples), so `OnEventsCD()` needed zero changes. Only the
+  *displayed* frame (`imgBufferA_`/`imgBufferB_`) shrinks to the ROI —
+  `BuildAndSwapFrame()`'s render loop now iterates `roiXSize_ x
+  roiYSize_`, reading `onCounts_[(roiY_+j)*sensorWidth_ + (roiX_+i)]`
+  instead of a flat index. This also satisfies the "blocked pixels are
+  global" requirement for free — there's no ROI-relative coordinate
+  space anywhere to be inconsistent with.
+- **`ApplyRoiToBuffers()`** (new private helper): resizes
+  `imgBufferA_`/`imgBufferB_` to the current ROI under `frontImgLock_`,
+  and — with no camera connected — re-renders the cropped checkerboard
+  test pattern directly into `frontImg_` (the only buffer actually read in
+  that path), so the ROI contract is visibly testable without hardware.
+  Called from `SetROI()`/`ClearROI()` and once from
+  `StartEventStreaming()` (replacing its old unconditional full-size
+  `Resize()` call).
+- **`roiX_`/`roiY_`/`roiXSize_`/`roiYSize_` are now `std::atomic<unsigned>`**
+  (previously plain `unsigned`) — `BuildAndSwapFrame()` reads them every
+  frame on `ProphEBSFrameBuilderThread`'s own thread while
+  `SetROI()`/`ClearROI()` write them from whatever thread MMCore calls the
+  ROI system from; same cross-thread read/write shape Goal 6 already
+  solved with atomics for `viewMode_`/`viewOffset_`/`viewScale_`.
+- **`EBS-BlockedPixels`** (string, read/write, default empty): a single
+  Property-Browser-editable list of absolute sensor-coordinate pixel
+  pairs, applied to hardware via `Metavision::I_RoiPixelMask`
+  (`reset_pixels()` -> `set_pixel()` per entry -> `apply_pixels()`).
+  `OnBlockedPixels()`'s `AfterSet` rejects the **whole string** atomically
+  on any malformed token or out-of-range coordinate (logging the specific
+  bad token, restoring the previous valid value, returning
+  `DEVICE_INVALID_PROPERTY_VALUE`) — the one deliberate exception to this
+  project's usual "never fail" convention, since a malformed hand-typed
+  string is a real user input error, not a recoverable hardware condition.
+- **On-demand hot-pixel calibration** (`EBS-DetectHotPixelsNow`, allowed
+  values `Idle`/`Run`; `EBS-HotPixelCalibDurationMs`, default 200 ms;
+  `EBS-HotPixelStddevK`, default 3.0, matching the official sample's own
+  default multiplier; `EBS-HotPixelCalibStatus`, a plain settable status
+  string mirroring the `EBS-RawRecordingStatus` pattern from Goal 4).
+  Setting the trigger to `"Run"` runs `OnDetectHotPixelsNow()`
+  **synchronously on the calling thread** (no precedent in this codebase
+  for a property handler spawning a throwaway thread, and the window is
+  short/user-configured): temporarily disables any active hardware ROI
+  (mirroring the official sample's own pre-scan `clearROI()`) so hot
+  pixels outside the current view can still be found, registers a
+  temporary CD callback accumulating a full-sensor-sized event count
+  independent of `onCounts_`/`offCounts_`, sleeps for
+  `EBS-HotPixelCalibDurationMs`, removes the callback, restores the ROI
+  window, computes `threshold = mean + k*stddev` via a hand-rolled
+  single-pass sum/sumSq loop (no OpenCV linked into this project, unlike
+  the official sample's `cv::meanStdDev`), and merges (`std::set` union)
+  every pixel above threshold into `blockedPixels_` before pushing to
+  hardware and updating `EBS-BlockedPixels`/`EBS-HotPixelCalibStatus` via
+  the standard `SetProperty()`+`OnPropertyChanged()` pairing.
+
+### Design decisions (and why)
+
+- **`onCounts_`/`offCounts_` stay full-sensor-sized rather than shrinking
+  to the ROI.** Avoids resizing/reindexing them (and the Goal 6 follow-up's
+  `CloseCurrentWindowLocked()`/`FlushBacklogLocked()`, which assume
+  full-sensor sizing) on every ROI change, at the cost of pixels outside
+  the active ROI harmlessly accumulating stale (zero, since no events
+  arrive there) counts between changes — `BuildAndSwapFrame()` never reads
+  outside the active ROI window anyway.
+- **Hot-pixel calibration disables the ROI while scanning, then restores
+  it.** If a shrunk ROI were left active, only pixels inside that window
+  could ever be found as hot — matches the official sample's own
+  `clearROI()`-before-scan pattern.
+- **Calibration merges (union) into `EBS-BlockedPixels`, never replaces
+  it** — explicit user decision, confirmed via `AskUserQuestion`, so
+  re-running calibration never silently un-masks a pixel added by hand.
+- **`x:y` pairs, not `x,y`, separated by `;`.** The original plan (and the
+  user's own example wording) used a comma between x and y — self-testing
+  this property for the first time threw `ValueError: Property value
+  "5,5;10,20" contains reserved characters` from pymmcore-plus.
+  Root-caused to `MM::g_FieldDelimiters` (`MMDeviceConstants.h`) being
+  `","` — MMCore's own `setProperty()` (`MMCore.cpp`'s
+  `IsPropertyValueValid` check) rejects **any** property value containing
+  a comma, regardless of device. `;` isn't reserved, so pairs stayed
+  semicolon-separated; `:` replaced `,` within each pair. **Lesson for
+  future goals**: never use `,` inside a property value in this codebase,
+  even for a brand-new custom format — it's an MMCore-wide restriction,
+  not something a device adapter can opt out of.
+- **`set_pixel()`'s `enable` boolean is implemented against the header's
+  documented contract** (`Metavision::I_RoiPixelMask::set_pixel()`'s doc
+  comment says "Pixel will be masked when true"), not the official
+  `metavision_active_pixel_detection.cpp` sample's own usage (which calls
+  `set_pixel(x, y, false)` to mask) — a genuine contradiction between the
+  header and the sample that can only be fully resolved by a real-hardware
+  GUI check (does a masked pixel actually go dark, or does it keep firing,
+  or intensify?). Implemented behind one named constant
+  (`kMaskPixelValue` in `ApplyBlockedPixelsToHardware()`) specifically so
+  this is a one-line flip if the GUI check shows the sample's convention
+  was actually right for this sensor. **Still open, flagged for the
+  user's GUI walkthrough.**
+
+### Verified locally
+
+- **Build**: `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`
+  succeeded with 0 warnings/errors on the first attempt (VS2022 Preview
+  toolset, PowerShell tool, same as every prior goal) — including the two
+  new `<metavision/hal/facilities/i_roi.h>`/`i_roi_pixel_mask.h` includes
+  with no `.vcxproj` changes needed.
+- **Real hardware, via `tools/test_prophebs.py`** (extended with Goal 7
+  checks): all Goal 1-6 checks still passed unchanged (no regression) on
+  the connected IMX636. New checks, all against real hardware:
+  - `EBS-BlockedPixels` round-tripped `"5:5;10:20"`; a malformed value
+    (`"abc"`) was correctly rejected with the previous valid value
+    retained (confirmed via `pymmcore-plus` raising `ValueError`, not a
+    silent no-op).
+  - `EBS-HotPixelCalibDurationMs`/`EBS-HotPixelStddevK` round-tripped
+    within their limits (defaults confirmed 200 ms / 3.0).
+  - **Hardware ROI produced a genuine, large data reduction, not just a
+    display crop**: `SetROI` to a quarter-frame window (320x180 of the
+    full 1280x720) reported back correctly via `GetROI`/`snapImage()`
+    shape; `EBS-AvgEventRate-MEvps` measured **0.0345 MEv/s** with that
+    ROI active vs. **10.1006 MEv/s** at full frame moments later (same
+    ambient scene) — a ~300x reduction, strong real evidence the crop is
+    happening at the sensor via `I_ROI`, not in software. `ClearROI()`
+    correctly restored the full `(0, 0, 1280, 720)` geometry.
+  - **On-demand hot-pixel calibration found a real hot pixel**: a 200 ms
+    calibration run against the connected IMX636 completed in ~0.22 s and
+    reported `Done: 1 masked (1 new)`, with `EBS-BlockedPixels` reading
+    back `114:239` afterward — a real outlier pixel on this physical
+    sensor, not a synthetic/zero result. The `I_RoiPixelMask` facility
+    itself was confirmed present and callable on this Gen4.1/IMX636
+    sensor (no exception from `get_facility<I_RoiPixelMask>()`,
+    `set_pixel()`, or `apply_pixels()`) — resolving the "does this
+    facility even work on Gen4.1, or only report coordinates" risk noted
+    in the official sample's own help text, at least as far as the API
+    surface goes (see the enable=true/false semantics caveat above for
+    what's still unresolved).
+  - Manually setting `EBS-BlockedPixels` against real hardware afterward
+    did not break subsequent `snapImage()` calls.
+  - No-camera fallback path (exercised separately, logic inspected):
+    `EBS-DetectHotPixelsNow` set to `"Run"` with no streaming camera fails
+    promptly via the `!cameraConnected_ || !streaming_` guard, reporting
+    `Failed: no camera streaming` and resetting the trigger to `Idle` —
+    not exercised in this run since a camera happened to be connected
+    throughout, but the guard clause is unconditional and was read
+    directly to confirm the promptly-fails behavior.
+  - `SetROI`/`GetROI`/`ClearROI` against the no-hardware fallback
+    checkerboard were not separately re-verified in this run (a camera was
+    connected throughout self-testing), but `ApplyRoiToBuffers()`'s
+    fallback-rendering branch is exercised by the same code path either
+    way and was inspected directly.
+
+### Follow-up: per-polarity detection, new defaults, and a truncation bug found under a loose threshold
+
+User asked to confirm whether hot-pixel calibration looks at both ON and
+OFF events separately, and to change the defaults to
+`EBS-HotPixelStddevK=5` / `EBS-HotPixelCalibDurationMs=2000` (2 s). Checking
+the code directly confirmed it did **not** — `calibCounts` was a single
+merged counter (total events regardless of polarity), so a pixel hot only
+in one polarity direction could be diluted into the combined
+distribution's noise rather than standing out.
+
+**Fix**: replaced the single `calibCounts` with `calibOnCounts`/
+`calibOffCounts`, split by `ev->p`. Mean/stddev/threshold are now computed
+independently per polarity (`onThreshold`, `offThreshold`), and a pixel is
+masked if it's an outlier in **either** channel
+(`calibOnCounts[idx] > onThreshold || calibOffCounts[idx] > offThreshold`)
+— catching a pixel that's abnormally hot in ON only, OFF only, or both.
+Defaults changed to `g_DefaultHotPixelStddevK = 5.0`,
+`g_DefaultHotPixelCalibDurationMs = 2000.0`.
+
+**Bug found immediately while re-testing this change**: rerunning the
+real-hardware calibration check crashed the self-test harness with
+`ValueError: invalid literal for int() with base 10: ''` while parsing
+`EBS-BlockedPixels`. Root cause: the test script had left
+`EBS-HotPixelStddevK` at `2.5` (from an earlier round-trip probe) instead
+of restoring it before the real calibration run, and — combined with the
+new per-polarity split, whose two independent channels each have a lower,
+noisier mean than the old merged count — this loose threshold flagged
+**35,721** pixels as "hot" in a single run. `EBS-BlockedPixels`'s
+serialized string exceeded MMCore's `MM::MaxStrLength` (1024 chars) and
+was silently truncated mid-pair by MMCore itself on the way back out,
+which is what produced the empty trailing token the parser choked on.
+
+This exposed a real correctness gap, not just a test-script bug: nothing
+in `OnDetectHotPixelsNow()` bounded how large `EBS-BlockedPixels` could
+grow, so a large enough result (whether from calibration or, in principle,
+a very long manually-typed list) could silently corrupt the property
+string while `blockedPixels_` itself — and the mask already pushed to
+hardware from it — stayed fully correct, an inconsistency that would only
+surface as confusing dead/mismatched-looking property state.
+
+**Fix**: `OnDetectHotPixelsNow()` now ranks newly-found candidate pixels by
+"hotness" (`max(onExcess, offExcess)`, i.e. how far each pixel's count
+exceeds its own polarity's threshold) and greedily adds the hottest ones
+first, stopping once the running serialized length would exceed
+`MM::MaxStrLength` — so if the budget is exhausted, it's the most
+marginal outliers that get dropped, not an arbitrary raster-order cutoff.
+Existing (e.g. manually-set) pixels are always kept in full; only new
+calibration additions are capped. `EBS-HotPixelCalibStatus` reports any
+drop explicitly (`"Done: 128 masked (128 new, 5866 dropped (property
+length limit))"`), and a `LogMessage()` records the same for the CoreLog.
+`tools/test_prophebs.py` was also fixed to restore `EBS-HotPixelStddevK`
+right after its round-trip probe, and gained a dedicated
+deliberately-loose-threshold stress check (`EBS-HotPixelStddevK` forced to
+its floor) specifically to exercise this cap, asserting
+`len(EBS-BlockedPixels) <= 1024` always holds.
+
+**A second, more fundamental finding, left as-is (not a bug to fix, a
+real limitation of the technique)**: even at the new defaults (2 s, k=5)
+against real ambient conditions on this dev machine, calibration still
+flagged several thousand pixels (128 kept + 5866 dropped by the cap in one
+run). Root cause: `mean`/`stddev` are computed **globally across the whole
+frame**, so any real scene content during the calibration window (motion,
+edges, uneven lighting) inflates the frame's overall variance and pulls
+plenty of otherwise-normal pixels above a global threshold — the detector
+cannot distinguish "this pixel is a genuine hardware defect" from "this
+pixel happens to be looking at something that moved just now." This
+matches why the official `metavision_active_pixel_detection.cpp` sample is
+normally run against a static/dark scene (lens cap on) rather than live
+ambient conditions. **Not fixed** — flagged as a usage note (see "Open
+questions" below) rather than a code change, since the statistics
+themselves are working as designed; the fix is procedural (calibrate
+against a static scene), not algorithmic.
+
+**Verified**: rebuilt (0 warnings/errors) and reran
+`tools/test_prophebs.py` against the connected IMX636 three times across
+these fixes. Final run: all Goal 1-6 checks passed unchanged; the
+real-hardware calibration check at actual defaults (2000 ms/k=5) reported
+`Done: 128 masked (128 new, 5866 dropped (property length limit))` with a
+well-formed, fully parseable `EBS-BlockedPixels` string; the dedicated
+loose-threshold stress check (k forced to its 0.1 floor, 200 ms) reported
+`Done: 130 masked (130 new, 139212 dropped (property length limit))` —
+confirming the cap holds even under a far more extreme overflow — with
+`len(EBS-BlockedPixels) <= 1024` asserted true throughout. Full suite
+(`SUCCESS`, exit 0).
+
+### Follow-up: calibration scoped to the active ROI, and a wider EBS-HotPixelStddevK range
+
+User asked for two more changes: scan only the currently active ROI during
+hot-pixel calibration, not the whole chip regardless of what's selected;
+and widen `EBS-HotPixelStddevK`'s max to 100, with a new default of 20 (up
+from 5).
+
+**Implementation**: `OnDetectHotPixelsNow()` no longer disables the
+hardware ROI before scanning (the previous "disable, scan full chip,
+restore" dance is gone entirely). Instead, `calibOnCounts`/
+`calibOffCounts` are now sized to `roiXSize_ x roiYSize_` (not
+`sensorWidth_ x sensorHeight_`) and indexed **ROI-locally**: the temporary
+CD callback converts each event's absolute `(ev->x, ev->y)` into an
+ROI-local index (`(ev->y - roiY) * roiW + (ev->x - roiX)`), skipping
+anything outside the active window (a defensive guard for any in-flight
+events from just before the ROI was applied -- shouldn't normally happen
+once `I_ROI` is actively filtering). Mean/stddev are therefore computed
+only over the pixels actually being viewed/recorded, not diluted by a huge
+sea of always-zero pixels outside the ROI. When merging outliers into
+`blockedPixels_`, the ROI-local index is converted back to absolute sensor
+coordinates (`roiX + idx % roiW`, `roiY + idx / roiW`) before storing --
+`EBS-BlockedPixels` itself is still always absolute/global coordinates,
+unaffected by this internal scanning change.
+
+`g_DefaultHotPixelStddevK` changed to `20.0`, `SetPropertyLimits` upper
+bound changed to `100.0`.
+
+**Design note**: ROI-scoped calibration is not just an optimization
+(fewer pixels to scan) -- it also directly mitigates the "real scene
+content inflates the global threshold" finding from the previous
+follow-up, since the statistics are now computed only over whatever
+region is actually being viewed/recorded rather than the entire chip
+(where motion/edges anywhere on the sensor, even far outside the current
+view, could previously pull the global mean/stddev around).
+
+**Verified**: rebuilt (0 warnings/errors) and reran
+`tools/test_prophebs.py` against the connected IMX636. New check: set a
+quarter-frame ROI, ran calibration with a deliberately loose threshold
+(`EBS-HotPixelStddevK` forced to its 0.1 floor) specifically so something
+would very likely be flagged, and asserted **every** resulting
+`EBS-BlockedPixels` coordinate falls within that ROI's bounds -- 126/126
+did. At the real default (2000 ms, k=20) against the full sensor,
+calibration reported `Done: 126 masked (126 new)` with **no property-length
+cap triggered** (unlike the k=5 runs in the previous follow-up), consistent
+with the wider default meaningfully tightening the threshold. Full suite
+(`SUCCESS`, exit 0), no regression.
+
+### Follow-up: masking wasn't actually suppressing events -- root cause and fix
+
+User asked to specifically test the masking effect, not just that the
+property/API calls succeeded: block a real 10x10 region (100 pixels) and
+confirm no events land there. Building this check properly (see
+`tools/test_prophebs.py`) took two iterations:
+
+- **First version was a false pass.** It only checked "is the blocked
+  region's max pixel value 0," with no unmasked baseline for the same
+  region -- a genuinely quiet corner of the scene would trivially pass
+  without proving anything. **Fixed** by first confirming the exact same
+  region shows real nonzero activity *unmasked* (escalating `Exposure`
+  100/300/1000 ms if the first attempt sees nothing, since ambient
+  activity there isn't guaranteed), only then blocking it and comparing.
+  Also, per the user's suggestion, the ON/OFF biases
+  (`EBS-bias_diff_on`/`EBS-bias_diff_off`) are pushed toward maximum
+  sensitivity (clamped to the hardware's own reported range, e.g. -40/-20)
+  for the duration of this check specifically so it isn't at the mercy of
+  whatever's happening in front of the sensor right now.
+- **With a real baseline in place, the check failed for real**: 50
+  (unmasked) vs. 50 (masked) -- confirming the user's report.
+  `I_RoiPixelMask::set_pixel()`/`apply_pixels()` were succeeding without
+  any exception, but genuinely not suppressing anything on this
+  Gen4.1/IMX636 sensor.
+
+**Root cause**: exactly the risk flagged (but not yet confirmed) back when
+this facility was first wired up -- the official
+`metavision_active_pixel_detection.cpp` sample's own help text warns that
+full live masking via `I_RoiPixelMask` is only demonstrated for GenX320;
+Gen4.1/IMX636 apparently only reveals the intended coordinates via that
+facility without hardware enforcing them. Found the actual mechanism by
+locating `metavision/hal/facilities/i_digital_event_mask.h`
+(`Metavision::I_DigitalEventMask`/nested `I_PixelMask::set_mask(x, y,
+enabled)`, doc comment: "when true, the mask will prevent pixel from
+generating CD event" -- unambiguous, unlike `I_RoiPixelMask`'s
+contradictory docs) and its Gen4.1-specific implementation
+(`gen41_digital_event_mask.h`, confirming this sensor family really does
+implement it) with a hard-coded `NUM_MASK_REGISTERS_ = 64` -- a real,
+fixed hardware limit on how many pixels can actually be masked at once on
+this sensor generation, structurally different from `I_RoiPixelMask`'s
+seemingly-unbounded list API.
+
+**Fix**: `ApplyBlockedPixelsToHardware()` now applies `blockedPixels_`
+primarily via `I_DigitalEventMask` -- `get_facility<I_DigitalEventMask>()`,
+then `set_mask(x, y, true)` on the first `min(blockedPixels_.size(),
+get_pixel_masks().size())` hardware slots (clearing any unused remaining
+slots via `set_mask(0, 0, false)`), logging if the list has more entries
+than there are slots. `I_RoiPixelMask` is still also written to afterward
+(harmless if inert on this sensor, and per the sample it *is* the real
+mechanism on other generations like GenX320) -- belt and suspenders, not
+an either/or.
+
+**Verified**: rebuilt (0 warnings/errors) and reran the masking-effectiveness
+check -- baseline unmasked activity in a 7x7 region (49 pixels, chosen to
+fit within the 64-slot limit so every pixel in the test region is actually
+hardware-enforced) was 50; the same region after blocking read exactly
+**0**, while the rest of the frame kept showing real activity (255). Full
+suite (`SUCCESS`, exit 0), no regression.
+
+### Follow-up: cap calibration additions to the hardware's own 64-slot limit, not just the property string length
+
+Immediate user follow-up: since only 64 pixels can ever be genuinely
+enforced, apply the same hotness-ranked "keep the most significant
+outliers" logic used for the property-string-length cap to this hardware
+limit too -- there's no point letting `EBS-BlockedPixels` list more
+calibration-found pixels than can ever actually be masked.
+
+**Fix**: `OnDetectHotPixelsNow()` now queries
+`cam_.get_facility<I_DigitalEventMask>().get_pixel_masks().size()` once
+per run (falling back to "no cap" if the facility isn't available) and
+enforces it as a second, independent budget alongside the existing
+`MM::MaxStrLength`-derived one in the same hotness-ranked loop -- whichever
+budget is tighter determines how many new candidates get added, with
+existing (e.g. manually-set) pixels still always kept in full regardless
+of either. `EBS-HotPixelCalibStatus`/the CoreLog wording was generalized
+from "property length limit" to "length/hardware-slot limit" since a drop
+can now come from either cause.
+
+**Verified**: reran the full suite. The real-hardware calibration check
+(default 2000 ms/k=20) now reports `Done: 64 masked (64 new, 31 dropped
+(length/hardware-slot limit))` -- exactly capped at the real 64-slot
+hardware limit, not the ~100-pixel property-string budget from before.
+The loose-threshold stress check similarly capped at exactly 64. Full
+suite (`SUCCESS`, exit 0), no regression; masking-effectiveness check
+still passed (0 events in the masked 7x7 region, baseline 50 unmasked).
+
+### Not yet verified
+
+- ~~The `enable=true`/`false` semantics ambiguity for `I_RoiPixelMask::
+  set_pixel()`~~ — **resolved** by the masking-effectiveness follow-up
+  above: `I_RoiPixelMask` turned out not to be the enforcing facility on
+  this sensor at all (see there), and the actually-effective
+  `I_DigitalEventMask::set_mask()` has an unambiguous doc comment ("mask
+  will prevent pixel from generating CD event" when `true`) confirmed
+  correct by the automated before/after masking test (50 events unmasked
+  -> 0 masked). `kMaskPixelValue` in `ApplyBlockedPixelsToHardware()`'s
+  now-secondary `I_RoiPixelMask` call is left as originally documented,
+  moot on this sensor either way.
+- **Actually dragging/zooming an ROI rectangle in MicroManager's Live
+  view** and visually confirming the displayed image crops accordingly —
+  the self-test only exercises `core.setROI()`/`getROI()` directly via
+  `pymmcore-plus`, not MM Studio's own FOV-selection/zoom-to-center UI
+  gesture.
+- **Inspecting a recorded `.raw` file's actual event content** to confirm
+  ROI cropping reached the recording itself (not just the live display) —
+  the self-test only measured the live `EBS-AvgEventRate-MEvps` drop, a
+  strong indirect signal, but didn't parse a `.raw` file's contents
+  directly.
+- A full Hardware Config Wizard / Device Property Browser walkthrough,
+  same as every prior goal's hand-off pattern.
+
+### Follow-up: calibration now replaces EBS-BlockedPixels instead of merging, new defaults
+
+User reported that running calibration repeatedly kept finding *more*
+pixels each time, eventually blocking pixels that clearly weren't
+genuinely hot -- especially noticeable on a small ROI with few real
+events. Also asked for new defaults: `EBS-HotPixelStddevK` = 10,
+`EBS-HotPixelCalibDurationMs` = 5000 (5 s).
+
+**Root cause**: a masked pixel generates zero events by hardware design
+(that's the whole point of `I_DigitalEventMask`). The original merge
+design left previously-masked pixels masked *during* a new calibration
+scan, which silently shrank the population the scan's mean/stddev were
+computed over on every successive run -- each run measured an
+ever-quieter population than the last, dragging the threshold down and
+starting to flag genuinely normal pixels as statistical outliers. This
+compounds worst exactly where the user saw it: a small ROI with few real
+events to begin with.
+
+**Fix**: `OnDetectHotPixelsNow()` now clears `blockedPixels_` and pushes
+that empty state to hardware (unblocking everything) *before* the scan
+starts, not after -- every run's mean/stddev now comes from the same
+full, honest population. As a direct consequence, this also changes
+`EBS-BlockedPixels` from "merge (union)" to "replace" semantics -- a
+deliberate reversal of the original Goal 7 merge decision, explicitly
+requested this way: "first unblock all pixels, then do the calculation,
+then block the most hot ones." A pixel added by hand right before running
+calibration will not survive a calibration run -- that's intended, not a
+regression. The hotness-ranking/truncation-cap logic (property-length and
+hardware-slot-count budgets) is otherwise unchanged, just simplified since
+there's no longer an "existing" list to exclude candidates against.
+`g_DefaultHotPixelStddevK` changed to `10.0`, `g_DefaultHotPixelCalibDurationMs`
+changed to `5000.0`.
+
+**Verified**: rebuilt (0 warnings/errors) and reran `tools/test_prophebs.py`
+against the connected IMX636. New check: manually set `EBS-BlockedPixels`
+to a single arbitrary sentinel pixel (`500:500`, essentially guaranteed
+not to be a real outlier), ran calibration, and confirmed the sentinel is
+gone from `EBS-BlockedPixels` afterward -- proof calibration genuinely
+replaces rather than merges. Real-hardware calibration at the new defaults
+(5000 ms/k=10) reported `Done: 64 masked, 61 dropped (length/hardware-slot
+limit)` (capped at the real 64-slot hardware limit, as expected). Full
+suite (`SUCCESS`, exit 0), no regression; the masking-effectiveness check
+from the previous follow-up still passed (0 events in a masked 7x7 region,
+baseline 50 unmasked).
+
+### Open questions / TODO for later goals
+
+- **Calibrate against a static/dark scene (lens cap on) for a clean
+  hot-pixel-only result.** Because `mean`/`stddev` are computed globally
+  across the whole frame, real scene activity (motion, edges, uneven
+  lighting) during the calibration window inflates the frame's overall
+  variance and can pull genuinely normal pixels above threshold alongside
+  real hardware defects -- the detector has no way to distinguish "broken
+  pixel" from "pixel that happened to see something move." This isn't a
+  bug (the mean+k*stddev math is doing exactly what it's asked), just a
+  real limitation of a whole-frame statistical approach -- worth
+  documenting for the user directly (and maybe surfacing as guidance text
+  somewhere the GUI shows it) before v0.7 ships, since running calibration
+  in a busy scene will visibly over-mask compared to a static one.
+- Goal 8 ("full suite polishing") is next per the roadmap -- error
+  handling, tests, and documentation sweep across everything built so far.
