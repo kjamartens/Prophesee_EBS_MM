@@ -100,6 +100,20 @@ const char* g_PropDisplayRefreshMs = "EBS-DisplayRefreshMs";
 // Bug-fix property name (Live-view push-cadence floor).
 const char* g_PropLiveViewMinIntervalMs = "EBS-LiveViewMinIntervalMs";
 
+// Follow-up property names (backlog detection/flush -- see ProphEBS.h).
+const char* g_PropCallbackLagMs = "EBS-CallbackLagMs";
+const char* g_PropBacklogFlushCount = "EBS-BacklogFlushCount";
+const char* g_PropBacklogFlushThresholdMs = "EBS-BacklogFlushThresholdMs";
+
+// Follow-up: how many events OnEventsCD()'s per-event loop processes between
+// wall-clock lag rechecks -- see FlushBacklogLocked()/g_PropBacklogFlushThresholdMs
+// in ProphEBS.h for why a single large/slow batch needs this instead of only
+// checking once at batch entry. A few thousand events is cheap to count
+// (one extra comparison/increment per event) while still keeping a single
+// recheck interval's own wall-clock cost well under typical threshold
+// values (tens to hundreds of ms).
+const size_t g_LagCheckEventInterval = 8192;
+
 // Filter-type string values for EBS-AntiFlicker-FilterType. Metavision
 // Studio's UI calls Metavision::I_AntiFlickerModule::AntiFlickerMode::
 // BAND_STOP "Band Cut" and BAND_PASS "Band Pass" -- these strings match that
@@ -618,6 +632,11 @@ CProphEBSCamera::CProphEBSCamera() :
    backImg_(&imgBufferB_),
    windowStartT_(0),
    lastWindowCloseWallTime_(std::chrono::steady_clock::now()),
+   streamWallStart_(std::chrono::steady_clock::now()),
+   streamSensorStart_(-1),
+   callbackLagMs_(0.0),
+   backlogFlushCount_(0),
+   backlogFlushThresholdMs_(g_DefaultBacklogFlushThresholdMs),
    integrationTimeMs_(100.0),
    displayRefreshMs_(g_DefaultDisplayRefreshMs),
    liveViewMinIntervalMs_(g_DefaultLiveViewMinIntervalMs),
@@ -828,12 +847,22 @@ int CProphEBSCamera::Initialize()
    // its own CPropertyAction instance -- see CreateBiasProperties() for why
    // sharing one across properties isn't safe (double-free on shutdown).
    for (const char* prop : { g_PropAvgDataRate, g_PropAvgEventRate, g_PropAvgErcDropRate,
-           g_PropTemperature, g_PropIllumination, g_PropPixelDeadTime })
+           g_PropTemperature, g_PropIllumination, g_PropPixelDeadTime,
+           g_PropCallbackLagMs, g_PropBacklogFlushCount })
    {
       nRet = CreateFloatProperty(prop, 0.0, true, new CPropertyAction(this, &CProphEBSCamera::OnStat));
       if (DEVICE_OK != nRet)
          return nRet;
    }
+
+   // Follow-up: settable backlog-flush threshold -- see g_PropBacklogFlushThresholdMs.
+   nRet = CreateFloatProperty(g_PropBacklogFlushThresholdMs, g_DefaultBacklogFlushThresholdMs, false,
+      new CPropertyAction(this, &CProphEBSCamera::OnBacklogFlushThresholdMs));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = SetPropertyLimits(g_PropBacklogFlushThresholdMs, 5.0, 60000.0);
+   if (DEVICE_OK != nRet)
+      return nRet;
 
    // Goal 6: view-mode/offset/scale and the software activity-noise filter.
    // Created unconditionally (no camera needed) -- same as the Goal 5
@@ -1888,6 +1917,12 @@ void CProphEBSCamera::StartEventStreaming()
    totalRawBytes_ = 0;
    totalEventCount_ = 0;
 
+   // Follow-up: reset the backlog-detection anchor -- re-established on the
+   // first event received after streaming (re)starts (see OnEventsCD()).
+   streamSensorStart_ = -1;
+   callbackLagMs_ = 0.0;
+   backlogFlushCount_ = 0;
+
    // Goal 6: (re)construct the software activity-noise filter now that the
    // real sensor geometry is known -- reads the current
    // activityFilterThresholdUs_ (whatever the property was last set to,
@@ -1969,6 +2004,68 @@ void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavis
 {
    totalEventCount_ += static_cast<uint64_t>(end - begin);
 
+   if (begin == end)
+      return;
+
+   // Follow-up: backlog detection, using each checked event's own raw
+   // sensor timestamp (before any activity-filter subsetting) against how
+   // much wall-clock time has actually elapsed since streamWallStart_/
+   // streamSensorStart_ were last anchored. A positive, growing lag means
+   // the Metavision SDK's own decode/callback pipeline is running behind
+   // real time -- the "queue of events building up" symptom this is meant
+   // to catch. See ProphEBS.h (streamWallStart_ comment) for two real bugs
+   // found and fixed here after the first version of this mechanism
+   // shipped: (1) a batch-entry-only check let one large/slow batch blow
+   // straight past the threshold before ever being re-evaluated, and (2)
+   // failing to re-anchor on a non-positive (caught-up) reading let the
+   // metric swing deeply negative and then have to climb back out of that
+   // hole before detecting the next real burst. Both are fixed by making
+   // this check reusable (a lambda) and calling it both at batch entry and
+   // periodically (every g_LagCheckEventInterval events) from inside the
+   // per-event loop below, always re-anchoring whenever the reading isn't
+   // positive.
+   auto checkLag = [this](std::chrono::steady_clock::time_point wallNow, Metavision::timestamp eventT) -> double
+   {
+      if (streamSensorStart_ < 0)
+      {
+         // First event since StartEventStreaming() (re)armed the anchor.
+         streamWallStart_ = wallNow;
+         streamSensorStart_ = eventT;
+         return 0.0;
+      }
+
+      double wallElapsedMs = std::chrono::duration<double, std::milli>(wallNow - streamWallStart_).count();
+      double sensorElapsedMs = static_cast<double>(eventT - streamSensorStart_) / 1000.0;
+      double lag = wallElapsedMs - sensorElapsedMs;
+      if (lag <= 0.0)
+      {
+         // Caught up (or this event's batch spans more sensor-time than
+         // wall-time -- e.g. a burst of already-decoded backlog delivered
+         // quickly): re-baseline right here so this moment becomes the new
+         // "known caught up" reference point, rather than letting the
+         // metric accumulate a negative credit that a later, genuine burst
+         // would first have to climb back out of before crossing
+         // EBS-BacklogFlushThresholdMs again.
+         streamWallStart_ = wallNow;
+         streamSensorStart_ = eventT;
+         lag = 0.0;
+      }
+      return lag;
+   };
+
+   auto nowWall = std::chrono::steady_clock::now();
+   Metavision::timestamp latestT = (end - 1)->t;
+   double lagMs = checkLag(nowWall, latestT);
+   callbackLagMs_ = lagMs;
+
+   MMThreadGuard g(eventCountsLock_);
+
+   if (lagMs >= backlogFlushThresholdMs_.load())
+   {
+      FlushBacklogLocked(nowWall, latestT, lagMs);
+      return;
+   }
+
    MMThreadGuard filterGuard(activityFilterLock_);
    const Metavision::EventCD* filteredBegin = begin;
    const Metavision::EventCD* filteredEnd = end;
@@ -1982,8 +2079,9 @@ void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavis
    }
 
    auto exposureUs = static_cast<Metavision::timestamp>(integrationTimeMs_.load() * 1000.0);
+   double flushThresholdMs = backlogFlushThresholdMs_.load();
+   size_t sinceLagCheck = 0;
 
-   MMThreadGuard g(eventCountsLock_);
    for (const Metavision::EventCD* ev = filteredBegin; ev != filteredEnd; ++ev)
    {
       if (ev->x < sensorWidth_ && ev->y < sensorHeight_)
@@ -1997,7 +2095,51 @@ void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavis
 
       if (ev->t - windowStartT_ >= exposureUs)
          CloseCurrentWindowLocked(true, ev->t);
+
+      // Mid-batch recheck: bounds a single large/slow batch's worst-case
+      // delay before flushing to roughly one recheck interval's worth of
+      // processing time, instead of the whole (potentially huge) batch --
+      // see the comment above checkLag() for the incident this fixes.
+      if (++sinceLagCheck >= g_LagCheckEventInterval)
+      {
+         sinceLagCheck = 0;
+         auto midWall = std::chrono::steady_clock::now();
+         double midLagMs = checkLag(midWall, ev->t);
+         callbackLagMs_ = midLagMs;
+         if (midLagMs >= flushThresholdMs)
+         {
+            FlushBacklogLocked(midWall, ev->t, midLagMs);
+            return;
+         }
+      }
    }
+}
+
+/**
+ * Follow-up: performs the actual backlog flush -- see the callback-lag
+ * comment in OnEventsCD() and the streamWallStart_ comment in ProphEBS.h.
+ * Wipes onCounts_/offCounts_/touchedIndices_ in one fixed O(sensor pixels)
+ * pass (independent of how large the backlog actually was) and re-anchors
+ * both the integration window and the lag-tracking pair to (nowWall,
+ * eventT), i.e. "now" -- discarding the stale backlog's per-pixel detail
+ * instead of laboriously draining it is what actually lets the callback
+ * thread catch back up to real time. Caller must already hold
+ * eventCountsLock_; this never locks it itself.
+ */
+void CProphEBSCamera::FlushBacklogLocked(std::chrono::steady_clock::time_point nowWall,
+   Metavision::timestamp eventT, double lagMs)
+{
+   std::fill(onCounts_.begin(), onCounts_.end(), 0);
+   std::fill(offCounts_.begin(), offCounts_.end(), 0);
+   touchedIndices_.clear();
+   windowStartT_ = eventT;
+   lastWindowCloseWallTime_ = nowWall;
+   streamWallStart_ = nowWall;
+   streamSensorStart_ = eventT;
+   callbackLagMs_ = 0.0;
+   ++backlogFlushCount_;
+   LogMessage(std::string("ProphEBS: backlog flush -- callback lag reached ") +
+      CDeviceUtils::ConvertToString(lagMs) + " ms, discarding stale event backlog to catch up", true);
 }
 
 /**
@@ -2171,6 +2313,9 @@ void CProphEBSCamera::UpdateStats()
    OnPropertyChanged(g_PropTemperature, CDeviceUtils::ConvertToString(temperatureC_.load()));
    OnPropertyChanged(g_PropIllumination, CDeviceUtils::ConvertToString(illuminationLux_.load()));
    OnPropertyChanged(g_PropPixelDeadTime, CDeviceUtils::ConvertToString(pixelDeadTimeUs_.load()));
+   OnPropertyChanged(g_PropCallbackLagMs, CDeviceUtils::ConvertToString(callbackLagMs_.load()));
+   OnPropertyChanged(g_PropBacklogFlushCount,
+      CDeviceUtils::ConvertToString(static_cast<double>(backlogFlushCount_.load())));
 }
 
 /**
@@ -2196,7 +2341,31 @@ int CProphEBSCamera::OnStat(MM::PropertyBase* pProp, MM::ActionType eAct)
       pProp->Set(illuminationLux_.load());
    else if (propName == g_PropPixelDeadTime)
       pProp->Set(pixelDeadTimeUs_.load());
+   else if (propName == g_PropCallbackLagMs)
+      pProp->Set(callbackLagMs_.load());
+   else if (propName == g_PropBacklogFlushCount)
+      pProp->Set(static_cast<double>(backlogFlushCount_.load()));
 
+   return DEVICE_OK;
+}
+
+/**
+ * Follow-up: settable threshold for OnEventsCD()'s backlog detection -- see
+ * g_PropBacklogFlushThresholdMs. Plain atomic-backed, same shape as
+ * OnViewOffset()/OnViewScale().
+ */
+int CProphEBSCamera::OnBacklogFlushThresholdMs(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      pProp->Set(backlogFlushThresholdMs_.load());
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      double value;
+      pProp->Get(value);
+      backlogFlushThresholdMs_ = std::max(1.0, value);
+   }
    return DEVICE_OK;
 }
 

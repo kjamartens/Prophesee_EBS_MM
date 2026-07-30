@@ -291,6 +291,29 @@ const double g_IdleWindowTimeoutMs = 100.0;
 extern const char* g_PropLiveViewMinIntervalMs;
 const double g_DefaultLiveViewMinIntervalMs = 5.0;
 
+// Follow-up: under sustained high event rates, the Metavision SDK's own
+// internal decode/callback pipeline can fall behind real (wall-clock) time --
+// observed as the live view's display lag growing during a burst of activity
+// and then slowly draining back down once activity calms, rather than
+// staying flat. OnEventsCD() detects this directly by comparing each
+// incoming batch's newest sensor timestamp (Metavision::EventCD::t,
+// microsecond-resolution) against how much wall-clock time has actually
+// elapsed since streaming started -- the difference is the callback's own
+// lag behind real time. Once that lag exceeds
+// EBS-BacklogFlushThresholdMs, rather than keep faithfully replaying every
+// stale sub-window in the backlog (which is itself real CPU work that only
+// prolongs the slow recovery), the current window's accumulators are wiped
+// and re-anchored to "now" in one cheap O(sensor pixels) pass -- discarding
+// the stale backlog's per-pixel detail instead of laboriously draining it,
+// which is what actually lets the callback thread catch back up quickly.
+// EBS-CallbackLagMs/EBS-BacklogFlushCount are read-only diagnostics (pushed
+// on the existing Goal 5 stats cadence, see UpdateStats()) so this is
+// observable in the Device/Property Browser without rebuilding.
+extern const char* g_PropCallbackLagMs;
+extern const char* g_PropBacklogFlushCount;
+extern const char* g_PropBacklogFlushThresholdMs;
+const double g_DefaultBacklogFlushThresholdMs = 250.0;
+
 // Goal 6: the four selectable view modes, stored as CProphEBSCamera::
 // viewMode_ (a std::atomic<int> holding one of these values -- see there
 // for why plain int rather than std::atomic<ProphEBSViewMode>).
@@ -411,6 +434,14 @@ public:
    int OnActivityFilterEnabled(MM::PropertyBase* pProp, MM::ActionType eAct);
    int OnActivityFilterThreshold(MM::PropertyBase* pProp, MM::ActionType eAct);
 
+   // Follow-up: settable threshold (see g_PropBacklogFlushThresholdMs) for
+   // OnEventsCD()'s backlog detection -- plain atomic-backed, same shape as
+   // OnViewOffset()/OnViewScale() above. EBS-CallbackLagMs/EBS-BacklogFlushCount
+   // are read-only and share OnStat() instead (added to its property list in
+   // Initialize()), since they're pushed on the same stats cadence as the
+   // Goal 5 live-stats properties.
+   int OnBacklogFlushThresholdMs(MM::PropertyBase* pProp, MM::ActionType eAct);
+
    // Goal 5: one shared read-only handler for all six live-stats
    // properties -- BeforeGet just reads the matching cached
    // std::atomic<double> (looked up via pProp->GetName(), same pattern as
@@ -480,6 +511,20 @@ private:
    // very stale to the next real event, which harmlessly triggers an
    // immediate (already-empty) close and a fresh windowStartT_ right then.
    void CloseCurrentWindowLocked(bool fromEvent, Metavision::timestamp eventT);
+
+   // Follow-up: performs the actual backlog flush -- wipes onCounts_/
+   // offCounts_/touchedIndices_, re-anchors windowStartT_ and the
+   // streamWallStart_/streamSensorStart_ lag-tracking pair to (nowWall,
+   // eventT), and records the flush for the EBS-BacklogFlushCount/
+   // EBS-CallbackLagMs diagnostics. Caller must already hold
+   // eventCountsLock_ (this never locks it itself), same convention as
+   // CloseCurrentWindowLocked() above. Factored out of OnEventsCD() so it
+   // can be called both at batch entry and, on a large/slow batch, from
+   // partway through the per-event loop -- see OnEventsCD() for why a
+   // batch-entry-only check let a single slow batch blow past
+   // EBS-BacklogFlushThresholdMs before ever getting flushed.
+   void FlushBacklogLocked(std::chrono::steady_clock::time_point nowWall,
+      Metavision::timestamp eventT, double lagMs);
 
    // Called by ProphEBSFrameBuilderThread every EBS-DisplayRefreshMs (Goal 6
    // follow-up -- decoupled from the Exposure/integration-window length):
@@ -603,6 +648,52 @@ private:
    Metavision::timestamp windowStartT_;
    std::vector<uint32_t> touchedIndices_;
    std::chrono::steady_clock::time_point lastWindowCloseWallTime_;
+
+   // Follow-up: backlog detection/flush state, all touched only from
+   // OnEventsCD() (Metavision's own callback thread) except
+   // backlogFlushThresholdMs_ (settable from any thread via its property
+   // handler, hence atomic). streamWallStart_/streamSensorStart_ are the
+   // (wall-clock, sensor-clock) anchor pair a later event's ev->t is
+   // compared against to detect the callback thread running behind real
+   // time. streamSensorStart_ == -1 means "no anchor yet" (armed on the
+   // very first event of a StartEventStreaming() session).
+   //
+   // Bug found after the initial version of this mechanism shipped: the
+   // anchor was only ever reset on an actual flush, so a batch that
+   // computed zero or negative lag (i.e. genuinely caught up, or even
+   // running ahead because one callback delivered a wide sensor-time span
+   // in a burst of already-decoded backlog) left the anchor untouched --
+   // and lag briefly went very negative (observed: -3210 ms) after an
+   // active scene. A later, genuine burst then had to climb back up through
+   // that entire negative deficit before crossing
+   // EBS-BacklogFlushThresholdMs again, silently defeating the threshold
+   // for however long that climb took. Fix: OnEventsCD() now re-anchors to
+   // (nowWall, latestT) -- and clamps the reported lag to 0 -- any time the
+   // computed lag is <= 0, not just on an explicit flush, so the metric
+   // continuously tracks "how far behind the most recent caught-up point,"
+   // never a stale credit from having briefly run ahead.
+   //
+   // Second bug found at the same time: the flush check only ran once, at
+   // the top of OnEventsCD(), before the per-event loop. Metavision can
+   // (and did, per the report) deliver a single callback batch spanning a
+   // huge sensor-time range in one call; if that one batch is itself slow
+   // to process (per-event touchedIndices_ growth, window-close resets),
+   // wall-clock time keeps advancing throughout it but nothing re-checks
+   // lag until the *next* callback invocation -- letting one slow batch run
+   // the true delay (observed: ~3460 ms) well past a 250 ms threshold
+   // before anything flushes. Fix: OnEventsCD()'s per-event loop now also
+   // rechecks lag every g_LagCheckEventInterval events and can flush
+   // mid-batch, bounding a single batch's worst-case delay to roughly that
+   // interval's own processing time instead of the whole batch's.
+   //
+   // callbackLagMs_/backlogFlushCount_ back the read-only diagnostic
+   // properties (EBS-CallbackLagMs/EBS-BacklogFlushCount), pushed on the
+   // existing Goal 5 stats cadence by UpdateStats().
+   std::chrono::steady_clock::time_point streamWallStart_;
+   Metavision::timestamp streamSensorStart_;
+   std::atomic<double> callbackLagMs_;
+   std::atomic<uint64_t> backlogFlushCount_;
+   std::atomic<double> backlogFlushThresholdMs_;
 
    // Goal 6: event-integration window length, driven by MM's own Exposure
    // property (see OnExposure()) instead of the old fixed

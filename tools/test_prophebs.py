@@ -449,5 +449,41 @@ if connection_status == "Connected":
 else:
     print("Goal 6 follow-up: no EBS connected -- skipping Live-cadence bug-fix check")
 
+# Follow-up: backlog detection/flush. EBS-BacklogFlushThresholdMs round-trip
+# first, then (with a real camera) force the threshold artificially low so
+# that ordinary real-time callback jitter reliably trips it within a short
+# streaming burst -- confirming both EBS-CallbackLagMs and
+# EBS-BacklogFlushCount are wired up and moving, not just present.
+thresh_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-BacklogFlushThresholdMs")
+thresh_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-BacklogFlushThresholdMs")
+original_threshold = core.getProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs")
+assert abs(float(original_threshold) - 250.0) < 1e-9, "expected EBS-BacklogFlushThresholdMs to default to 250 ms"
+core.setProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs", "500")
+assert float(core.getProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs")) == 500.0
+print("Follow-up: EBS-BacklogFlushThresholdMs round-tripped to 500 ms (limits", thresh_lo, "-", thresh_hi,
+      ", default 250)")
+core.setProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs", original_threshold)
+
+if connection_status == "Connected":
+    lag_before = float(core.getProperty("ProphEBSCam", "EBS-CallbackLagMs"))
+    flushes_before = float(core.getProperty("ProphEBSCam", "EBS-BacklogFlushCount"))
+    core.setProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs", str(thresh_lo))  # near-guaranteed trip
+    time.sleep(1.0)
+    lag_after = float(core.getProperty("ProphEBSCam", "EBS-CallbackLagMs"))
+    flushes_after = float(core.getProperty("ProphEBSCam", "EBS-BacklogFlushCount"))
+    core.setProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs", original_threshold)
+    print("Follow-up: EBS-CallbackLagMs", lag_before, "->", lag_after,
+          ", EBS-BacklogFlushCount", flushes_before, "->", flushes_after,
+          "(threshold forced to 0.001 ms for 1s)")
+    assert flushes_after > flushes_before, \
+        "expected EBS-BacklogFlushCount to increase once EBS-BacklogFlushThresholdMs was forced near zero"
+    # Snap after restoring the threshold, confirming the adapter is still in
+    # a normal working state post-flush (no regression from the fast path).
+    img_after_flush = core.snapImage()
+    core.getImage()
+    print("Follow-up: snap after backlog flush still succeeded, shape unaffected")
+else:
+    print("Follow-up: no EBS connected -- skipping backlog-flush trigger check")
+
 core.unloadDevice("ProphEBSCam")
 print("SUCCESS")

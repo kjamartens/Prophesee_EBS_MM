@@ -1290,3 +1290,170 @@ reflected promptly.
 - Goal 7 ("pixel-by-pixel differences") is next per the roadmap — per-pixel
   masking (blocked-pixel list) and a sensor ROI, building on the geometry
   and per-pixel accumulation infrastructure already in place from Goals 3/6.
+
+### Follow-up: Live view falling behind under sustained high event rates ("backlog flush")
+
+User reported (session start, before any new code): under many streamed
+events, Live view stops catching up — a display lag that grows during a
+burst of activity, then slowly recovers once activity calms, rather than
+staying flat or freezing outright. Asked the user two clarifying questions
+before touching code: (1) does the lag recover on its own or stay stuck —
+**recovers, slowly**, which is the signature of a real FIFO backlog
+draining, not a permanent stall; (2) lead with Metavision's own hardware
+ERC (event-rate-control, already exposed as `EBS-ERC-*` since Goal 5) as a
+proactive rate cap, or detect-and-flush after the fact — user chose
+**detect-and-flush only** (don't cap/drop events at the sensor; catch the
+display back up to real time instead).
+
+**Root cause reasoning**: the device adapter has no visibility into
+MMCore's circular-buffer occupancy (`MM::Core` — confirmed by reading
+`MMDevice/MMDevice.h` — only exposes a one-way `InsertImage()` push, no
+query), so backlog can't be measured or flushed from that side. Metavision's
+own real-time viewer sample
+(`share/metavision/sdk/core/python_samples/metavision_simple_viewer`) uses
+`window.show_async(cd_frame)` — a "latest wins" display slot, not a queue —
+which this adapter's own `frontImg_`/`backImg_` double-buffer already
+mirrors (see Goal 3). The actual queue that can back up is internal to the
+Metavision SDK's own decode/callback pipeline: `OnEventsCD()`'s per-event
+work (bias/HPF-driven touch tracking, window-close resets) scales with how
+much event backlog has piled up, which is itself extra CPU spent on stale
+data — a classic slow-recovery shape once a burst pushes the callback
+thread behind real (wall-clock) time.
+
+**Implementation** — backlog detection directly in `OnEventsCD()`
+(`ProphEBS.cpp`), no new thread needed:
+
+- An anchor pair, `streamWallStart_` (`std::chrono::steady_clock::
+  time_point`) / `streamSensorStart_` (`Metavision::timestamp`), is
+  established on the first event of each `StartEventStreaming()` session
+  (reset to a `-1` sentinel there, armed on the next `OnEventsCD()` call).
+  Every batch computes `lagMs = wallElapsedSinceAnchor -
+  sensorElapsedSinceAnchor` using the batch's own newest raw event
+  timestamp (`(end-1)->t`, before any activity-filter subsetting) — a
+  growing positive value means the callback is falling behind real time.
+- New `EBS-BacklogFlushThresholdMs` property (float, default 250 ms, limits
+  5–60000) — once `lagMs` reaches it, `OnEventsCD()` takes a **flush** fast
+  path instead of the normal per-event loop: `onCounts_`/`offCounts_` are
+  wiped with `std::fill` (fixed O(sensor pixels) cost, independent of how
+  large the actual backlog is), `touchedIndices_` cleared,
+  `windowStartT_`/the anchor pair re-set to "now" (this batch's newest
+  event), and the whole batch's activity-filter/per-event work is skipped
+  entirely. This is the actual mechanism that lets the callback thread
+  drain the Metavision SDK's internal backlog faster than it refills —
+  spending less CPU per batch once behind, not more.
+- Two new read-only diagnostics, `EBS-CallbackLagMs` and
+  `EBS-BacklogFlushCount`, pushed on the existing Goal 5 stats cadence
+  (`UpdateStats()`, every `g_StatsIntervalMs` via `OnPropertyChanged()`) —
+  so the user can watch lag and flush count live in the Device/Property
+  Browser during a real GUI session, not just infer the fix worked.
+- Made a design call to lock `eventCountsLock_` before `activityFilterLock_`
+  in `OnEventsCD()` (previously the reverse), so the lag check + fast flush
+  path can run under just `eventCountsLock_` without touching
+  `activityFilterLock_` at all when flushing. Confirmed safe: grepped every
+  other use of both locks — nothing else in the file ever holds both
+  simultaneously, so nesting order is only self-consistent within
+  `OnEventsCD()` itself, no deadlock risk.
+
+### Verified locally (backlog flush)
+
+- **Build**: `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`
+  — one error on the first attempt (`CDeviceUtils::ConvertToString()`
+  returns `const char*`, not `std::string` — confirmed in
+  `MMDevice/DeviceUtils.h`; `"a" + ConvertToString(x)` was pointer + pointer
+  arithmetic, not string concatenation), fixed by wrapping in
+  `std::string(...)`. 0 warnings/errors after.
+- **Real hardware, via `tools/test_prophebs.py`** (extended): all Goal 1-6
+  checks still passed (no regression). New checks:
+  `EBS-BacklogFlushThresholdMs` round-tripped within its 5-60000 ms limits
+  (default confirmed 250); then, with the threshold forced down to its
+  5 ms floor for 1 second of real streaming (~10 MEv/s ambient, same as
+  every other real-hardware check in this session), `EBS-BacklogFlushCount`
+  rose from 0 to 2 and `EBS-CallbackLagMs` moved from ~1.9 ms to -12.3 ms
+  (negative == caught up/ahead immediately after a flush re-anchors to
+  "now", exactly the intended effect) — real, observable evidence the flush
+  path triggers and actually resets the lag, not just that the properties
+  exist. A `snapImage()` immediately after confirmed the adapter is still
+  in a normal working state post-flush (unchanged `(720, 1280) uint8`).
+- **Not yet verified**: the real-world scenario that prompted this — a
+  genuinely heavy, sustained motion/light burst in the MicroManager GUI's
+  Live view, watched for whether the display lag now stays flat (or at
+  least recovers quickly) instead of growing unboundedly during the burst.
+  The self-test only proves the flush mechanism triggers and resets
+  `EBS-CallbackLagMs`/`EBS-BacklogFlushCount` correctly under real streaming
+  load with an artificially low threshold — it can't observe the GUI's own
+  visual display lag, only the callback's internal timing. Pending the
+  user's GUI walkthrough, ideally comparing Live view responsiveness before
+  and after this change during a deliberately busy scene (e.g. waving a
+  hand close to the sensor), and confirming `EBS-BacklogFlushThresholdMs`'s
+  default (250 ms) is a reasonable balance — lower flushes more eagerly
+  (catches up faster but discards more stale detail), higher tolerates more
+  transient lag before discarding anything.
+
+### Bug found immediately by the user, same session: negative lag readings and a 3.4s-late first flush
+
+User tried the above in the real GUI and reported it looked broken:
+`EBS-CallbackLagMs` read a nonsensical **-3210** during a static/quiet
+scene right after an active one, and the flush only actually seemed to
+kick in around **3460 ms** of real display delay, not anywhere near the
+250 ms default threshold. Both symptoms trace back to two real bugs in the
+first version of this mechanism (not requirements gaps):
+
+1. **The flush check only ran once, at the very top of `OnEventsCD()`.**
+   Metavision can (and evidently did) deliver a single callback batch
+   spanning a large sensor-time range in one call. If that one batch was
+   itself slow to process — the existing per-event `touchedIndices_`
+   growth and window-close resets, now working through unusually dense
+   data — wall-clock time kept advancing throughout it, but nothing
+   re-checked the lag until the *next* callback invocation. A single slow
+   batch could therefore run the real delay arbitrarily far past the
+   configured threshold before anything flushed, which is exactly the
+   "flush only at 3460 ms, not 250 ms" symptom.
+2. **The anchor was only ever reset on an actual flush.** A batch that
+   computed zero or negative lag (genuinely caught up, or even running
+   *ahead* because one callback delivered a wide sensor-time span from
+   already-decoded backlog in a burst) left `streamWallStart_`/
+   `streamSensorStart_` untouched, so the lag reading was free to swing
+   deeply negative. Once negative, a later *genuine* burst had to climb
+   back up through that entire deficit before crossing
+   `EBS-BacklogFlushThresholdMs` again — silently defeating the threshold
+   for however long that climb took. This is the direct explanation for
+   both the -3210 reading itself and, compounding with bug 1, part of why
+   the next flush was so late.
+
+**Fix**: refactored the lag check into a reusable `checkLag()` lambda
+inside `OnEventsCD()` (`ProphEBS.cpp`) and a new `FlushBacklogLocked()`
+helper (factored out of the inline flush code):
+
+- `checkLag()` now **re-anchors `streamWallStart_`/`streamSensorStart_` to
+  "now" any time the computed lag is `<= 0`**, not only on an explicit
+  flush — clamping the reported value to 0 in that case. This makes the
+  metric track "how far behind the most recent *known caught-up* point,"
+  with no way to accumulate a negative credit a later burst would have to
+  climb out of first.
+- The per-event loop in `OnEventsCD()` now also calls `checkLag()` every
+  `g_LagCheckEventInterval` (8192) events, not just once at batch entry,
+  and can call `FlushBacklogLocked()` mid-batch. This bounds a single
+  large/slow batch's worst-case un-flushed delay to roughly one recheck
+  interval's own processing time instead of the whole batch, regardless of
+  how large that batch turns out to be.
+- Extensively documented both incidents directly on the
+  `streamWallStart_`/`streamSensorStart_` member comment in `ProphEBS.h`
+  (not just here), since this is exactly the kind of "the naive version
+  doesn't scale/isn't correct" lesson worth having next to the state itself
+  for whoever touches this next.
+
+**Verified**: `tools/test_prophebs.py`'s existing backlog-flush check
+(forces `EBS-BacklogFlushThresholdMs` to its 5 ms floor for 1 second of
+real streaming) needed no changes and still passed — `EBS-CallbackLagMs`
+went `0.42 -> 3.43` (both positive/small, never negative) and
+`EBS-BacklogFlushCount` rose by **8** in that second (versus 2 before this
+fix, since flushes are now caught promptly at the 8192-event granularity
+instead of only occasionally landing on an already-over-threshold batch
+boundary) — consistent with the fix working as intended. Full suite
+(`SUCCESS`, exit 0) passed with no regression across all Goal 1-6 checks.
+Build: 0 warnings/errors, first attempt, no `.vcxproj` changes needed.
+
+**Not yet verified**: the same real GUI walkthrough as above (still
+pending) — this time specifically re-checking that `EBS-CallbackLagMs`
+stays non-negative and the flush now visibly kicks in close to the
+configured 250 ms default rather than several seconds late.
