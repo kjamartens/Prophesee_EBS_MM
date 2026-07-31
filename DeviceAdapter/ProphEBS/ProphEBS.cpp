@@ -1124,7 +1124,7 @@ void CProphEBSCamera::ConnectToCamera()
       // Throws CameraException (caught below) if the facility isn't
       // available -- every real Prophesee device registers it, so this only
       // trips for unusual/unsupported hardware.
-      Metavision::I_HW_Identification& hwId = cam_.get_facility<Metavision::I_HW_Identification>();
+      Metavision::I_HW_Identification& hwId = GetCamFacility<Metavision::I_HW_Identification>();
 
       cameraSerial_ = hwId.get_serial();
       connectionType_ = hwId.get_connection_type();
@@ -1145,7 +1145,7 @@ void CProphEBSCamera::ConnectToCamera()
       // g_TestImageWidth/Height fallback (throws CameraException, caught
       // below, on the same unusual "no I_Geometry facility" condition as
       // I_HW_Identification above).
-      Metavision::I_Geometry& geometry = cam_.get_facility<Metavision::I_Geometry>();
+      Metavision::I_Geometry& geometry = GetCamFacility<Metavision::I_Geometry>();
       sensorWidth_ = static_cast<unsigned>(geometry.get_width());
       sensorHeight_ = static_cast<unsigned>(geometry.get_height());
 
@@ -1201,7 +1201,7 @@ void CProphEBSCamera::CreateBiasProperties()
    {
       try
       {
-         Metavision::I_LL_Biases& biases = cam_.get_facility<Metavision::I_LL_Biases>();
+         Metavision::I_LL_Biases& biases = GetCamFacility<Metavision::I_LL_Biases>();
          std::map<std::string, int> allBiases = biases.get_all_biases();
          for (const auto& kv : allBiases)
          {
@@ -1251,7 +1251,7 @@ int CProphEBSCamera::OnBias(MM::PropertyBase* pProp, MM::ActionType eAct)
    {
       try
       {
-         Metavision::I_LL_Biases& biases = cam_.get_facility<Metavision::I_LL_Biases>();
+         Metavision::I_LL_Biases& biases = GetCamFacility<Metavision::I_LL_Biases>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(biases.get(biasName)));
@@ -1330,7 +1330,7 @@ void CProphEBSCamera::CreateErcProperties()
    {
       try
       {
-         Metavision::I_ErcModule& erc = cam_.get_facility<Metavision::I_ErcModule>();
+         Metavision::I_ErcModule& erc = GetCamFacility<Metavision::I_ErcModule>();
          SetPropertyLimits(g_PropErcEventRate, erc.get_min_supported_cd_event_rate(),
             erc.get_max_supported_cd_event_rate());
          // Apply the requested default (50 Mev/s) to the hardware now, so
@@ -1352,7 +1352,7 @@ int CProphEBSCamera::OnErcEnabled(MM::PropertyBase* pProp, MM::ActionType eAct)
    {
       try
       {
-         Metavision::I_ErcModule& erc = cam_.get_facility<Metavision::I_ErcModule>();
+         Metavision::I_ErcModule& erc = GetCamFacility<Metavision::I_ErcModule>();
          if (eAct == MM::BeforeGet)
             pProp->Set(erc.is_enabled() ? "On" : "Off");
          else if (eAct == MM::AfterSet)
@@ -1387,7 +1387,7 @@ int CProphEBSCamera::OnErcEventRate(MM::PropertyBase* pProp, MM::ActionType eAct
    {
       try
       {
-         Metavision::I_ErcModule& erc = cam_.get_facility<Metavision::I_ErcModule>();
+         Metavision::I_ErcModule& erc = GetCamFacility<Metavision::I_ErcModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<double>(erc.get_cd_event_rate()));
@@ -1439,7 +1439,7 @@ void CProphEBSCamera::CreateEventTrailFilterProperties()
       try
       {
          Metavision::I_EventTrailFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventTrailFilterModule>();
+            GetCamFacility<Metavision::I_EventTrailFilterModule>();
          std::set<Metavision::I_EventTrailFilterModule::Type> available = filter.get_available_types();
          for (const auto& type : available)
             AddAllowedValue(g_PropEventTrailFilterMode, EventTrailFilterTypeToString(type));
@@ -1472,7 +1472,7 @@ int CProphEBSCamera::OnEventTrailFilterEnabled(MM::PropertyBase* pProp, MM::Acti
       try
       {
          Metavision::I_EventTrailFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventTrailFilterModule>();
+            GetCamFacility<Metavision::I_EventTrailFilterModule>();
          if (eAct == MM::BeforeGet)
             pProp->Set(filter.is_enabled() ? "On" : "Off");
          else if (eAct == MM::AfterSet)
@@ -1509,7 +1509,7 @@ int CProphEBSCamera::OnEventTrailFilterThreshold(MM::PropertyBase* pProp, MM::Ac
       try
       {
          Metavision::I_EventTrailFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventTrailFilterModule>();
+            GetCamFacility<Metavision::I_EventTrailFilterModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(filter.get_threshold()));
@@ -1544,7 +1544,7 @@ int CProphEBSCamera::OnEventTrailFilterMode(MM::PropertyBase* pProp, MM::ActionT
       try
       {
          Metavision::I_EventTrailFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventTrailFilterModule>();
+            GetCamFacility<Metavision::I_EventTrailFilterModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(EventTrailFilterTypeToString(filter.get_type()));
@@ -1612,7 +1612,7 @@ void CProphEBSCamera::CreateAntiFlickerProperties()
    {
       try
       {
-         Metavision::I_AntiFlickerModule& af = cam_.get_facility<Metavision::I_AntiFlickerModule>();
+         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
          SetPropertyLimits(g_PropAntiFlickerStartThreshold, af.get_min_supported_start_threshold(),
             af.get_max_supported_start_threshold());
          SetPropertyLimits(g_PropAntiFlickerStopThreshold, af.get_min_supported_stop_threshold(),
@@ -1655,7 +1655,7 @@ int CProphEBSCamera::OnAntiFlickerEnabled(MM::PropertyBase* pProp, MM::ActionTyp
    {
       try
       {
-         Metavision::I_AntiFlickerModule& af = cam_.get_facility<Metavision::I_AntiFlickerModule>();
+         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
          if (eAct == MM::BeforeGet)
             pProp->Set(af.is_enabled() ? "On" : "Off");
          else if (eAct == MM::AfterSet)
@@ -1690,7 +1690,7 @@ int CProphEBSCamera::OnAntiFlickerStartThreshold(MM::PropertyBase* pProp, MM::Ac
    {
       try
       {
-         Metavision::I_AntiFlickerModule& af = cam_.get_facility<Metavision::I_AntiFlickerModule>();
+         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(af.get_start_threshold()));
@@ -1724,7 +1724,7 @@ int CProphEBSCamera::OnAntiFlickerStopThreshold(MM::PropertyBase* pProp, MM::Act
    {
       try
       {
-         Metavision::I_AntiFlickerModule& af = cam_.get_facility<Metavision::I_AntiFlickerModule>();
+         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(af.get_stop_threshold()));
@@ -1758,7 +1758,7 @@ int CProphEBSCamera::OnAntiFlickerDutyCycle(MM::PropertyBase* pProp, MM::ActionT
    {
       try
       {
-         Metavision::I_AntiFlickerModule& af = cam_.get_facility<Metavision::I_AntiFlickerModule>();
+         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<double>(af.get_duty_cycle()));
@@ -1791,7 +1791,7 @@ int CProphEBSCamera::OnAntiFlickerFilterType(MM::PropertyBase* pProp, MM::Action
    {
       try
       {
-         Metavision::I_AntiFlickerModule& af = cam_.get_facility<Metavision::I_AntiFlickerModule>();
+         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(af.get_filtering_mode() == Metavision::I_AntiFlickerModule::BAND_PASS
@@ -1826,7 +1826,7 @@ int CProphEBSCamera::OnAntiFlickerLowFreq(MM::PropertyBase* pProp, MM::ActionTyp
    {
       try
       {
-         Metavision::I_AntiFlickerModule& af = cam_.get_facility<Metavision::I_AntiFlickerModule>();
+         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(af.get_band_low_frequency()));
@@ -1863,7 +1863,7 @@ int CProphEBSCamera::OnAntiFlickerHighFreq(MM::PropertyBase* pProp, MM::ActionTy
    {
       try
       {
-         Metavision::I_AntiFlickerModule& af = cam_.get_facility<Metavision::I_AntiFlickerModule>();
+         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(af.get_band_high_frequency()));
@@ -1932,7 +1932,7 @@ void CProphEBSCamera::CreateTriggerProperties()
    {
       try
       {
-         Metavision::I_TriggerIn& triggerIn = cam_.get_facility<Metavision::I_TriggerIn>();
+         Metavision::I_TriggerIn& triggerIn = GetCamFacility<Metavision::I_TriggerIn>();
          std::map<Metavision::I_TriggerIn::Channel, short> available = triggerIn.get_available_channels();
          for (const auto& kv : available)
          {
@@ -1949,7 +1949,7 @@ void CProphEBSCamera::CreateTriggerProperties()
 
       try
       {
-         Metavision::I_TriggerOut& triggerOut = cam_.get_facility<Metavision::I_TriggerOut>();
+         Metavision::I_TriggerOut& triggerOut = GetCamFacility<Metavision::I_TriggerOut>();
          triggerOut.set_period(static_cast<uint32_t>(localTriggerOutPeriodUs_));
          triggerOut.set_duty_cycle(localTriggerOutDutyCycle_);
          triggerOut.disable();
@@ -1985,7 +1985,7 @@ int CProphEBSCamera::OnTriggerInEnabled(MM::PropertyBase* pProp, MM::ActionType 
    {
       try
       {
-         Metavision::I_TriggerIn& triggerIn = cam_.get_facility<Metavision::I_TriggerIn>();
+         Metavision::I_TriggerIn& triggerIn = GetCamFacility<Metavision::I_TriggerIn>();
          Metavision::I_TriggerIn::Channel ch;
          TriggerChannelFromString(localTriggerInChannel_, ch);
          if (eAct == MM::BeforeGet)
@@ -2027,7 +2027,7 @@ int CProphEBSCamera::OnTriggerOutEnabled(MM::PropertyBase* pProp, MM::ActionType
    {
       try
       {
-         Metavision::I_TriggerOut& triggerOut = cam_.get_facility<Metavision::I_TriggerOut>();
+         Metavision::I_TriggerOut& triggerOut = GetCamFacility<Metavision::I_TriggerOut>();
          if (eAct == MM::BeforeGet)
          {
             // I_TriggerOut has no is_enabled() query -- reflect back
@@ -2070,7 +2070,7 @@ int CProphEBSCamera::OnTriggerOutPeriodUs(MM::PropertyBase* pProp, MM::ActionTyp
    {
       try
       {
-         Metavision::I_TriggerOut& triggerOut = cam_.get_facility<Metavision::I_TriggerOut>();
+         Metavision::I_TriggerOut& triggerOut = GetCamFacility<Metavision::I_TriggerOut>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(triggerOut.get_period()));
@@ -2107,7 +2107,7 @@ int CProphEBSCamera::OnTriggerOutDutyCycle(MM::PropertyBase* pProp, MM::ActionTy
    {
       try
       {
-         Metavision::I_TriggerOut& triggerOut = cam_.get_facility<Metavision::I_TriggerOut>();
+         Metavision::I_TriggerOut& triggerOut = GetCamFacility<Metavision::I_TriggerOut>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(triggerOut.get_duty_cycle());
@@ -2167,8 +2167,9 @@ void CProphEBSCamera::CreateEventRateFilterProperties()
    {
       try
       {
+#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
          Metavision::I_EventRateActivityFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventRateActivityFilterModule>();
+            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
          auto minT = filter.get_min_supported_thresholds();
          auto maxT = filter.get_max_supported_thresholds();
          SetPropertyLimits(g_PropEventRateFilterLowerStart, minT.lower_bound_start, maxT.lower_bound_start);
@@ -2186,6 +2187,10 @@ void CProphEBSCamera::CreateEventRateFilterProperties()
          SetProperty(g_PropEventRateFilterUpperStop, CDeviceUtils::ConvertToString(
             static_cast<long>(current.upper_bound_stop)));
          filter.enable(false);
+#else
+         throw std::runtime_error(
+            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
+#endif
       }
       catch (const std::exception& e)
       {
@@ -2201,8 +2206,9 @@ int CProphEBSCamera::OnEventRateFilterEnabled(MM::PropertyBase* pProp, MM::Actio
    {
       try
       {
+#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
          Metavision::I_EventRateActivityFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventRateActivityFilterModule>();
+            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
          if (eAct == MM::BeforeGet)
             pProp->Set(filter.is_enabled() ? "On" : "Off");
          else if (eAct == MM::AfterSet)
@@ -2211,6 +2217,10 @@ int CProphEBSCamera::OnEventRateFilterEnabled(MM::PropertyBase* pProp, MM::Actio
             pProp->Get(value);
             filter.enable(value == "On");
          }
+#else
+         throw std::runtime_error(
+            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
+#endif
       }
       catch (const std::exception& e)
       {
@@ -2243,8 +2253,9 @@ int CProphEBSCamera::OnEventRateFilterLowerStart(MM::PropertyBase* pProp, MM::Ac
    {
       try
       {
+#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
          Metavision::I_EventRateActivityFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventRateActivityFilterModule>();
+            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(filter.get_thresholds().lower_bound_start));
@@ -2259,6 +2270,10 @@ int CProphEBSCamera::OnEventRateFilterLowerStart(MM::PropertyBase* pProp, MM::Ac
                LogMessage("ProphEBS: event-rate filter lower-bound-start (" + std::to_string(value) +
                   " evt/s) rejected by hardware", false);
          }
+#else
+         throw std::runtime_error(
+            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
+#endif
       }
       catch (const std::exception& e)
       {
@@ -2282,8 +2297,9 @@ int CProphEBSCamera::OnEventRateFilterLowerStop(MM::PropertyBase* pProp, MM::Act
    {
       try
       {
+#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
          Metavision::I_EventRateActivityFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventRateActivityFilterModule>();
+            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(filter.get_thresholds().lower_bound_stop));
@@ -2298,6 +2314,10 @@ int CProphEBSCamera::OnEventRateFilterLowerStop(MM::PropertyBase* pProp, MM::Act
                LogMessage("ProphEBS: event-rate filter lower-bound-stop (" + std::to_string(value) +
                   " evt/s) rejected by hardware", false);
          }
+#else
+         throw std::runtime_error(
+            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
+#endif
       }
       catch (const std::exception& e)
       {
@@ -2321,8 +2341,9 @@ int CProphEBSCamera::OnEventRateFilterUpperStart(MM::PropertyBase* pProp, MM::Ac
    {
       try
       {
+#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
          Metavision::I_EventRateActivityFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventRateActivityFilterModule>();
+            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(filter.get_thresholds().upper_bound_start));
@@ -2337,6 +2358,10 @@ int CProphEBSCamera::OnEventRateFilterUpperStart(MM::PropertyBase* pProp, MM::Ac
                LogMessage("ProphEBS: event-rate filter upper-bound-start (" + std::to_string(value) +
                   " evt/s) rejected by hardware", false);
          }
+#else
+         throw std::runtime_error(
+            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
+#endif
       }
       catch (const std::exception& e)
       {
@@ -2360,8 +2385,9 @@ int CProphEBSCamera::OnEventRateFilterUpperStop(MM::PropertyBase* pProp, MM::Act
    {
       try
       {
+#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
          Metavision::I_EventRateActivityFilterModule& filter =
-            cam_.get_facility<Metavision::I_EventRateActivityFilterModule>();
+            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
          if (eAct == MM::BeforeGet)
          {
             pProp->Set(static_cast<long>(filter.get_thresholds().upper_bound_stop));
@@ -2376,6 +2402,10 @@ int CProphEBSCamera::OnEventRateFilterUpperStop(MM::PropertyBase* pProp, MM::Act
                LogMessage("ProphEBS: event-rate filter upper-bound-stop (" + std::to_string(value) +
                   " evt/s) rejected by hardware", false);
          }
+#else
+         throw std::runtime_error(
+            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
+#endif
       }
       catch (const std::exception& e)
       {
@@ -2420,7 +2450,7 @@ void CProphEBSCamera::ApplySyncModeToHardware()
       GetProperty(g_PropSyncMode, modeBuf);
       std::string mode(modeBuf);
 
-      Metavision::I_CameraSynchronization& sync = cam_.get_facility<Metavision::I_CameraSynchronization>();
+      Metavision::I_CameraSynchronization& sync = GetCamFacility<Metavision::I_CameraSynchronization>();
       bool ok;
       if (mode == g_SyncModeMaster)
          ok = sync.set_mode_master();
@@ -2605,7 +2635,7 @@ void CProphEBSCamera::ApplyBlockedPixelsToHardware()
    bool digitalMaskApplied = false;
    try
    {
-      Metavision::I_DigitalEventMask& dem = cam_.get_facility<Metavision::I_DigitalEventMask>();
+      Metavision::I_DigitalEventMask& dem = GetCamFacility<Metavision::I_DigitalEventMask>();
       const std::vector<Metavision::I_DigitalEventMask::I_PixelMaskPtr>& slots = dem.get_pixel_masks();
       size_t applied = std::min(blockedPixels_.size(), slots.size());
       for (size_t i = 0; i < slots.size(); i++)
@@ -2634,10 +2664,15 @@ void CProphEBSCamera::ApplyBlockedPixelsToHardware()
    // false) to mask a pixel -- a real contradiction, moot on this sensor
    // (see above) but still implemented against the header's documented
    // contract for whatever generation actually enforces it via this path.
+   // I_RoiPixelMask itself is absent from some installed SDK versions (e.g.
+   // 4.3.0, no renamed equivalent) -- this whole belt-and-suspenders block is
+   // skipped entirely in that case, since I_DigitalEventMask above is the
+   // facility that actually enforces the mask on this sensor generation.
+#ifdef PROPHEBS_HAVE_ROI_PIXEL_MASK
    const bool kMaskPixelValue = true;
    try
    {
-      Metavision::I_RoiPixelMask& mask = cam_.get_facility<Metavision::I_RoiPixelMask>();
+      Metavision::I_RoiPixelMask& mask = GetCamFacility<Metavision::I_RoiPixelMask>();
       mask.reset_pixels();
       for (const auto& px : blockedPixels_)
          mask.set_pixel(px.first, px.second, kMaskPixelValue);
@@ -2649,6 +2684,7 @@ void CProphEBSCamera::ApplyBlockedPixelsToHardware()
          LogMessage(std::string("ProphEBS: could not apply blocked-pixel mask via I_RoiPixelMask either: ") +
             e.what(), false);
    }
+#endif
 }
 
 int CProphEBSCamera::OnBlockedPixels(MM::PropertyBase* pProp, MM::ActionType eAct)
@@ -2839,7 +2875,7 @@ int CProphEBSCamera::OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionTyp
 
       try
       {
-         hardwareSlotCap = cam_.get_facility<Metavision::I_DigitalEventMask>().get_pixel_masks().size();
+         hardwareSlotCap = GetCamFacility<Metavision::I_DigitalEventMask>().get_pixel_masks().size();
       }
       catch (const std::exception&)
       {
@@ -3785,7 +3821,7 @@ void CProphEBSCamera::UpdateStats()
 
    try
    {
-      Metavision::I_ErcModule& erc = cam_.get_facility<Metavision::I_ErcModule>();
+      Metavision::I_ErcModule& erc = GetCamFacility<Metavision::I_ErcModule>();
       double dropRateKEvps = 0.0;
       if (erc.is_enabled())
       {
@@ -3804,7 +3840,7 @@ void CProphEBSCamera::UpdateStats()
 
    try
    {
-      Metavision::I_Monitoring& mon = cam_.get_facility<Metavision::I_Monitoring>();
+      Metavision::I_Monitoring& mon = GetCamFacility<Metavision::I_Monitoring>();
 
       try { temperatureC_ = static_cast<double>(mon.get_temperature()); }
       catch (const std::exception&) { /* leave at last good value */ }
@@ -4349,7 +4385,7 @@ int CProphEBSCamera::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySi
    {
       try
       {
-         Metavision::I_ROI& roi = cam_.get_facility<Metavision::I_ROI>();
+         Metavision::I_ROI& roi = GetCamFacility<Metavision::I_ROI>();
          roi.set_mode(Metavision::I_ROI::Mode::ROI);
          roi.set_window(Metavision::I_ROI::Window(
             static_cast<int>(x), static_cast<int>(y), static_cast<int>(xSize), static_cast<int>(ySize)));
@@ -4388,7 +4424,7 @@ int CProphEBSCamera::ClearROI()
          // Mirrors the official metavision_active_pixel_detection.cpp
          // sample's own clearROI() helper: disable rather than re-set a
          // full-frame window.
-         cam_.get_facility<Metavision::I_ROI>().enable(false);
+         GetCamFacility<Metavision::I_ROI>().enable(false);
       }
       catch (const std::exception& e)
       {

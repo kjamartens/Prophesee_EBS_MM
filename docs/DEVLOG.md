@@ -2772,3 +2772,152 @@ to assert `EBS-RawRecordingFormat` defaults to `HDF5` with allowed values
 `{RAW, HDF5}`, that an auto-discovered recording under the default produces
 a `.hdf5` file, and that switching to `RAW` mid-session produces a `.raw`
 file instead. Reran the full suite: `SUCCESS`, no flakes, no regressions.
+
+## Incident: v0.9.2 DLL "(unavailable)" on a machine with a matching DIV, root-caused to a Metavision SDK version gap between the build and runtime machines
+
+User reported that the `mmgr_dal_ProphEBS.dll` they had (built on "a Windows
+11 PC x64") showed as **"(unavailable)"** in the Hardware Configuration
+Wizard on this dev machine, *despite* the installed MicroManager's device
+interface version matching (75) -- ruling out the usual Goal-1-incident
+explanation (see above) up front, since that one requires a DIV mismatch and
+this one didn't have one.
+
+**Root cause, found by reading this machine's own real CoreLog rather than
+guessing**: `C:\Program Files\Micro-Manager-2.0\CoreLogs\CoreLog<ts>_pid<pid>.txt`
+(a real MM Studio session run on this machine earlier the same day, per
+timestamps) contained the actual Windows loader error, which the Hardware
+Config Wizard's plain "(unavailable)" never surfaces:
+
+```text
+Error: Unable to load ProphEBS library: Failed to load device adapter
+"ProphEBS" from "C:\Program Files\Micro-Manager-2.0\mmgr_dal_ProphEBS.dll"
+[ Failed to load module ... [ The module, or a module it depends upon, could
+not be found (Windows error: The specified module could not be found.) ] ]
+```
+
+`dumpbin /dependents` on the already-deployed DLL showed it statically
+imports `metavision_sdk_stream.dll` -- but this machine's actually-installed
+Metavision SDK (`metavision_software_info.exe -v` → **4.3.0**) has no such
+DLL at all; it ships `metavision_sdk_driver.dll` instead (confirmed via
+`metavision_software_info.exe`/directory listing of
+`C:\Program Files\Prophesee\bin`). This is a real Prophesee module rename
+between SDK generations, not a copy/paste or install mistake -- the
+"stream"-named module (used throughout this codebase's Goal 2+ history, per
+every earlier "Verified locally" entry above) apparently didn't exist yet,
+or existed under the "driver" name, in whatever SDK version 4.3.0
+corresponds to. **The already-deployed DLL was almost certainly built on a
+machine with a newer/different Metavision SDK than the one installed on
+*this* machine** -- a portability gap between build-time and load-time SDK
+versions, invisible to the DIV check entirely (DIV governs MMCore/adapter
+ABI compatibility; it says nothing about which Metavision SDK a given
+adapter binary was linked against).
+
+Rebuilding fresh from this repo's source, against this machine's *actual*
+installed SDK, surfaced the full scope of the gap -- not just one renamed
+module:
+
+1. `metavision/sdk/stream/camera.h` doesn't exist in 4.3.0; only
+   `metavision/sdk/driver/camera.h` does (same `Metavision::Camera` API,
+   confirmed by reading both headers' class declarations).
+2. `metavision/hal/facilities/i_event_rate_activity_filter_module.h` (Goal
+   8's `EBS-EventRateFilter-*` band-pass hysteresis filter) doesn't exist in
+   4.3.0 at all. The closest thing 4.3.0 has,
+   `i_event_rate_noise_filter_module.h`/`I_EventRateNoiseFilterModule`, is a
+   genuinely different, simpler API (one enable/disable + one
+   below-this-threshold-only cutoff, vs. four independent
+   lower/upper-bound-start/stop hysteresis thresholds) -- not a rename, a
+   real feature gap. Confirmed by reading the header directly rather than
+   assuming a naming difference.
+3. `metavision/hal/facilities/i_roi_pixel_mask.h` (Goal 7 hot-pixel
+   masking's secondary/"belt and suspenders" mechanism, per
+   `ApplyBlockedPixelsToHardware()`'s own comment) doesn't exist in 4.3.0
+   either, with no equivalent found anywhere in the installed header tree.
+4. `Metavision::Camera::get_facility<T>()` (the throwing, `T&`-returning
+   convenience method this codebase calls at ~40 call sites via
+   `cam_.get_facility<Metavision::X>()`) doesn't exist on 4.3.0's
+   `driver`-module `Camera` class at all -- only the lower-level
+   `Camera::get_device().get_facility<T>()` (non-throwing, `T*`, possibly
+   null) is available there, per that header's own doc comment. This is the
+   same throwing-vs-pointer distinction the Goal 2 design-decision note
+   above already discusses in the abstract ("Camera-level" vs
+   "Device-level") -- it turns out the "Camera-level" convenience is itself
+   version-gated, not just a stylistic choice between two always-available
+   options.
+
+**Fix, in order of how surgical each one could be**:
+
+- **Camera.h module + link library**: `ProphEBS.h` now picks
+  `metavision/sdk/stream/camera.h` (and links `metavision_sdk_stream(_d).lib`
+  via `#pragma comment(lib, ...)`) if that header exists
+  (`__has_include`), else falls back to `metavision/sdk/driver/camera.h` /
+  `metavision_sdk_driver(_d).lib`. `ProphEBS.vcxproj` no longer hardcodes
+  either name in `AdditionalDependencies` -- the pragma-comment in code picks
+  the one that actually matches whatever SDK is installed at build time.
+- **`get_facility` shape mismatch**: new private template method
+  `CProphEBSCamera::GetCamFacility<T>()` (`ProphEBS.h`, next to `cam_`)
+  normalizes both shapes to the same throwing-`T&` interface every call site
+  was already written against (wrapped in `try { ... } catch (const
+  std::exception&)` throughout) -- `cam_.get_facility<T>()` directly when
+  `PROPHEBS_CAMERA_HAS_GET_FACILITY` is defined (i.e. the `stream` module was
+  found), else `cam_.get_device().get_facility<T>()` with a manual null
+  check and `throw`. All ~40 call sites in `ProphEBS.cpp` mechanically
+  changed from `cam_.get_facility<Metavision::X>()` to
+  `GetCamFacility<Metavision::X>()` (identical text substitution, no
+  call-site-specific logic needed).
+- **`I_EventRateActivityFilterModule` (Goal 8 event-rate filter) and
+  `I_RoiPixelMask` (Goal 7 fallback)**: genuinely absent, not just
+  renamed -- gated behind `__has_include` in `ProphEBS.h`
+  (`PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER` /
+  `PROPHEBS_HAVE_ROI_PIXEL_MASK`), with every call site's `try` body wrapped
+  in the matching `#ifdef`/`#else throw std::runtime_error(...)/#endif` so
+  the surrounding (already-existing) `catch (const std::exception&)` handles
+  the "unsupported on this SDK" case exactly like it already handles
+  "unsupported on this sensor generation." **Deliberately not
+  reimplemented against `I_EventRateNoiseFilterModule`** -- that facility's
+  single-threshold semantics don't match what the four
+  `EBS-EventRateFilter-Lower/UpperStart/Stop` properties promise, and
+  silently remapping them would be actively misleading rather than
+  gracefully degraded. Net effect on a 4.3.0-linked build: the
+  `EBS-EventRateFilter-*` properties still exist (state-only, same as the
+  no-camera fallback path) but never reach real hardware; hot-pixel masking
+  still works via `I_DigitalEventMask` alone, which is what actually
+  enforces it on this Gen4.1/IMX636 sensor anyway.
+
+**Verified**: `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`
+now succeeds with 0 errors against this machine's real installed SDK
+(4.3.0). `dumpbin /dependents` on the freshly-built DLL confirmed it now
+imports `metavision_sdk_driver.dll`, not `metavision_sdk_stream.dll`.
+Copying it into `C:\Program Files\Micro-Manager-2.0\` and loading it via a
+raw `ctypes.WinDLL(...)` call (Python, with both `C:\Program Files\
+Micro-Manager-2.0` and `C:\Program Files\Prophesee\bin`/`third_party\bin`
+added via `os.add_dll_directory` -- the same two directories the real
+`ImageJ.exe` process already has on its inherited system `PATH`) succeeded
+where it previously failed with the exact `LoadLibrary`-style error recorded
+in the CoreLog. This confirms the dependency chain now resolves fully on
+this machine; a real Hardware Configuration Wizard / Device Property
+Browser pass in the actual MicroManager GUI is still the authoritative
+end-to-end check and is up to the user, per this project's established
+practice for anything GUI-shaped.
+
+### Open questions / TODO
+
+- If the user upgrades this machine's Metavision SDK to whatever version
+  the DLL was originally built against, the `EBS-EventRateFilter-*`
+  properties would need re-verification against real `I_EventRateActivityFilterModule`
+  hardware again (the `__has_include` gating means they'll just start
+  working again automatically on a rebuild against a newer SDK -- no code
+  change needed, only a rebuild).
+- Worth asking the user directly which Metavision SDK version they actually
+  want to standardize development on -- building against the oldest
+  supported version (like this machine's 4.3.0) maximizes portability across
+  lab machines at the cost of the two features noted above; building against
+  the newest maximizes feature coverage at the cost of portability. No
+  decision made yet either way; this fix makes the codebase buildable
+  against *either* generation, which sidesteps the question for now but
+  doesn't answer it.
+- Add a line to `docs/BUILD_AND_USAGE.md`'s troubleshooting table for this
+  specific symptom (DIV matches, still "(unavailable)", `dumpbin
+  /dependents` shows a missing `metavision_sdk_*`/HDF5/boost/protobuf DLL) --
+  distinct from the existing "Metavision SDK not on PATH at all" entry,
+  since here the SDK *is* installed and on `PATH`, just a different version
+  than whatever the DLL was linked against.

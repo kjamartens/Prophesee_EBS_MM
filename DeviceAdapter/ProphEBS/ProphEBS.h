@@ -112,18 +112,68 @@
 #include "DeviceThreads.h"
 #include "ImgBuffer.h"
 
+// Metavision renamed the module that provides Camera.h from "stream" to
+// "driver" (older SDKs, e.g. 4.3.0, ship metavision/sdk/driver/camera.h and
+// metavision_sdk_driver.lib; newer ones ship metavision/sdk/stream/camera.h
+// and metavision_sdk_stream.lib) -- pick whichever this installed SDK
+// actually has at compile time, and link the matching .lib automatically, so
+// a DLL built against one SDK version doesn't fail to load with a missing-
+// module error on a machine whose installed SDK uses the other name.
+#if __has_include(<metavision/sdk/stream/camera.h>)
 #include <metavision/sdk/stream/camera.h>
+#ifdef _DEBUG
+#pragma comment(lib, "metavision_sdk_stream_d.lib")
+#else
+#pragma comment(lib, "metavision_sdk_stream.lib")
+#endif
+// The "stream" module's Camera also grew a convenience get_facility<T>()
+// that throws and returns T& directly; the older "driver" module only has
+// the lower-level Camera::get_device().get_facility<T>(), which returns a
+// possibly-null T* instead (see GetCamFacility() below, which normalizes
+// both to the same throwing-T&-reference shape this file's try/catch-per-
+// facility pattern is written against).
+#define PROPHEBS_CAMERA_HAS_GET_FACILITY 1
+#else
+#include <metavision/sdk/driver/camera.h>
+#ifdef _DEBUG
+#pragma comment(lib, "metavision_sdk_driver_d.lib")
+#else
+#pragma comment(lib, "metavision_sdk_driver.lib")
+#endif
+#endif
 #include <metavision/hal/facilities/i_antiflicker_module.h>
 #include <metavision/hal/facilities/i_camera_synchronization.h>
 #include <metavision/hal/facilities/i_erc_module.h>
-#include <metavision/hal/facilities/i_event_rate_activity_filter_module.h>
 #include <metavision/hal/facilities/i_event_trail_filter_module.h>
 #include <metavision/hal/facilities/i_ll_biases.h>
 #include <metavision/hal/facilities/i_digital_event_mask.h>
 #include <metavision/hal/facilities/i_roi.h>
-#include <metavision/hal/facilities/i_roi_pixel_mask.h>
 #include <metavision/hal/facilities/i_trigger_in.h>
 #include <metavision/hal/facilities/i_trigger_out.h>
+
+// Both of these HAL facilities are absent entirely from some installed SDK
+// versions (confirmed missing in Metavision SDK 4.3.0 -- no renamed
+// equivalent either, unlike the stream/driver Camera module above):
+// - I_EventRateActivityFilterModule (Goal 8 EBS-EventRateFilter-* band-pass
+//   hysteresis filter). 4.3.0's closest facility,
+//   I_EventRateNoiseFilterModule, is a different, single-threshold API and
+//   not a drop-in replacement, so the feature is disabled rather than
+//   mis-implemented against it.
+// - I_RoiPixelMask (Goal 7 hot-pixel masking's secondary/"belt and
+//   suspenders" mechanism -- I_DigitalEventMask, still included above, is
+//   the facility that actually enforces the mask on this sensor generation
+//   per ApplyBlockedPixelsToHardware()'s own comment, so losing this one is
+//   cosmetic).
+// Gated so the adapter still builds (with these two features/fallbacks
+// silently absent) against an older SDK install instead of failing outright.
+#if __has_include(<metavision/hal/facilities/i_event_rate_activity_filter_module.h>)
+#include <metavision/hal/facilities/i_event_rate_activity_filter_module.h>
+#define PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER 1
+#endif
+#if __has_include(<metavision/hal/facilities/i_roi_pixel_mask.h>)
+#include <metavision/hal/facilities/i_roi_pixel_mask.h>
+#define PROPHEBS_HAVE_ROI_PIXEL_MASK 1
+#endif
 #include <metavision/sdk/cv/algorithms/activity_noise_filter_algorithm.h>
 
 #include <memory>
@@ -933,6 +983,27 @@ private:
    // Goal 2: real EBS connection state. cam_ is default-constructed (not
    // connected to anything) until ConnectToCamera() succeeds.
    Metavision::Camera cam_;
+
+   // Every facility lookup in this file is written as
+   // GetCamFacility<Metavision::I_Whatever>() inside a try/catch(const
+   // std::exception&) -- this normalizes the SDK-version split between
+   // Camera::get_facility<T>() (throwing T&, "stream"-module SDKs) and
+   // Camera::get_device().get_facility<T>() (possibly-null T*, "driver"-
+   // module SDKs) onto the same throwing-T&-reference shape, so call sites
+   // don't need to know which SDK generation is actually installed.
+   template <typename T>
+   T& GetCamFacility()
+   {
+#ifdef PROPHEBS_CAMERA_HAS_GET_FACILITY
+      return cam_.get_facility<T>();
+#else
+      T* f = cam_.get_device().get_facility<T>();
+      if (!f)
+         throw std::runtime_error("facility not available on this device");
+      return *f;
+#endif
+   }
+
    bool cameraConnected_;
    std::string connectionStatus_;
    std::string cameraModel_;

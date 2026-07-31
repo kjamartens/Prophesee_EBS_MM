@@ -90,7 +90,10 @@
       <DataExecutionPrevention>
       </DataExecutionPrevention>
       <AdditionalLibraryDirectories>$(MetavisionSdkRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Winmm.lib;metavision_hal_d.lib;metavision_sdk_base_d.lib;metavision_sdk_stream_d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- metavision_sdk_stream_d.lib / metavision_sdk_driver_d.lib is linked
+           via pragma comment(lib, ...) in ProphEBS.h, whichever the
+           installed SDK actually provides; see the comment there. -->
+      <AdditionalDependencies>Winmm.lib;metavision_hal_d.lib;metavision_sdk_base_d.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -116,7 +119,10 @@
       <DataExecutionPrevention>
       </DataExecutionPrevention>
       <AdditionalLibraryDirectories>$(MetavisionSdkRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Winmm.lib;metavision_hal.lib;metavision_sdk_base.lib;metavision_sdk_stream.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- metavision_sdk_stream.lib / metavision_sdk_driver.lib is linked via
+           pragma comment(lib, ...) in ProphEBS.h, whichever the installed
+           SDK actually provides; see the comment there. -->
+      <AdditionalDependencies>Winmm.lib;metavision_hal.lib;metavision_sdk_base.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
