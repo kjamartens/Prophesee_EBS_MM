@@ -52,9 +52,9 @@
 //                BuildAndSwapFrame() runs); CD events are accumulated
 //                per-polarity (onCounts_/offCounts_ instead of one merged
 //                counter) so EBS-ViewMode can render Merged/OnOnly/OffOnly/
-//                NetSigned (ON minus OFF); EBS-ViewOffset/EBS-ViewScale turn
-//                that raw per-pixel value into pixel = clamp(offset + raw *
-//                scale, 0, 255); and an optional software
+//                NetSigned (ON minus OFF); EBS-ViewOffset turns that raw
+//                per-pixel value into pixel = clamp(offset + raw, 0, 255);
+//                and an optional software
 //                Metavision::ActivityNoiseFilterAlgorithm
 //                (EBS-ActivityFilter-Enabled/-Threshold-us) can denoise the
 //                event stream before it's accumulated at all.
@@ -68,7 +68,7 @@
 //                closes) doesn't scale for a megapixel-class sensor, so
 //                window-close only resets the specific pixels actually
 //                touched since it opened (touchedIndices_). A new
-//                EBS-DisplayRefreshMs property decouples how often a frame
+//                EBS-ViewDisplayRefreshMs property decouples how often a frame
 //                is actually published (ProphEBSFrameBuilderThread) from
 //                how long each integration window is -- no point publishing
 //                faster than ~1 ms since nothing downstream can show it
@@ -83,16 +83,16 @@
 //                what's displayed, so the recorded .raw genuinely only
 //                contains the cropped region) and per-pixel hot-pixel
 //                masking via Metavision::I_RoiPixelMask, either edited by
-//                hand (EBS-BlockedPixels, a semicolon-separated list of
+//                hand (EBS-HotPixelBlockedPixels, a semicolon-separated list of
 //                "x,y" pairs in absolute sensor coordinates, unaffected by
 //                the active ROI) or found automatically by an on-demand
-//                calibration (EBS-DetectHotPixelsNow): first unblocks every
+//                calibration (EBS-HotPixelDetectNow): first unblocks every
 //                currently-masked pixel (so the scan measures a clean,
 //                full population), then a short window of streaming
 //                scoped to whatever ROI is currently active (not the whole
 //                chip), followed by a mean+k*stddev outlier threshold --
 //                computed separately per polarity (ON/OFF) -- over each
-//                pixel's own event count, replacing EBS-BlockedPixels with
+//                pixel's own event count, replacing EBS-HotPixelBlockedPixels with
 //                whatever's found (not merged -- see docs/DEVLOG.md for
 //                why re-blocking from a clean slate every run matters).
 //                See docs/DEVLOG.md at the repository root for the
@@ -250,21 +250,20 @@ const unsigned g_TestImageHeight = 480;
 //   OnOnly   -- onCount only
 //   OffOnly  -- offCount only
 //   NetSigned -- onCount - offCount (signed; the default -- see below)
-// then pixel = clamp(EBS-ViewOffset + raw * EBS-ViewScale, 0, 255).
-// NetSigned is the default view mode because a quiet pixel then sits at the
-// gray level EBS-ViewOffset (default 10) and net ON/OFF activity visibly
-// pushes it up/down from there -- this is the actual Goal 6 ask ("integrate
-// over whatever time is wanted, and show offset +- found events"); Merged
-// is kept selectable for the old Goal 3/5 look.
+// then pixel = clamp(EBS-ViewOffset + raw, 0, 255). NetSigned is the default
+// view mode because a quiet pixel then sits at the gray level EBS-ViewOffset
+// (default 100) and net ON/OFF activity visibly pushes it up/down from there
+// -- this is the actual Goal 6 ask ("integrate over whatever time is wanted,
+// and show offset +- found events"); Merged is kept selectable for the old
+// Goal 3/5 look. There used to be an EBS-ViewScale multiplier here too, but
+// it was removed as an unneeded extra control -- scale is always 1.
 extern const char* g_PropViewMode;
 extern const char* g_PropViewOffset;
-extern const char* g_PropViewScale;
 const char* const g_ViewModeMerged = "Merged";
 const char* const g_ViewModeOnOnly = "OnOnly";
 const char* const g_ViewModeOffOnly = "OffOnly";
 const char* const g_ViewModeNetSigned = "NetSigned";
-const long g_DefaultViewOffset = 10;
-const double g_DefaultViewScale = 1.0;
+const long g_DefaultViewOffset = 100;
 
 // Goal 6: software activity-noise filter (Metavision::
 // ActivityNoiseFilterAlgorithm), applied to each CD event batch in
@@ -277,7 +276,7 @@ const long g_DefaultActivityFilterThresholdUs = 10000;
 // Goal 6 follow-up: decouples "how long is one integration window" (Exposure,
 // now sub-millisecond capable -- see CProphEBSCamera::integrationTimeMs_ and
 // OnEventsCD()'s window-close logic) from "how often is a frame actually
-// published" (EBS-DisplayRefreshMs, backing displayRefreshMs_ -- what
+// published" (EBS-ViewDisplayRefreshMs, backing displayRefreshMs_ -- what
 // ProphEBSFrameBuilderThread now sleeps on instead of the integration time).
 // There is no value in publishing faster than about 1 ms since nothing
 // downstream (Live view, ImageJ, a human) can show it, hence the 1 ms floor.
@@ -305,7 +304,7 @@ const double g_IdleWindowTimeoutMs = 100.0;
 // actually consume -- causing an ever-growing display backlog/latency
 // instead of any visible sub-ms benefit. Fix: ignore the caller-supplied
 // interval entirely for unbounded (Live) sequences; instead push at
-// max(Exposure, EBS-LiveViewMinIntervalMs) -- Live view naturally follows
+// max(Exposure, EBS-ViewLiveMinIntervalMs) -- Live view naturally follows
 // Exposure like any other camera for normal exposure times, but never
 // faster than the floor once Exposure goes below it (there's no reason to
 // push more Live frames/sec than the GUI can actually display, whatever
@@ -325,13 +324,13 @@ const double g_DefaultLiveViewMinIntervalMs = 5.0;
 // microsecond-resolution) against how much wall-clock time has actually
 // elapsed since streaming started -- the difference is the callback's own
 // lag behind real time. Once that lag exceeds
-// EBS-BacklogFlushThresholdMs, rather than keep faithfully replaying every
+// EBS-AvgBacklogFlushThresholdMs, rather than keep faithfully replaying every
 // stale sub-window in the backlog (which is itself real CPU work that only
 // prolongs the slow recovery), the current window's accumulators are wiped
 // and re-anchored to "now" in one cheap O(sensor pixels) pass -- discarding
 // the stale backlog's per-pixel detail instead of laboriously draining it,
 // which is what actually lets the callback thread catch back up quickly.
-// EBS-CallbackLagMs/EBS-BacklogFlushCount are read-only diagnostics (pushed
+// EBS-AvgCallbackLagMs/EBS-AvgBacklogFlushCount are read-only diagnostics (pushed
 // on the existing Goal 5 stats cadence, see UpdateStats()) so this is
 // observable in the Device/Property Browser without rebuilding.
 extern const char* g_PropCallbackLagMs;
@@ -365,7 +364,7 @@ const double g_DefaultBacklogFlushThresholdMs = 250.0;
 // recoverable hardware condition.
 extern const char* g_PropBlockedPixels;
 
-// Goal 7: on-demand hot-pixel calibration. Setting EBS-DetectHotPixelsNow to
+// Goal 7: on-demand hot-pixel calibration. Setting EBS-HotPixelDetectNow to
 // "Run" synchronously (blocking the calling thread for
 // EBS-HotPixelCalibDurationMs) first unblocks every currently-masked pixel
 // (clears blockedPixels_ and pushes that to hardware) -- see
@@ -380,7 +379,7 @@ extern const char* g_PropBlockedPixels;
 // viewed/recorded. Accumulates a separate ROI-sized, per-polarity event
 // count (independent of onCounts_/offCounts_ -- see OnDetectHotPixelsNow()),
 // computes threshold = mean + EBS-HotPixelStddevK * stddev independently for
-// ON and OFF, and **replaces** EBS-BlockedPixels with every pixel that's an
+// ON and OFF, and **replaces** EBS-HotPixelBlockedPixels with every pixel that's an
 // outlier in either polarity (not merged -- per explicit user decision, a
 // deliberate change from this property's original merge-only design;
 // always converted back to absolute sensor coordinates before storing).
@@ -405,8 +404,8 @@ const double g_DefaultHotPixelStddevK = 10.0;
 // most-recent event (lastEventTimeUs_/lastEventPolarity_, full-sensor-sized,
 // updated directly in OnEventsCD() alongside onCounts_/offCounts_) and
 // BuildAndSwapFrame() renders brightness = sign * exp(-(now - lastEventT) /
-// EBS-TimeDecay-TimeConstant-us) through the same offset/scale formula the
-// other modes use. "now" is extrapolated forward from the latest processed
+// EBS-ViewModeTimeDecay_DecayTime_Constant-us) through the same offset formula
+// the other modes use. "now" is extrapolated forward from the latest processed
 // event's sensor timestamp (nowT_) by however much wall-clock time has
 // elapsed since (nowWallAnchor_) -- see BuildAndSwapFrame() -- so the decay
 // keeps advancing smoothly between event batches instead of only updating
@@ -453,7 +452,7 @@ extern const char* g_PropTriggerOutDutyCycle;
 // Incremented on the SDK's own ext_trigger callback thread (a single atomic
 // add per batch, same "off the hot path" shape as totalRawBytes_/
 // totalEventCount_); pushed to the GUI on the existing Goal 5 stats cadence
-// by UpdateStats(), same as EBS-CallbackLagMs/EBS-BacklogFlushCount.
+// by UpdateStats(), same as EBS-AvgCallbackLagMs/EBS-AvgBacklogFlushCount.
 extern const char* g_PropTriggerInCount;
 const long g_DefaultTriggerOutPeriodUs = 1000; // 1 kHz
 const double g_DefaultTriggerOutDutyCycle = 0.5;
@@ -595,14 +594,13 @@ public:
    // g_PropLiveViewMinIntervalMs and ProphEBSSequenceThread::svc().
    int OnLiveViewMinIntervalMs(MM::PropertyBase* pProp, MM::ActionType eAct);
 
-   // Goal 6: view-mode/offset/scale handlers -- see g_PropViewMode above for
-   // what each does. All three are plain atomic-backed settable properties;
-   // AfterSet writes are single-writer (MMCore serializes property sets) and
+   // Goal 6: view-mode/offset handlers -- see g_PropViewMode above for what
+   // each does. Both are plain atomic-backed settable properties; AfterSet
+   // writes are single-writer (MMCore serializes property sets) and
    // BuildAndSwapFrame() is the sole reader, so no additional locking is
    // needed beyond the atomics themselves.
    int OnViewMode(MM::PropertyBase* pProp, MM::ActionType eAct);
    int OnViewOffset(MM::PropertyBase* pProp, MM::ActionType eAct);
-   int OnViewScale(MM::PropertyBase* pProp, MM::ActionType eAct);
 
    // Goal 6: software activity-noise-filter handlers. Both guard
    // activityFilter_ (constructed only once StartEventStreaming() knows the
@@ -634,13 +632,13 @@ public:
 
    // Follow-up: settable threshold (see g_PropBacklogFlushThresholdMs) for
    // OnEventsCD()'s backlog detection -- plain atomic-backed, same shape as
-   // OnViewOffset()/OnViewScale() above. EBS-CallbackLagMs/EBS-BacklogFlushCount
+   // OnViewOffset() above. EBS-AvgCallbackLagMs/EBS-AvgBacklogFlushCount
    // are read-only and share OnStat() instead (added to its property list in
    // Initialize()), since they're pushed on the same stats cadence as the
    // Goal 5 live-stats properties.
    int OnBacklogFlushThresholdMs(MM::PropertyBase* pProp, MM::ActionType eAct);
 
-   // Goal 7: EBS-BlockedPixels handler -- BeforeGet serializes
+   // Goal 7: EBS-HotPixelBlockedPixels handler -- BeforeGet serializes
    // blockedPixels_, AfterSet parses the incoming string and, only if it's
    // entirely well-formed, replaces blockedPixels_ and pushes it to hardware
    // via ApplyBlockedPixelsToHardware(). See g_PropBlockedPixels for the
@@ -648,7 +646,7 @@ public:
    int OnBlockedPixels(MM::PropertyBase* pProp, MM::ActionType eAct);
 
    // Goal 7: triggers/reads back the on-demand hot-pixel calibration
-   // (EBS-DetectHotPixelsNow) and its two parameters. See
+   // (EBS-HotPixelDetectNow) and its two parameters. See
    // g_PropDetectHotPixelsNow for the full workflow -- OnDetectHotPixelsNow()
    // runs synchronously on whatever thread calls AfterSet.
    int OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionType eAct);
@@ -707,7 +705,7 @@ private:
    // "must be set before the camera starts" contract can ever be honored.
    void ApplySyncModeToHardware();
 
-   // Goal 7: creates EBS-BlockedPixels and the hot-pixel calibration
+   // Goal 7: creates EBS-HotPixelBlockedPixels and the hot-pixel calibration
    // properties. Called from Initialize() alongside the other
    // Create*Properties() methods, before the cameraConnected_ branch that
    // calls StartEventStreaming() -- these are hardware-backed the same way
@@ -734,7 +732,7 @@ private:
    // connects, just never touches hardware in the meantime).
    void ApplyBlockedPixelsToHardware();
 
-   // Goal 7: EBS-BlockedPixels string <-> blockedPixels_ conversion. Parse
+   // Goal 7: EBS-HotPixelBlockedPixels string <-> blockedPixels_ conversion. Parse
    // returns false (leaving out unchanged) on any malformed token or
    // out-of-range coordinate -- see g_PropBlockedPixels for why a malformed
    // string is rejected wholesale rather than partially applied.
@@ -777,18 +775,18 @@ private:
    // Follow-up: performs the actual backlog flush -- wipes onCounts_/
    // offCounts_/touchedIndices_, re-anchors windowStartT_ and the
    // streamWallStart_/streamSensorStart_ lag-tracking pair to (nowWall,
-   // eventT), and records the flush for the EBS-BacklogFlushCount/
-   // EBS-CallbackLagMs diagnostics. Caller must already hold
+   // eventT), and records the flush for the EBS-AvgBacklogFlushCount/
+   // EBS-AvgCallbackLagMs diagnostics. Caller must already hold
    // eventCountsLock_ (this never locks it itself), same convention as
    // CloseCurrentWindowLocked() above. Factored out of OnEventsCD() so it
    // can be called both at batch entry and, on a large/slow batch, from
    // partway through the per-event loop -- see OnEventsCD() for why a
    // batch-entry-only check let a single slow batch blow past
-   // EBS-BacklogFlushThresholdMs before ever getting flushed.
+   // EBS-AvgBacklogFlushThresholdMs before ever getting flushed.
    void FlushBacklogLocked(std::chrono::steady_clock::time_point nowWall,
       Metavision::timestamp eventT, double lagMs);
 
-   // Called by ProphEBSFrameBuilderThread every EBS-DisplayRefreshMs (Goal 6
+   // Called by ProphEBSFrameBuilderThread every EBS-ViewDisplayRefreshMs (Goal 6
    // follow-up -- decoupled from the Exposure/integration-window length):
    // first, if no window has closed for g_IdleWindowTimeoutMs (a quiet
    // scene), force-closes the stale window so the display resets to the
@@ -796,11 +794,22 @@ private:
    // copy of the per-polarity event-count accumulators (a copy, not a
    // reset-via-swap like Goal 6 -- window resets are now exclusively
    // CloseCurrentWindowLocked()'s job), renders them into backImg_ per the
-   // current EBS-ViewMode/-Offset/-Scale, then swaps front/back so
+   // current EBS-ViewMode/-Offset, applies the EBS-Transpose* corrections
+   // (see ApplyTransposeToBackBuffer()), then swaps front/back so
    // GetImageBuffer()/InsertImage() start returning the newly-built frame.
    // Readers of frontImg_ never see a partially-written
    // buffer because the frame builder only ever writes to backImg_.
    void BuildAndSwapFrame();
+
+   // Bug fix: applies the TransposeCorrection/-MirrorX/-MirrorY/-SwapXY
+   // properties (created automatically by CCameraBase, but previously
+   // inert -- MMCore itself does not apply them; each adapter must) to the
+   // naturally-oriented pixels the caller just computed, writing the
+   // (possibly mirrored/transposed) result into whichever ImgBuffer is
+   // passed as the target (backImg_ from BuildAndSwapFrame() during real
+   // streaming; frontImg_ from GenerateTestImage()/ApplyRoiToBuffers()'s
+   // no-camera fallback pattern). See the .cpp for the full rationale.
+   void ApplyTranspose(ImgBuffer* target, const std::vector<unsigned char>& natural, unsigned srcW, unsigned srcH);
 
    // Goal 4: builds a local staging raw-file path (Documents\
    // ProphEBS_Recordings\ProphEBS_<timestamp>.raw), creating the folder if
@@ -854,7 +863,7 @@ private:
    // now reads them every frame on ProphEBSFrameBuilderThread's own thread
    // while SetROI()/ClearROI() write them from whatever thread MMCore calls
    // the property/ROI system from -- same cross-thread read/write shape as
-   // viewMode_/viewOffset_/viewScale_ in Goal 6.
+   // viewMode_/viewOffset_ in Goal 6.
    std::atomic<unsigned> roiX_;
    std::atomic<unsigned> roiY_;
    std::atomic<unsigned> roiXSize_;
@@ -957,7 +966,7 @@ private:
    // and lag briefly went very negative (observed: -3210 ms) after an
    // active scene. A later, genuine burst then had to climb back up through
    // that entire negative deficit before crossing
-   // EBS-BacklogFlushThresholdMs again, silently defeating the threshold
+   // EBS-AvgBacklogFlushThresholdMs again, silently defeating the threshold
    // for however long that climb took. Fix: OnEventsCD() now re-anchors to
    // (nowWall, latestT) -- and clamps the reported lag to 0 -- any time the
    // computed lag is <= 0, not just on an explicit flush, so the metric
@@ -978,7 +987,7 @@ private:
    // interval's own processing time instead of the whole batch's.
    //
    // callbackLagMs_/backlogFlushCount_ back the read-only diagnostic
-   // properties (EBS-CallbackLagMs/EBS-BacklogFlushCount), pushed on the
+   // properties (EBS-AvgCallbackLagMs/EBS-AvgBacklogFlushCount), pushed on the
    // existing Goal 5 stats cadence by UpdateStats().
    std::chrono::steady_clock::time_point streamWallStart_;
    Metavision::timestamp streamSensorStart_;
@@ -1017,7 +1026,6 @@ private:
    // enum-atomic edge cases across compilers).
    std::atomic<int> viewMode_;
    std::atomic<double> viewOffset_;
-   std::atomic<double> viewScale_;
 
    // Goal 6: software activity-noise filter. Constructed only inside
    // StartEventStreaming() (needs sensorWidth_/sensorHeight_, known only
@@ -1064,7 +1072,14 @@ private:
    // above so OnErcEnabled() etc. have somewhere to read/write without
    // touching cam_.
    bool localErcEnabled_;
-   long localErcEventRate_;
+   // Goal 9 fix: was `long` (32-bit signed), but this sensor's own
+   // I_ErcModule::get_max_supported_cd_event_rate() can exceed INT32_MAX
+   // (observed 3.2 GEv/s on the connected IMX636) -- a value that large
+   // silently overflowed/truncated on its way through a `long`-typed
+   // CreateIntegerProperty, corrupting to an unrelated in-range value
+   // instead of being honored or cleanly rejected. double has more than
+   // enough precision for event-rate integers in this range.
+   double localErcEventRate_;
    bool localEventTrailFilterEnabled_;
    long localEventTrailFilterThreshold_;
    std::string localEventTrailFilterMode_;
@@ -1106,7 +1121,7 @@ private:
    // Goal 7: canonical blocked/hot-pixel list, always in absolute sensor
    // coordinates. blockedPixelsLock_ guards it against
    // OnDetectHotPixelsNow()'s calibration path racing a manual
-   // EBS-BlockedPixels edit (both can run on MMCore's calling thread, but
+   // EBS-HotPixelBlockedPixels edit (both can run on MMCore's calling thread, but
    // never concurrently with each other by construction -- this lock is
    // defensive, matching this file's general practice of never assuming a
    // property handler runs alone). hotPixelCalibDurationMs_/

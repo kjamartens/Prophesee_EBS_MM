@@ -55,10 +55,10 @@ const char* g_PropIntegrator = "EBS-Integrator";
 // Goal 4 recording property names.
 const char* g_PropRawFilePath = "EBS-RawFilePath";
 const char* g_PropRawRecordingStatus = "EBS-RawRecordingStatus";
-const char* g_PropTempFolder = "EBS-TempRecordingFolder";
+const char* g_PropTempFolder = "EBS-RawTempRecordingFolder";
 
 // Goal 5 property names.
-const char* g_PropBiasRangeCheckBypass = "EBS-BiasRangeCheckBypass";
+const char* g_PropBiasRangeCheckBypass = "EBS-biasRangeCheckBypass";
 
 const char* const g_FallbackBiasNames[6] = {
    "bias_diff", "bias_diff_off", "bias_diff_on", "bias_fo", "bias_hpf", "bias_refr"
@@ -92,29 +92,28 @@ const char* g_PropPixelDeadTime = "EBS-PixelDeadTime-us";
 // Goal 6 property names.
 const char* g_PropViewMode = "EBS-ViewMode";
 const char* g_PropViewOffset = "EBS-ViewOffset";
-const char* g_PropViewScale = "EBS-ViewScale";
 const char* g_PropActivityFilterEnabled = "EBS-ActivityFilter-Enabled";
 const char* g_PropActivityFilterThresholdUs = "EBS-ActivityFilter-Threshold-us";
 
 // Goal 6 follow-up property name.
-const char* g_PropDisplayRefreshMs = "EBS-DisplayRefreshMs";
+const char* g_PropDisplayRefreshMs = "EBS-ViewDisplayRefreshMs";
 
 // Bug-fix property name (Live-view push-cadence floor).
-const char* g_PropLiveViewMinIntervalMs = "EBS-LiveViewMinIntervalMs";
+const char* g_PropLiveViewMinIntervalMs = "EBS-ViewLiveMinIntervalMs";
 
 // Follow-up property names (backlog detection/flush -- see ProphEBS.h).
-const char* g_PropCallbackLagMs = "EBS-CallbackLagMs";
-const char* g_PropBacklogFlushCount = "EBS-BacklogFlushCount";
-const char* g_PropBacklogFlushThresholdMs = "EBS-BacklogFlushThresholdMs";
+const char* g_PropCallbackLagMs = "EBS-AvgCallbackLagMs";
+const char* g_PropBacklogFlushCount = "EBS-AvgBacklogFlushCount";
+const char* g_PropBacklogFlushThresholdMs = "EBS-AvgBacklogFlushThresholdMs";
 
-const char* g_PropBlockedPixels = "EBS-BlockedPixels";
-const char* g_PropDetectHotPixelsNow = "EBS-DetectHotPixelsNow";
+const char* g_PropBlockedPixels = "EBS-HotPixelBlockedPixels";
+const char* g_PropDetectHotPixelsNow = "EBS-HotPixelDetectNow";
 const char* g_PropHotPixelCalibDurationMs = "EBS-HotPixelCalibDurationMs";
 const char* g_PropHotPixelStddevK = "EBS-HotPixelStddevK";
 const char* g_PropHotPixelCalibStatus = "EBS-HotPixelCalibStatus";
 
 // Goal 8 property names.
-const char* g_PropTimeDecayTimeConstantUs = "EBS-TimeDecay-TimeConstant-us";
+const char* g_PropTimeDecayTimeConstantUs = "EBS-ViewModeTimeDecay_DecayTime_Constant-us";
 
 const char* g_PropTriggerInChannel = "EBS-TriggerIn-Channel";
 const char* g_PropTriggerInEnabled = "EBS-TriggerIn-Enabled";
@@ -695,7 +694,6 @@ CProphEBSCamera::CProphEBSCamera() :
    liveViewMinIntervalMs_(g_DefaultLiveViewMinIntervalMs),
    viewMode_(static_cast<int>(ProphEBSViewMode::NetSigned)),
    viewOffset_(static_cast<double>(g_DefaultViewOffset)),
-   viewScale_(g_DefaultViewScale),
    activityFilterEnabled_(false),
    activityFilterThresholdUs_(g_DefaultActivityFilterThresholdUs),
    streaming_(false),
@@ -925,7 +923,7 @@ int CProphEBSCamera::Initialize()
    CreateEventTrailFilterProperties();
    CreateAntiFlickerProperties();
 
-   // Goal 7: EBS-BlockedPixels + on-demand hot-pixel calibration properties.
+   // Goal 7: EBS-HotPixelBlockedPixels + on-demand hot-pixel calibration properties.
    // Created here (before the cameraConnected_ branch below) so they exist
    // and are hardware-backed the same way EBS-ERC-* etc. already are,
    // independent of whether streaming has started yet.
@@ -1006,14 +1004,6 @@ int CProphEBSCamera::Initialize()
    if (DEVICE_OK != nRet)
       return nRet;
 
-   nRet = CreateFloatProperty(g_PropViewScale, g_DefaultViewScale, false,
-      new CPropertyAction(this, &CProphEBSCamera::OnViewScale));
-   if (DEVICE_OK != nRet)
-      return nRet;
-   nRet = SetPropertyLimits(g_PropViewScale, 0.01, 1000.0);
-   if (DEVICE_OK != nRet)
-      return nRet;
-
    nRet = CreateStringProperty(g_PropActivityFilterEnabled, "Off", false,
       new CPropertyAction(this, &CProphEBSCamera::OnActivityFilterEnabled));
    if (DEVICE_OK != nRet)
@@ -1083,7 +1073,7 @@ void CProphEBSCamera::ConnectToCamera()
 {
    try
    {
-      // Goal 5: EBS-BiasRangeCheckBypass is a pre-init property (see the
+      // Goal 5: EBS-biasRangeCheckBypass is a pre-init property (see the
       // constructor), so it's safe to read here -- it can no longer change
       // once Initialize()/ConnectToCamera() runs. Mirrors Metavision
       // Studio's "bypass biases range check" checkbox.
@@ -1240,7 +1230,7 @@ int CProphEBSCamera::OnBias(MM::PropertyBase* pProp, MM::ActionType eAct)
             // The allowed range reported by LL_Bias_Info::get_bias_range()
             // (used for SetPropertyLimits() in CreateBiasProperties(), which
             // widens to the full allowed range when
-            // EBS-BiasRangeCheckBypass is On) is not always what the
+            // EBS-biasRangeCheckBypass is On) is not always what the
             // sensor's own firmware will actually accept: biases.set() can
             // return true (no rejection) while silently clamping to a
             // tighter, firmware-internal safety limit -- e.g. bias_refr's
@@ -1256,7 +1246,7 @@ int CProphEBSCamera::OnBias(MM::PropertyBase* pProp, MM::ActionType eAct)
                LogMessage("ProphEBS: bias " + biasName + " was set to " + std::to_string(value) +
                   " but the hardware clamped it to " + std::to_string(actual) +
                   " (a firmware-level safety limit, tighter than the allowed range reported by "
-                  "the SDK even with EBS-BiasRangeCheckBypass On)", false);
+                  "the SDK even with EBS-biasRangeCheckBypass On)", false);
                pProp->Set(static_cast<long>(actual));
             }
          }
@@ -1294,7 +1284,10 @@ void CProphEBSCamera::CreateErcProperties()
    AddAllowedValue(g_PropErcEnabled, "On");
 
    CPropertyAction* pActRate = new CPropertyAction(this, &CProphEBSCamera::OnErcEventRate);
-   CreateIntegerProperty(g_PropErcEventRate, localErcEventRate_, false, pActRate);
+   // Goal 9 fix: Float, not Integer -- see the comment on localErcEventRate_
+   // in ProphEBS.h for why (this sensor's max supported rate can exceed
+   // what a 32-bit long can hold).
+   CreateFloatProperty(g_PropErcEventRate, localErcEventRate_, false, pActRate);
 
    if (cameraConnected_)
    {
@@ -1360,11 +1353,11 @@ int CProphEBSCamera::OnErcEventRate(MM::PropertyBase* pProp, MM::ActionType eAct
          Metavision::I_ErcModule& erc = cam_.get_facility<Metavision::I_ErcModule>();
          if (eAct == MM::BeforeGet)
          {
-            pProp->Set(static_cast<long>(erc.get_cd_event_rate()));
+            pProp->Set(static_cast<double>(erc.get_cd_event_rate()));
          }
          else if (eAct == MM::AfterSet)
          {
-            long value;
+            double value;
             pProp->Get(value);
             erc.set_cd_event_rate(static_cast<uint32_t>(value));
          }
@@ -2409,7 +2402,7 @@ void CProphEBSCamera::ApplySyncModeToHardware()
 }
 
 /**
- * Goal 7: creates EBS-BlockedPixels and the hot-pixel calibration
+ * Goal 7: creates EBS-HotPixelBlockedPixels and the hot-pixel calibration
  * properties. Called from Initialize() alongside the other
  * Create*Properties() methods, before the cameraConnected_ branch below
  * calls StartEventStreaming().
@@ -2466,7 +2459,7 @@ int CProphEBSCamera::OnHotPixelStddevK(MM::PropertyBase* pProp, MM::ActionType e
 }
 
 /**
- * Goal 7: EBS-BlockedPixels serialization -- "x:y" pairs separated by ';',
+ * Goal 7: EBS-HotPixelBlockedPixels serialization -- "x:y" pairs separated by ';',
  * e.g. "120:340;121:341". Always absolute sensor coordinates. Uses ':'
  * (not ',') between x and y -- see g_PropBlockedPixels for why: MMCore
  * itself rejects any property value containing a comma (found while
@@ -2486,7 +2479,7 @@ std::string CProphEBSCamera::SerializeBlockedPixels() const
 }
 
 /**
- * Parses the EBS-BlockedPixels format. Returns false (leaving out
+ * Parses the EBS-HotPixelBlockedPixels format. Returns false (leaving out
  * unchanged) on any malformed token or out-of-range coordinate (checked
  * against sensorWidth_/sensorHeight_ only when cameraConnected_, since the
  * no-hardware fallback geometry is just the test-image size) -- the whole
@@ -2557,7 +2550,7 @@ bool CProphEBSCamera::ParseBlockedPixels(const std::string& text,
  * ones (in blockedPixels_'s own order -- existing/manually-set entries
  * first, then calibration-found ones in the hotness order
  * OnDetectHotPixelsNow() built) actually get masked; the rest remain
- * listed in EBS-BlockedPixels but aren't hardware-enforced, logged so
+ * listed in EBS-HotPixelBlockedPixels but aren't hardware-enforced, logged so
  * this isn't silently invisible.
  *
  * No-op (state-only) if !cameraConnected_ -- the list is still remembered
@@ -2587,7 +2580,7 @@ void CProphEBSCamera::ApplyBlockedPixelsToHardware()
       }
       digitalMaskApplied = true;
       if (blockedPixels_.size() > slots.size())
-         LogMessage("ProphEBS: EBS-BlockedPixels has " + std::to_string(blockedPixels_.size()) +
+         LogMessage("ProphEBS: EBS-HotPixelBlockedPixels has " + std::to_string(blockedPixels_.size()) +
             " entries, but this sensor's I_DigitalEventMask only has " + std::to_string(slots.size()) +
             " hardware mask slots -- only the first " + std::to_string(slots.size()) +
             " are actually being suppressed", false);
@@ -2635,7 +2628,7 @@ int CProphEBSCamera::OnBlockedPixels(MM::PropertyBase* pProp, MM::ActionType eAc
       std::string error;
       if (!ParseBlockedPixels(value, parsed, error))
       {
-         LogMessage("ProphEBS: rejected EBS-BlockedPixels value: " + error, false);
+         LogMessage("ProphEBS: rejected EBS-HotPixelBlockedPixels value: " + error, false);
          // Reject the whole string -- restore the previous (still valid)
          // value so the Property Browser doesn't show the bad input as if
          // it had taken effect.
@@ -2653,7 +2646,7 @@ int CProphEBSCamera::OnBlockedPixels(MM::PropertyBase* pProp, MM::ActionType eAc
 
 /**
  * Goal 7: on-demand hot-pixel calibration, triggered by setting
- * EBS-DetectHotPixelsNow to "Run". Runs synchronously on the calling
+ * EBS-HotPixelDetectNow to "Run". Runs synchronously on the calling
  * thread -- there is no precedent in this codebase for a property handler
  * spawning a throwaway thread, and the calibration window is short and
  * user-configured (EBS-HotPixelCalibDurationMs). See g_PropDetectHotPixelsNow
@@ -2699,7 +2692,7 @@ int CProphEBSCamera::OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionTyp
    // outliers (especially visible in a small ROI with few real events to
    // begin with). Clearing first guarantees every run's statistics come
    // from the same full, honest population, and this also means the result
-   // below fully *replaces* EBS-BlockedPixels rather than merging into it
+   // below fully *replaces* EBS-HotPixelBlockedPixels rather than merging into it
    // -- calibration is now a clean "redetect from scratch" every time, not
    // an accumulate-forever union. A pixel added by hand right before
    // running calibration will *not* survive a calibration run -- that's
@@ -2792,7 +2785,7 @@ int CProphEBSCamera::OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionTyp
       // this run's result *replaces* it outright -- there is no existing
       // list to merge into or exclude candidates against anymore. Still
       // capped on two independent budgets: (1) the serialized
-      // EBS-BlockedPixels string can never exceed MMCore's
+      // EBS-HotPixelBlockedPixels string can never exceed MMCore's
       // MM::MaxStrLength (1024) property-value limit -- found via
       // self-testing with a deliberately loose threshold, which flagged
       // tens of thousands of "hot" pixels and silently truncated the
@@ -2830,7 +2823,7 @@ int CProphEBSCamera::OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionTyp
          if (onExcess <= 0.0 && offExcess <= 0.0)
             continue;
          // idx is ROI-local -- convert back to absolute sensor coordinates
-         // (what EBS-BlockedPixels/I_RoiPixelMask both expect) before
+         // (what EBS-HotPixelBlockedPixels/I_RoiPixelMask both expect) before
          // storing.
          std::pair<unsigned, unsigned> px{
             roiX + static_cast<unsigned>(idx % roiW), roiY + static_cast<unsigned>(idx / roiW) };
@@ -2862,7 +2855,7 @@ int CProphEBSCamera::OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionTyp
          ? std::string("no hardware slot limit known") : (std::to_string(hardwareSlotCap) + "-slot I_DigitalEventMask limit");
       LogMessage("ProphEBS: hot-pixel calibration found " + std::to_string(foundCount + skippedCount) +
          " outlier pixels but only " + std::to_string(foundCount) +
-         " fit within EBS-BlockedPixels' property-length limit and/or this sensor's " + slotDesc +
+         " fit within EBS-HotPixelBlockedPixels' property-length limit and/or this sensor's " + slotDesc +
          " -- " + std::to_string(skippedCount) +
          " were dropped this run (a lower EBS-HotPixelStddevK finds fewer, more significant outliers)",
          false);
@@ -2988,21 +2981,6 @@ int CProphEBSCamera::OnViewOffset(MM::PropertyBase* pProp, MM::ActionType eAct)
    return DEVICE_OK;
 }
 
-int CProphEBSCamera::OnViewScale(MM::PropertyBase* pProp, MM::ActionType eAct)
-{
-   if (eAct == MM::BeforeGet)
-   {
-      pProp->Set(viewScale_.load());
-   }
-   else if (eAct == MM::AfterSet)
-   {
-      double value;
-      pProp->Get(value);
-      viewScale_ = value;
-   }
-   return DEVICE_OK;
-}
-
 /**
  * Goal 6: software activity-noise filter enable/threshold handlers. Both
  * guard activityFilter_ under activityFilterLock_ -- the same lock
@@ -3051,7 +3029,7 @@ int CProphEBSCamera::OnActivityFilterThreshold(MM::PropertyBase* pProp, MM::Acti
 
 // Goal 8: time-decay view mode's characteristic decay time -- plain
 // atomic-backed, no hardware/lock interaction (BuildAndSwapFrame() is the
-// sole reader), same shape as OnViewOffset()/OnViewScale().
+// sole reader), same shape as OnViewOffset().
 int CProphEBSCamera::OnTimeDecayTimeConstant(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
    if (eAct == MM::BeforeGet)
@@ -3262,7 +3240,7 @@ void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavis
          // "known caught up" reference point, rather than letting the
          // metric accumulate a negative credit that a later, genuine burst
          // would first have to climb back out of before crossing
-         // EBS-BacklogFlushThresholdMs again.
+         // EBS-AvgBacklogFlushThresholdMs again.
          streamWallStart_ = wallNow;
          streamSensorStart_ = eventT;
          lag = 0.0;
@@ -3396,7 +3374,7 @@ void CProphEBSCamera::CloseCurrentWindowLocked(bool fromEvent, Metavision::times
 }
 
 /**
- * Called by ProphEBSFrameBuilderThread every EBS-DisplayRefreshMs -- Goal 6
+ * Called by ProphEBSFrameBuilderThread every EBS-ViewDisplayRefreshMs -- Goal 6
  * follow-up: decoupled from the Exposure/integration-window length
  * (integrationTimeMs_), since publishing faster than the display can show
  * is pure overhead. First, if no window has closed for
@@ -3408,7 +3386,8 @@ void CProphEBSCamera::CloseCurrentWindowLocked(bool fromEvent, Metavision::times
  * window resets are now exclusively CloseCurrentWindowLocked()'s job, so
  * BuildAndSwapFrame() must not clear onCounts_/offCounts_ itself), renders
  * them into backImg_ as an 8-bit grayscale frame according to the current
- * EBS-ViewMode/EBS-ViewOffset/EBS-ViewScale, then swaps front/back under
+ * EBS-ViewMode/EBS-ViewOffset (and the EBS-Transpose* corrections -- see
+ * ApplyTransposeToBackBuffer()), then swaps front/back under
  * frontImgLock_ so subsequent GetImageBuffer()/InsertImage() calls return
  * the newly-built frame. backImg_ (the old frontImg_) is only written again
  * on the next call to this function, so readers of frontImg_ never see a
@@ -3449,7 +3428,6 @@ void CProphEBSCamera::BuildAndSwapFrame()
 
    ProphEBSViewMode mode = static_cast<ProphEBSViewMode>(viewMode_.load());
    double offset = viewOffset_.load();
-   double scale = viewScale_.load();
 
    unsigned roiX = roiX_.load();
    unsigned roiY = roiY_.load();
@@ -3474,10 +3452,15 @@ void CProphEBSCamera::BuildAndSwapFrame()
       std::chrono::steady_clock::now() - nowWallAnchor).count();
    double nowEffectiveUs = static_cast<double>(nowT) + wallElapsedUs;
 
-   unsigned char* pixels = backImg_->GetPixelsRW();
+   // Rendered into a local, untransformed (natural sensor orientation)
+   // buffer first -- the EBS-TransposeMirrorX/Y/SwapXY properties (see
+   // ApplyTransposeToBackBuffer() below) are applied as a separate pass
+   // once the whole frame is known, rather than computing transformed
+   // indices inline here.
+   std::vector<unsigned char> natural(static_cast<size_t>(outW) * outH);
    for (unsigned j = 0; j < outH; j++)
    {
-      unsigned char* outRow = pixels + static_cast<size_t>(j) * outW;
+      unsigned char* outRow = natural.data() + static_cast<size_t>(j) * outW;
       for (unsigned i = 0; i < outW; i++)
       {
          double raw;
@@ -3538,7 +3521,7 @@ void CProphEBSCamera::BuildAndSwapFrame()
             }
          }
 
-         double value = offset + raw * scale;
+         double value = offset + raw;
          if (value < 0.0)
             value = 0.0;
          else if (value > 255.0)
@@ -3547,9 +3530,71 @@ void CProphEBSCamera::BuildAndSwapFrame()
       }
    }
 
+   ApplyTranspose(backImg_, natural, outW, outH);
+
    {
       MMThreadGuard g(frontImgLock_);
       std::swap(frontImg_, backImg_);
+   }
+}
+
+/**
+ * Bug fix: the four EBS-Transpose* properties MM::CCameraBase creates
+ * automatically (Correction/MirrorX/MirrorY/SwapXY) previously existed as
+ * settable properties with no effect on the actual image, since MMCore
+ * itself does not apply them -- each camera adapter is responsible for its
+ * own pixel transform (confirmed against MMCore, which has no "Transpose"
+ * handling at all; e.g. the ABS adapter applies these the same way, gated
+ * on Correction). EBS-TransposeCorrection is the master switch: mirroring/
+ * swapping is applied only when it's "1", matching that convention.
+ * SwapXY changes the published width/height (finalW/finalH below), so
+ * the target buffer is resized here rather than relying on
+ * ApplyRoiToBuffers() (which only knows about ROI/binning, not transpose)
+ * -- a transient one-frame mismatch is possible if ROI/binning and
+ * transpose change on the same frame, but the next frame (BuildAndSwapFrame()
+ * for real streaming, ApplyRoiToBuffers() for the no-hardware fallback
+ * pattern) always corrects it. Used for both backImg_ (BuildAndSwapFrame(),
+ * real streaming) and frontImg_ (GenerateTestImage()/ApplyRoiToBuffers()'s
+ * no-camera fallback checkerboard) -- hence the explicit target parameter
+ * rather than always writing to backImg_. Note the no-camera path only
+ * re-renders on Initialize()/a ROI or binning change (there is no periodic
+ * frame-builder thread without a real camera to pick up a bare Transpose*
+ * property change on its own) -- toggling Transpose* with no camera
+ * connected takes visible effect at the next ROI/binning change, same as
+ * any other view-rendering property in that fallback path.
+ */
+void CProphEBSCamera::ApplyTranspose(ImgBuffer* target, const std::vector<unsigned char>& natural,
+   unsigned srcW, unsigned srcH)
+{
+   bool correctionOn = IsPropertyEqualTo(MM::g_Keyword_Transpose_Correction, "1");
+   bool mirrorX = correctionOn && IsPropertyEqualTo(MM::g_Keyword_Transpose_MirrorX, "1");
+   bool mirrorY = correctionOn && IsPropertyEqualTo(MM::g_Keyword_Transpose_MirrorY, "1");
+   bool swapXY = correctionOn && IsPropertyEqualTo(MM::g_Keyword_Transpose_SwapXY, "1");
+
+   unsigned finalW = swapXY ? srcH : srcW;
+   unsigned finalH = swapXY ? srcW : srcH;
+   target->Resize(finalW, finalH, 1);
+   unsigned char* dst = target->GetPixelsRW();
+
+   if (!mirrorX && !mirrorY && !swapXY)
+   {
+      memcpy(dst, natural.data(), static_cast<size_t>(srcW) * srcH);
+      return;
+   }
+
+   for (unsigned j = 0; j < srcH; j++)
+   {
+      unsigned dj = mirrorY ? (srcH - 1 - j) : j;
+      const unsigned char* srcRow = natural.data() + static_cast<size_t>(j) * srcW;
+      for (unsigned i = 0; i < srcW; i++)
+      {
+         unsigned di = mirrorX ? (srcW - 1 - i) : i;
+         unsigned char value = srcRow[i];
+         if (swapXY)
+            dst[static_cast<size_t>(di) * finalW + dj] = value;
+         else
+            dst[static_cast<size_t>(dj) * finalW + di] = value;
+      }
    }
 }
 
@@ -3680,7 +3725,7 @@ int CProphEBSCamera::OnStat(MM::PropertyBase* pProp, MM::ActionType eAct)
 /**
  * Follow-up: settable threshold for OnEventsCD()'s backlog detection -- see
  * g_PropBacklogFlushThresholdMs. Plain atomic-backed, same shape as
- * OnViewOffset()/OnViewScale().
+ * OnViewOffset().
  */
 int CProphEBSCamera::OnBacklogFlushThresholdMs(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
@@ -3699,7 +3744,7 @@ int CProphEBSCamera::OnBacklogFlushThresholdMs(MM::PropertyBase* pProp, MM::Acti
 
 /**
  * Builds <folder>\ProphEBS_<timestamp>.raw, creating the folder if needed.
- * <folder> is EBS-TempRecordingFolder if the user has set it, else
+ * <folder> is EBS-RawTempRecordingFolder if the user has set it, else
  * Documents\ProphEBS_Recordings under the current user's profile (falling
  * back to a relative "ProphEBS_Recordings" if USERPROFILE isn't set
  * either). This is always the actual recording destination when
@@ -3963,8 +4008,7 @@ void CProphEBSCamera::StopRawRecordingIfActive()
  */
 void CProphEBSCamera::GenerateTestImage()
 {
-   frontImg_->Resize(g_TestImageWidth, g_TestImageHeight, 1);
-   unsigned char* pixels = frontImg_->GetPixelsRW();
+   std::vector<unsigned char> natural(static_cast<size_t>(g_TestImageWidth) * g_TestImageHeight);
 
    const unsigned checkerSize = 32;
    for (unsigned y = 0; y < g_TestImageHeight; y++)
@@ -3973,9 +4017,11 @@ void CProphEBSCamera::GenerateTestImage()
       {
          bool checker = ((x / checkerSize) + (y / checkerSize)) % 2 == 0;
          unsigned char gradient = static_cast<unsigned char>((x * 255) / (g_TestImageWidth - 1));
-         pixels[y * g_TestImageWidth + x] = checker ? gradient : static_cast<unsigned char>(255 - gradient);
+         natural[y * g_TestImageWidth + x] = checker ? gradient : static_cast<unsigned char>(255 - gradient);
       }
    }
+
+   ApplyTranspose(frontImg_, natural, g_TestImageWidth, g_TestImageHeight);
 }
 
 int CProphEBSCamera::SnapImage()
@@ -4152,7 +4198,7 @@ void CProphEBSCamera::ApplyRoiToBuffers()
 
    if (!cameraConnected_)
    {
-      unsigned char* pixels = frontImg_->GetPixelsRW();
+      std::vector<unsigned char> natural(static_cast<size_t>(w) * h);
       const unsigned checkerSize = 32;
       for (unsigned j = 0; j < h; j++)
       {
@@ -4162,9 +4208,10 @@ void CProphEBSCamera::ApplyRoiToBuffers()
             unsigned sensorX = x + i * bin;
             bool checker = ((sensorX / checkerSize) + (sensorY / checkerSize)) % 2 == 0;
             unsigned char gradient = static_cast<unsigned char>((sensorX * 255) / (sensorWidth_ - 1));
-            pixels[j * w + i] = checker ? gradient : static_cast<unsigned char>(255 - gradient);
+            natural[j * w + i] = checker ? gradient : static_cast<unsigned char>(255 - gradient);
          }
       }
+      ApplyTranspose(frontImg_, natural, w, h);
    }
 }
 
@@ -4341,7 +4388,7 @@ int ProphEBSSequenceThread::svc()
          // Bug fix: for an unbounded (Live view) sequence, intervalMs_ is
          // whatever MMCore's "unused" startContinuousSequenceAcquisition
          // parameter happened to be -- per MMCore's own contract, devices
-         // must ignore it. Use max(Exposure, EBS-LiveViewMinIntervalMs)
+         // must ignore it. Use max(Exposure, EBS-ViewLiveMinIntervalMs)
          // instead (see g_PropLiveViewMinIntervalMs for the full story):
          // Live view naturally follows Exposure like any other camera for
          // normal exposure times, but never faster than the floor once

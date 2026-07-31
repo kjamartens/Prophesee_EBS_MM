@@ -413,7 +413,7 @@ configure before clicking Acquire!. Two properties are involved:
 |---|---|
 | `EBS-RawFilePath` | Manual override. Leave empty (the default) for fully automatic behavior. Set it to a specific path to use that instead, skipping auto-discovery entirely. |
 | `EBS-RawRecordingStatus` | Read-write status the adapter itself updates: `Not recording`, `Recording to <path>`, `Finished: <path>`, or `Failed: <reason>`. Check this after an acquisition to confirm the `.raw` file was actually written, and where. |
-| `EBS-TempRecordingFolder` | Where recordings land when the MDA folder can't be determined (e.g. "Save images" unchecked, or auto-discovery fails) — also used as a brief staging spot in some direct-streaming edge cases. Leave empty for the default (`Documents\ProphEBS_Recordings\`), or set it to any folder you'd rather use instead. |
+| `EBS-RawTempRecordingFolder` | Where recordings land when the MDA folder can't be determined (e.g. "Save images" unchecked, or auto-discovery fails) — also used as a brief staging spot in some direct-streaming edge cases. Leave empty for the default (`Documents\ProphEBS_Recordings\`), or set it to any folder you'd rather use instead. |
 
 Recording only triggers for a **finite** sequence acquisition (i.e. an MDA
 with a fixed number of frames, like "10 frames at 100 ms") — not for Live
@@ -493,7 +493,7 @@ inspectable/testable without an EBS attached.
 
 | Property group | Properties |
 |---|---|
-| Bias range check | `EBS-BiasRangeCheckBypass` (**pre-init only** — set before "Add Device"/`initializeDevice`, greyed out afterward; mirrors Metavision Studio's "bypass biases range check" checkbox) |
+| Bias range check | `EBS-biasRangeCheckBypass` (**pre-init only** — set before "Add Device"/`initializeDevice`, greyed out afterward; mirrors Metavision Studio's "bypass biases range check" checkbox) |
 | Biases | One `EBS-bias_*` Integer property per bias the sensor reports (e.g. `EBS-bias_diff`, `EBS-bias_diff_off`, `EBS-bias_diff_on`, `EBS-bias_fo`, `EBS-bias_hpf`, `EBS-bias_refr` on the IMX636) — each range-limited to what the hardware actually supports |
 | Event rate control (ERC) | `EBS-ERC-Enabled` (Off/On, default Off), `EBS-ERC-EventRate` (default 50,000,000 events/s) |
 | Event trail (STC) filter | `EBS-EventTrailFilter-Enabled` (Off/On, default Off), `-Threshold` (default 10,000 µs), `-Mode` (`TRAIL`/`STC_CUT_TRAIL`/`STC_KEEP_TRAIL`, default `TRAIL`) |
@@ -542,13 +542,14 @@ window, ×32 brightness" behavior from Goal 3. Four things changed:
 | Property | Meaning |
 |---|---|
 | `Exposure` | MicroManager's own standard exposure control **is** the event-integration window now — set it like you would on any camera (Device/Property Browser, MDA dialog, or a script's `setExposure()`). Can go down to **0.001 ms (1 microsecond)** — see the sub-millisecond note below — and changes take effect on the very next event, no restart needed. |
-| `EBS-DisplayRefreshMs` | How often the live image is actually published/refreshed (default **1 ms**), separate from `Exposure`. There's no benefit setting this below ~1 ms since nothing downstream (Live view, a human eye) can show it any faster — this just controls how often the displayed frame updates, independent of how short each integration window is. |
-| `EBS-LiveViewMinIntervalMs` | Floor (default **5 ms**) on how fast MicroManager's **Live** view specifically is allowed to push new frames. Live view otherwise follows `Exposure` directly (like any normal camera) — this floor only kicks in once `Exposure` drops below it, since pushing Live frames faster than the GUI can actually display them just causes a growing display backlog/delay, not a smoother picture. Doesn't affect Snap or Multi-D Acquisition, only continuous Live streaming. |
+| `EBS-ViewDisplayRefreshMs` | How often the live image is actually published/refreshed (default **1 ms**), separate from `Exposure`. There's no benefit setting this below ~1 ms since nothing downstream (Live view, a human eye) can show it any faster — this just controls how often the displayed frame updates, independent of how short each integration window is. |
+| `EBS-ViewLiveMinIntervalMs` | Floor (default **5 ms**) on how fast MicroManager's **Live** view specifically is allowed to push new frames. Live view otherwise follows `Exposure` directly (like any normal camera) — this floor only kicks in once `Exposure` drops below it, since pushing Live frames faster than the GUI can actually display them just causes a growing display backlog/delay, not a smoother picture. Doesn't affect Snap or Multi-D Acquisition, only continuous Live streaming. |
 | `EBS-ViewMode` | Which per-pixel quantity is rendered: `NetSigned` (default) shows ON-event-count minus OFF-event-count, signed; `Merged` is the old Goal 3/5 look (ON+OFF combined); `OnOnly`/`OffOnly` show just one polarity. |
-| `EBS-ViewOffset` | The gray level a quiet (no-activity) pixel sits at — default **10**. In `NetSigned` mode this is what lets net OFF activity show up as *darker than* this baseline instead of being clipped to 0. |
-| `EBS-ViewScale` | Multiplier applied to the raw per-pixel count before adding the offset — default **1**. Turn this up if the live image looks too dim; down if it's saturating to white. |
+| `EBS-ViewOffset` | The gray level a quiet (no-activity) pixel sits at — default **100**. In `NetSigned` mode this is what lets net OFF activity show up as *darker than* this baseline instead of being clipped to 0. |
 
-Formula: `pixel = clamp(EBS-ViewOffset + raw_count × EBS-ViewScale, 0, 255)`.
+Formula: `pixel = clamp(EBS-ViewOffset + raw_count, 0, 255)`. (There used to be
+an `EBS-ViewScale` multiplier here too; removed as an unneeded extra control
+— scale is always 1.)
 
 **Sub-millisecond `Exposure` note**: internally, the integration window is
 now measured against the sensor's own event timestamps (microsecond
@@ -557,13 +558,13 @@ work — tested down to the 0.001 ms (1 µs) floor on real hardware at ~10
 million events/second with no issues. If the sensor's scene goes fully
 quiet (no events at all) for about 100 ms, the display automatically resets
 to the `EBS-ViewOffset` baseline rather than freezing on the last frame.
-If you drop `Exposure` below `EBS-LiveViewMinIntervalMs` while **Live** is
+If you drop `Exposure` below `EBS-ViewLiveMinIntervalMs` while **Live** is
 running, the live feed itself won't refresh faster than that floor (even
 though the integration window internally is that short) — this is
 intentional, since MicroManager's own display/GUI can't usefully show
 updates faster than a few milliseconds anyway, and trying to push faster
 than that just builds up a growing display delay instead of a smoother
-picture. Lower `EBS-LiveViewMinIntervalMs` if you want to test pushing
+picture. Lower `EBS-ViewLiveMinIntervalMs` if you want to test pushing
 Live view harder, but don't expect it to help once you're faster than the
 GUI can actually draw.
 
@@ -574,6 +575,18 @@ Goal 5 hardware event-trail (STC) filter:
 |---|---|
 | `EBS-ActivityFilter-Enabled` | `Off` (default) / `On`. When on, events are run through Metavision's own activity-noise filter *before* being counted, dropping isolated events with no similar neighbor recently. |
 | `EBS-ActivityFilter-Threshold-us` | How far back (in microseconds) to look for a "similar recent event" — default 10,000 µs (10 ms). Larger values filter more aggressively. |
+
+**Bug fix — image orientation (`TransposeCorrection`/`TransposeMirrorX`/
+`TransposeMirrorY`/`TransposeXY`).** MicroManager creates these four standard
+properties on every camera automatically, but MMCore itself never applies
+them — each adapter is responsible for its own pixel transform, and this one
+previously wasn't, so setting them had no visible effect. They now work:
+`TransposeCorrection` is the master switch (must be `1` for Mirror/`TransposeXY`
+to do anything, matching the convention other camera adapters use), and
+`TransposeXY` swaps the reported image width/height. With a real camera
+streaming this takes effect on the very next displayed frame; with no camera
+connected (the static test pattern), it takes effect at the next
+`Exposure`-independent redraw — an ROI or `Binning` change.
 
 ### 12. Try the new view controls
 
@@ -587,25 +600,134 @@ Goal 5 hardware event-trail (STC) filter:
 4. Change `EBS-ViewMode` between `NetSigned`, `Merged`, `OnOnly`, and
    `OffOnly` while something is moving in front of the sensor, and compare
    how each looks.
-5. Try raising `EBS-ViewScale` (e.g. to 4 or 8) if the `NetSigned`/`OnOnly`/
-   `OffOnly` views look too dim, or lowering it if they're washed out to
-   white.
-6. Turn `EBS-ActivityFilter-Enabled` **On** in a noisy/low-light scene and
+5. Turn `EBS-ActivityFilter-Enabled` **On** in a noisy/low-light scene and
    compare the amount of stray single-pixel flicker before and after.
 
 If the live view visibly responds to each of these properties as described,
 **Goal 6 is verified working** — let the project owner know so we can tag
 this as `v0.6` and move on to Goal 7 (pixel masking and sensor ROI).
 
+## Goal 7 (Pixel-by-pixel differences)
+
+### What's new
+
+Two independent features: blocking individual "hot" pixels (ones that fire
+constantly regardless of the scene, a common event-camera hardware defect),
+and a hardware region-of-interest (ROI) that crops the sensor itself rather
+than just the displayed image.
+
+| Property | Meaning |
+|---|---|
+| `EBS-HotPixelBlockedPixels` | A semicolon-separated list of `x:y` pixel coordinates to mask, e.g. `114:239;500:12`. Empty by default. Can be typed by hand, or filled in automatically by calibration (below). Rejects a malformed value outright (keeps the previous valid list) rather than accepting garbage. |
+| `EBS-HotPixelDetectNow` | `Idle` (default) / `Run`. Setting this to `Run` clears `EBS-HotPixelBlockedPixels`, watches the sensor for `EBS-HotPixelCalibDurationMs` milliseconds, and replaces the list with whatever pixels came out as statistical outliers — see below for why it *replaces* rather than adds to the existing list. Automatically resets to `Idle` when done. |
+| `EBS-HotPixelCalibDurationMs` | How long a calibration run watches the sensor (default **5000 ms**). |
+| `EBS-HotPixelStddevK` | How many standard deviations above the mean a pixel's event count must be to get flagged as an outlier (default **10**, range 0.1–100). Lower = more aggressive masking (more false positives); higher = only the most extreme outliers get caught. |
+| `EBS-HotPixelCalibStatus` | Read-only. Reports the outcome of the last calibration run, e.g. `Done: 64 masked (64 new, 31 dropped (length/hardware-slot limit))`, or a failure reason if no camera was streaming. |
+
+Masking is enforced by the sensor's own hardware pixel mask, which has a
+**fixed 64-pixel limit** on this sensor generation (IMX636/Gen4.1) — if
+calibration or a manually-typed list would exceed that (or MMCore's
+1024-character property-string limit, whichever is tighter), the least
+significant outliers are silently dropped from what's actually enforced,
+and `EBS-HotPixelCalibStatus` says so explicitly.
+
+**Calibrate against a static/dark scene for best results.** Because the
+statistics are computed across whatever's currently visible (within the
+active ROI), real scene motion or uneven lighting during a calibration run
+can pull genuinely normal pixels above the threshold alongside real
+hardware defects. Covering the lens (or pointing it at a plain, static
+surface) during calibration gives a cleaner, hot-pixel-only result.
+
+Hardware ROI uses MicroManager's own standard `SetROI`/`GetROI`/`ClearROI`
+API (the same one every other MM camera adapter uses) — no `EBS-*`
+property needed. Setting an ROI crops the sensor itself (fewer raw events
+leave the chip at all), not just the displayed/recorded image, so it also
+meaningfully reduces `EBS-AvgEventRate-MEvps`/`EBS-AvgDataRate-MBps` and
+recording file size. Hot-pixel calibration automatically scopes itself to
+whatever ROI is currently active, rather than always scanning the full
+chip.
+
+### 13. Try hot-pixel masking and hardware ROI
+
+1. Make sure your EBS camera is plugged in and connected, and open **Live**.
+2. In the Device/Property Browser, set `EBS-HotPixelCalibDurationMs` and
+   `EBS-HotPixelStddevK` if you want non-default values, then set
+   `EBS-HotPixelDetectNow` to `Run`. Wait for it to reset to `Idle` on its
+   own, then check `EBS-HotPixelCalibStatus` and
+   `EBS-HotPixelBlockedPixels` for the result.
+3. Use MicroManager's own ROI tool (drag a rectangle on the Live image, or
+   use the toolbar's "Set ROI" button) to crop to a smaller region, then
+   watch `EBS-AvgEventRate-MEvps` drop compared to the full-frame value.
+   Use "Clear ROI" (or `ClearROI()` via a script) to restore the full
+   sensor.
+
+If calibration produces a plausible `EBS-HotPixelBlockedPixels` list and the
+ROI tool visibly crops the Live view (with a lower event rate to match),
+**Goal 7 is verified working** — let the project owner know so we can tag
+this as `v0.7` and move on to Goal 8 (additional hardware/SDK features).
+
+## Goal 8 (Additional hardware/SDK features)
+
+### What's new
+
+Five more hardware capabilities, picked by scanning the Metavision SDK and
+MM's own camera API for anything Goals 1-7 hadn't already covered.
+
+| Property group | Properties |
+|---|---|
+| Hardware trigger in/out | `EBS-TriggerIn-Channel` (which physical input channel), `EBS-TriggerIn-Enabled`, `EBS-TriggerIn-Count` (read-only, counts real trigger pulses seen); `EBS-TriggerOut-Enabled`, `-PeriodUs`, `-DutyCycle` (configures the camera's own output pulse) |
+| Sensor event-rate filter | `EBS-EventRateFilter-Enabled` plus `-LowerStart`/`-LowerStop`/`-UpperStart`/`-UpperStop` (evt/s hysteresis thresholds) — drops events **at the sensor itself** whenever the overall event rate falls outside this band, saving USB bandwidth. Distinct from the Goal 6 software `EBS-ActivityFilter-*` and the Goal 5 `EBS-EventTrailFilter-*` (per-pixel, not rate-based). |
+| Time-decay view mode | A fifth `EBS-ViewMode` value, `TimeDecay` — each pixel fades from bright to the baseline over `EBS-ViewModeTimeDecay_DecayTime_Constant-us` microseconds since it last fired, instead of showing a fixed integration window. Gives a persistence/trail-like look. |
+| Binning | MicroManager's standard `Binning` property now does real 1×/2×/4× spatial binning — sums raw event counts over each block into one output pixel (higher apparent sensitivity, lower resolution), same idea as a real camera's charge binning. |
+| Camera sync mode | `EBS-SyncMode` (`Standalone`/`Master`/`Slave`, **pre-init only** — set before "Add Device", greyed out afterward) — for linking multiple EBS cameras' timestamps together. Needs a second, physically-linked EBS to actually test; on a single camera only `Standalone` is meaningful. |
+
+**Trigger-in is a monitoring input, not a capture gate.** Unlike a typical
+frame camera, enabling `EBS-TriggerIn-Enabled` does not pause or gate Live
+view — the EBS sensor is free-running by design, and trigger-in pulses are
+just recorded as timestamped markers alongside the normal event stream (for
+aligning an external stimulus to event data afterward). `EBS-TriggerIn-Count`
+staying at `0` with nothing physically wired to the trigger-in pin is
+expected, not a bug — it's there so you can confirm the monitoring path is
+alive once you do wire something up.
+
+### 14. Try the Goal 8 features
+
+1. Make sure your EBS camera is plugged in and connected, and open **Live**.
+2. Change `Binning` (the standard MM property, same place as any other
+   camera) between `1`, `2`, and `4` and watch the Live image's resolution
+   change accordingly (and, if the scene is dim, look visibly brighter at
+   higher binning).
+3. Set `EBS-ViewMode` to `TimeDecay` and compare the trailing/persistence
+   look against `NetSigned`/`Merged` from Goal 6. Try changing
+   `EBS-ViewModeTimeDecay_DecayTime_Constant-us` to see faster/slower fade.
+4. If you have a signal generator or other pulse source wired to the
+   sensor's trigger-in pin, turn `EBS-TriggerIn-Enabled` on and confirm
+   `EBS-TriggerIn-Count` increases with real pulses. Without one wired up,
+   just confirm the property exists and Live view is unaffected either way.
+5. `EBS-EventRateFilter-*` and `EBS-TriggerOut-*` can be round-tripped in
+   the Device/Property Browser even without external hardware to observe
+   their effect directly.
+
+If Binning visibly changes the Live view's resolution/sensitivity and
+TimeDecay mode shows a distinct persistence-style look, **Goal 8 is
+verified working** — let the project owner know so we can tag this as
+`v0.8` and move on to Goal 9 (full suite polishing).
+
 ## Troubleshooting MicroManager itself
 
 | Symptom | Likely cause |
 |---|---|
 | `ProphEBS` doesn't appear in the Hardware Configuration Wizard device list | The DLL isn't in the MicroManager install folder, or it's a 32-bit build (must be x64/Release), or MicroManager itself is a 32-bit install (rare, would need a 32-bit rebuild) |
-| `ProphEBS` appears as a flat entry marked **"(unavailable)"** instead of an expandable folder with `ProphEBS-Camera` inside it | **Device interface version mismatch** — your installed MicroManager build and the `mmgr_dal_ProphEBS.dll` you built expect different interface versions. Run `tools\mm_python_env\Scripts\mmcore list` (see step 1c) to see the required version and whether your active install matches; if not, get a newer/matching nightly build via `mmcore install` (or the no-admin workaround) |
+| `ProphEBS` appears as a flat entry marked **"(unavailable)"** instead of an expandable folder with `ProphEBS-Camera` inside it, **and** `tools\mm_python_env\Scripts\mmcore list` shows your active install's interface version *matching* what the DLL needs | **Metavision SDK DLLs missing/not on `PATH`** at MicroManager's load time (`metavision_hal.dll`, `metavision_sdk_base.dll`, `metavision_sdk_stream.dll`). This looks identical to the device-interface-version case below in the GUI (Windows can't load the DLL at all, so MMCore never gets far enough to report a specific reason) — the interface-version check above is what tells them apart. Confirm `C:\Program Files\Prophesee\bin` (or wherever you installed the SDK) is on your system `PATH` (see step 1d) — the SDK installer normally does this for you, but a manual/non-default install or a `PATH` edited afterward can undo it. After fixing `PATH`, restart MicroManager (a `PATH` change doesn't apply to already-running programs) |
+| `ProphEBS` appears as a flat entry marked **"(unavailable)"**, **and** `mmcore list` shows a version *mismatch* | **Device interface version mismatch** — your installed MicroManager build and the `mmgr_dal_ProphEBS.dll` you built expect different interface versions. Get a newer/matching nightly build via `mmcore install` (or the no-admin workaround, see step 1c) |
+| Building fails with compiler errors like `cannot open include file 'metavision/sdk/...'` or linker errors about `metavision_hal.lib` | **Metavision SDK not installed, or `MetavisionSdkRoot` points at the wrong folder** — this is a raw MSBuild/compiler error, not a custom message from this project, so it can look like something else is wrong. Confirm the SDK is actually installed (step 1d) and, if it's not at the default `C:\Program Files\Prophesee`, pass `/p:MetavisionSdkRoot="<your path>"` on the MSBuild command line |
 | MicroManager crashes or shows a popup error when adding the device | Copy the exact error text and the relevant lines from the CoreLog around the crash — this is the most useful debugging info |
 | Live/Snap shows a black image or an error instead of the checkerboard | Note down what MicroManager's status bar / log says at that moment |
 | Goal 3: Live view stays completely black even while waving a hand in front of the sensor | Check `EBS-ConnectionStatus` is `Connected` first (if not, you're still seeing the Goal 1/2 static checkerboard, not a live feed). If connected, check the sensor lens isn't covered, and that you're close enough / moving enough to actually generate events — event cameras only report brightness *changes* |
 | Goal 4: `EBS-RawRecordingStatus` reads `Failed: ...` | The resolved path is likely invalid (e.g. a folder that couldn't be created, or no write permission) — check the exact error text and the CoreLog. If `EBS-RawFilePath` is empty (auto-discovery), check the CoreLog for "auto-discovered" vs. "could not auto-discover" to see which path was actually used |
 | Goal 4: the `.raw` file didn't land next to the MDA's images | Auto-discovery likely fell back to `Documents\ProphEBS_Recordings\` — check the CoreLog around acquisition start for "could not auto-discover the Multi-D Acquisition save location." This can happen if MicroManager's UserProfile JSON format changed in your installed version (see `docs/DEVLOG.md`, Goal 4) — the recording still succeeds, just not in the expected folder |
 | Goal 4: no `.raw` file was created at all | Confirm `EBS-ConnectionStatus` was `Connected` — recording needs a real streaming camera; it's a no-op with no hardware attached (by design, same as Goal 2/3's fallback behavior) |
+| Goal 5: a bias value silently reverts to something other than what you typed (e.g. setting `bias_refr` to 255 reads back 235) | Not a bug — the sensor firmware enforces its own safety clamp tighter than the range `EBS-biasRangeCheckBypass`/`SetPropertyLimits` reports as allowed. The property is updated to reflect the true hardware value immediately, and the CoreLog explains the clamp when it happens |
+| Goal 7: hot-pixel calibration masks far more pixels than expected | Likely ran against a busy/moving scene — the statistics are computed over whatever's currently active within the ROI, so real motion or uneven lighting inflates the count and can flag normal pixels as outliers alongside genuine hardware defects. Re-run calibration against a static/dark scene (lens covered) for a cleaner result, or raise `EBS-HotPixelStddevK` |
+| Goal 8: `EBS-SyncMode` seems to "reset itself" back to `Standalone` after being set to `Master`/`Slave` | Expected — `EBS-SyncMode` is a **pre-init-only** property (same category as `EBS-biasRangeCheckBypass`), only ever applied once, before the camera starts streaming. Set it in the Hardware Configuration Wizard *before* clicking "Add Device", not afterward in the Device/Property Browser (it's greyed out there) |
+| Goal 8: Live view doesn't pause/gate even with `EBS-TriggerIn-Enabled` on and nothing wired to the trigger-in pin | Expected, not a bug — trigger-in only monitors an external pin for timestamp-marker purposes; the EBS sensor is free-running by design and never waits for a trigger to produce CD events (unlike a typical frame camera's trigger-in). See the Goal 8 section above |

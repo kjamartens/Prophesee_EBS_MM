@@ -2171,6 +2171,242 @@ available on this dev machine.
   roadmap -- error handling, tests, and documentation sweep across
   everything built so far (now including this goal).
 
+## Goal 9 -- Full suite polishing
+
+### Status: self-tested on real hardware, awaiting user GUI confirmation before tagging v0.9
+
+### How this goal was scoped
+
+Per `claude_instructions.txt`'s Goal 9 entry ("do a full sweep over
+everything and make proper tests, documentation, handle errors, etc"), plus
+its two explicit asks -- a clear message for "no SDK found," and grouping
+related properties under a shared alphabetically-sortable prefix (the user's
+own example: "for hot pixels all start with HotPixel...") -- an Explore
+agent surveyed the whole codebase first: every registered MM property
+(grouped by feature area, flagging any that broke its group's naming
+convention), what actually happens when the Metavision SDK is missing at
+build time vs. runtime, `tools/test_prophebs.py`'s structure and gaps, and
+`docs/BUILD_AND_USAGE.md`'s section coverage. That survey found four more
+naming-inconsistent groups beyond the cited hot-pixel one, confirmed the
+SDK-missing-DLL case is architecturally uninterceptable from inside the
+adapter (fails at the Windows loader level before any of this project's
+code runs), found `docs/BUILD_AND_USAGE.md` had no Goal 7 or Goal 8 sections
+at all, and found the self-test harness was almost entirely happy-path
+round-trips (the sole exception being the Goal 7 malformed-`EBS-BlockedPixels`
+check). Presented to the user via `AskUserQuestion`, who chose: rename all
+five naming-inconsistent groups (not just hot-pixel), document (not
+code-fix) the SDK-missing case, and expand the test harness with real
+negative/error-path checks.
+
+### What was built
+
+- **Property renames, five groups, for alphabetical grouping.** All
+  `CreateProperty`/`SetProperty`/`GetProperty`/`OnPropertyChanged` call
+  sites and every reference (comments, log-message text) updated via exact
+  string-literal replacement in `ProphEBS.cpp`/`ProphEBS.h`/
+  `tools/test_prophebs.py`/`docs/BUILD_AND_USAGE.md` -- deliberately not a
+  blanket identifier rename (C++ symbol names like `g_PropBlockedPixels`,
+  `OnBlockedPixels`, `ApplyBlockedPixelsToHardware` were left as-is; only
+  the user-visible MM property name strings changed) to keep the diff
+  scoped to what the user actually sees in the Property Browser:
+  - `EBS-BlockedPixels` -> `EBS-HotPixelBlockedPixels`
+  - `EBS-DetectHotPixelsNow` -> `EBS-HotPixelDetectNow`
+  - `EBS-BiasRangeCheckBypass` -> `EBS-biasRangeCheckBypass` (lowercase `b`
+    so it sorts adjacent to `EBS-bias_*` in a case-sensitive alphabetical
+    listing; doesn't change any code behavior, MM property names are opaque
+    strings either way)
+  - `EBS-TimeDecay-TimeConstant-us` -> `EBS-ViewTimeDecayTimeConstant-us`
+  - `EBS-DisplayRefreshMs` -> `EBS-ViewDisplayRefreshMs`
+  - `EBS-LiveViewMinIntervalMs` -> `EBS-ViewLiveMinIntervalMs`
+  - `EBS-TempRecordingFolder` -> `EBS-RawTempRecordingFolder`
+  - `EBS-CallbackLagMs` -> `EBS-AvgCallbackLagMs`
+  - `EBS-BacklogFlushCount` -> `EBS-AvgBacklogFlushCount`
+  - `EBS-BacklogFlushThresholdMs` -> `EBS-AvgBacklogFlushThresholdMs`
+
+  `docs/DEVLOG.md` itself (this file) was deliberately **not** updated --
+  every earlier goal's section still uses the old names, matching what was
+  true and tested at the time; this file's own header says "do not delete
+  earlier sections," and rewriting history here would misrepresent what
+  those goals actually verified.
+- **SDK-missing documentation, no code change** (per the user's explicit
+  choice -- this failure mode happens at the Windows loader level, before
+  any adapter code runs, so there is no `try`/`catch` that could ever
+  intercept it). Three new/reworded rows in `docs/BUILD_AND_USAGE.md`'s
+  troubleshooting table distinguish: (1) the existing Goal 1 device-
+  interface-version `(unavailable)` case, (2) a **new** entry for Metavision
+  DLLs missing/not on `PATH` at runtime -- which looks *identical* in the
+  GUI to case (1) (both just show `(unavailable)`, since Windows can't even
+  get far enough to report a reason) -- distinguished by checking whether
+  `mmcore list`'s interface-version check actually matches, and (3) a
+  **new** entry for the SDK not installed (or `MetavisionSdkRoot` pointed
+  wrong) at *build* time, which surfaces as a raw MSBuild/compiler error
+  rather than anything from this project.
+- **Missing Goal 7/Goal 8 tutorial sections added to
+  `docs/BUILD_AND_USAGE.md`.** These two entire goals had shipped with zero
+  user-facing tutorial coverage -- the doc jumped straight from Goal 6 to
+  "Troubleshooting." Added in the same style as existing sections (property
+  table + a numbered "try it" walkthrough), using the new (renamed)
+  property names throughout, plus new troubleshooting-table rows for
+  Goal 5's bias-clamp behavior, Goal 7's calibrate-against-a-static-scene
+  guidance, and Goal 8's `EBS-SyncMode` pre-init-only / trigger-in-doesn't-
+  gate-Live-view behaviors (both already explained in this file, just not
+  yet surfaced in the user-facing tutorial).
+- **Comment-density spot-check.** Cross-referenced every
+  `CProphEBSCamera::` function definition in `ProphEBS.cpp` against its
+  nearest doc-comment block. Found all of the genuinely non-obvious
+  "hardware-facility wiring" functions (every `Create*Properties()`,
+  `SerializeBlockedPixels`/`ParseBlockedPixels`,
+  `ApplyBlockedPixelsToHardware`, `SetROI`/`ApplyRoiToBuffers`,
+  `StartEventStreaming`/`StopEventStreaming`, `OnEventsCD`, etc.) already
+  carry a `/**...*/` block explaining the non-obvious parts. The functions
+  without one are uniformly simple, formulaic property getters/setters
+  (`OnErcEnabled`, `OnHotPixelStddevK`, `GetBinning`, etc.) or trivial
+  one-liners (`GetName`, `Busy`) whose names and the repeated
+  `BeforeGet`/`AfterSet` shape already make them self-explanatory -- added
+  no new comments here, since forcing a boilerplate doc block onto every
+  one of these would be noise, not documentation (matches this project's
+  own stated commenting philosophy).
+- **Negative/error-path expansion of `tools/test_prophebs.py`** (previously
+  almost entirely happy-path round-trips): out-of-range rejection checks
+  for properties with unconditional limits (`EBS-HotPixelCalibDurationMs`,
+  `EBS-HotPixelStddevK`, `EBS-TriggerOut-DutyCycle`, `EBS-ViewOffset`,
+  `Exposure`) and for hardware-range-dependent ones when a camera is
+  connected (`EBS-ERC-EventRate`, a bias, `EBS-AntiFlicker-HighFreq`);
+  invalid-enum-string rejection for `EBS-ViewMode`,
+  `EBS-EventTrailFilter-Mode`, `EBS-TriggerIn-Channel`,
+  `EBS-AntiFlicker-FilterType`; a check that `pymmcore-plus` rejects a
+  post-init `setProperty()` on the two pre-init-only properties
+  (`EBS-biasRangeCheckBypass`, `EBS-SyncMode`); and a zero-size `SetROI`
+  boundary check.
+
+### Bug found by the new EBS-ERC-EventRate out-of-range test: silent int32 overflow
+
+The new out-of-range check for `EBS-ERC-EventRate` failed on the very first
+run -- not because the adapter correctly rejected the bad value, but because
+setting it to `hardware_max + 1e9` (~4.2 GEv/s) silently corrupted the
+property to **2147480000** (~`INT32_MAX`, not the requested value, not the
+declared hardware max, and not the previous value either). Root cause:
+`CreateErcProperties()` used `CreateIntegerProperty()` for
+`EBS-ERC-EventRate`, backed by a `long localErcEventRate_` member and
+`OnErcEventRate()`'s `long value; pProp->Get(value);` -- but this sensor's
+own `I_ErcModule::get_max_supported_cd_event_rate()` reports **3.2 GEv/s**,
+which already exceeds what a 32-bit signed `long` can represent
+(`INT32_MAX` = ~2.147 GEv/s) even for values *within* the declared
+hardware-reported range, let alone ones tested deliberately above it. The
+overflow happens silently inside MMCore's own integer parsing/storage, well
+before `SetPropertyLimits()`'s range check would normally reject an
+out-of-bounds value -- so even a legitimate "set to the sensor's actual
+max" request would have silently corrupted, not just adversarial
+out-of-range input.
+
+**Fix**: switched `EBS-ERC-EventRate` from `CreateIntegerProperty` to
+`CreateFloatProperty` (`double`, more than enough precision for event-rate
+integers in this range), changed `localErcEventRate_` from `long` to
+`double`, and `OnErcEventRate()`'s `AfterSet` branch from `long value` to
+`double value` (still narrowed to `uint32_t` only at the final
+`erc.set_cd_event_rate()` call, matching the SDK's own parameter type).
+
+**Verified**: rebuilt (0 warnings/errors) and reran `tools/test_prophebs.py`
+against the connected IMX636 -- the out-of-range `EBS-ERC-EventRate` check
+now correctly rejects the oversized value (property left unchanged), and
+the existing Goal 5 `EBS-ERC-EventRate` round-trip (mid-range value,
+in-bounds) still passes unchanged.
+
+### Design decisions (and why)
+
+- **String-literal renames, not identifier renames.** Keeps the C++-side
+  diff minimal and focused on exactly what the user asked for (property
+  names visible in MM's Property Browser); renaming `g_PropBlockedPixels`
+  itself would touch far more lines for zero user-visible benefit.
+- **`docs/DEVLOG.md` left un-renamed (historical).** This file is a
+  chronological record of what was verified true *at the time each goal was
+  built*; retroactively rewriting old sections to use new names would make
+  the "Verified locally" evidence in those sections describe behavior that
+  didn't actually exist yet at that point in the project's history.
+- **Docs-only fix for the SDK-missing case, no `DllMain` or load-time
+  guard added.** Confirmed via `ProphEBSModule.cpp` that this adapter has
+  no custom `DllMain` (only the three required `MODULE_API` exports) --
+  Windows' own loader resolves `mmgr_dal_ProphEBS.dll`'s implicit
+  dependencies on `metavision_hal.dll` etc. *before* any of this project's
+  code executes, so there is no hook-in point available even if one were
+  wanted. Matches the user's own choice (docs, not a code fix) and the
+  existing Goal 1 precedent for the device-interface-version case, which
+  has the same fundamental shape.
+- **Negative-path tests reuse the existing flat-script/sequential-assert
+  structure**, not a new framework -- this is additive to
+  `tools/test_prophebs.py`'s established pattern (per-goal comment banners,
+  `assert`/`print`, camera-gated blocks where hardware ranges are involved)
+  rather than a rewrite, keeping one consistent self-test script per this
+  project's established convention.
+- **`assert_rejected()` helper treats "value unchanged" as equivalent to
+  "raised an exception."** Some out-of-range paths in this codebase throw
+  (MMCore's own `SetPropertyLimits()` enforcement), while others might
+  clamp silently at a lower layer -- both count as "the bad input didn't
+  take effect," which is the actual property being tested, not the specific
+  mechanism.
+
+### Verified locally
+
+- **Build**: `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`
+  succeeds with 0 warnings/errors (same VS2022 Preview toolset as every
+  prior goal), both before and after the `EBS-ERC-EventRate` int32-overflow
+  fix.
+- **Real hardware, via `tools/test_prophebs.py`** (extended with the Goal 9
+  negative-path checks): full suite (`SUCCESS`, exit 0) against the
+  connected IMX636, with no regression in any Goal 1-8 check under the
+  renamed properties. New checks all passed: out-of-range rejection for
+  `EBS-HotPixelCalibDurationMs`, `EBS-HotPixelStddevK`,
+  `EBS-TriggerOut-DutyCycle`, `EBS-ViewOffset`, `Exposure`,
+  `EBS-ERC-EventRate` (after the overflow fix), a bias property, and
+  `EBS-AntiFlicker-HighFreq`; invalid-enum-string rejection for
+  `EBS-ViewMode`, `EBS-EventTrailFilter-Mode`, `EBS-TriggerIn-Channel`,
+  `EBS-AntiFlicker-FilterType`; pre-init-only post-init rejection (via
+  `pymmcore-plus`'s own `RuntimeError`, see below) for
+  `EBS-biasRangeCheckBypass`/`EBS-SyncMode`; and a zero-size `SetROI`
+  boundary case.
+- **A documented assumption corrected while writing the pre-init-property
+  test**: the near-top-of-script comment (present since Goal 5/8) says raw
+  MMCore's `PropertyCollection::Set()` doesn't block a post-init
+  `setProperty()` call on a pre-init-only property at the Core API level --
+  true for bare MMCore, confirmed by reading `MMDevice/Property.cpp`
+  directly. But this test harness goes through `pymmcore-plus`'s
+  `CMMCorePlus.setProperty()` wrapper, which turned out to add its own
+  extra guard: it actually raises `RuntimeError("Cannot set pre-init
+  property after initialization")` in that situation. Discovered while
+  writing this exact check (the initial version assumed no exception and
+  failed); fixed the test to assert the `RuntimeError` instead. The
+  underlying bare-Core behavior described in the older comment is still
+  accurate for bare MMCore -- it just doesn't describe what this
+  particular test harness (or, presumably, any GUI/tool built on
+  `pymmcore-plus`) actually does.
+- **Re-confirmed the Goal 7 hot-pixel masking-effectiveness check is a
+  genuine, pre-existing, hardware-timing-dependent flake, not something
+  this goal's changes caused.** It failed 2 of 4 runs this session
+  (`masked_region_max` reading 50 or 100 instead of 0 in the fixed
+  `(0-6,0-6)` probe region) and passed the other 2 -- same intermittent
+  behavior already noted as unresolved in the Goal 8 "Bug fix" section
+  above, reproduced here across multiple fresh test runs with no code in
+  that check touched by this goal (only the property name string changed).
+  Not investigated further, consistent with the prior session's choice to
+  leave it as a known, flagged flake rather than an open regression.
+- **Not yet verified**: a real MicroManager Studio GUI walkthrough --
+  same hand-off pattern as every prior goal -- specifically: the renamed
+  properties actually appearing grouped/sorted as intended in the
+  Device/Property Browser (alphabetical sort is a GUI behavior, not
+  something `pymmcore-plus`'s flat property list exercises), and that the
+  new Goal 7/Goal 8 `docs/BUILD_AND_USAGE.md` sections match what the user
+  sees when following them.
+
+### Open questions / TODO for later
+
+- The Goal 7 hot-pixel masking-effectiveness flake (see above) remains
+  unresolved -- worth a dedicated investigation if it starts affecting real
+  usage, but continues to be treated as a known, documented, intermittent
+  hardware/timing issue rather than a Goal 9 blocker.
+- This was the last goal on the original roadmap (`claude_instructions.txt`
+  numbers it "9. Full suite polishing"). Future work from here is
+  maintenance/follow-up driven by the user, not a new numbered goal.
+
 ### Bug fix: bias property silently reverting past its own reported max (e.g. `bias_refr` 255 -> 235)
 
 User reported (with `EBS-BiasRangeCheckBypass` On, "developer"/allowed-range
@@ -2211,3 +2447,50 @@ check (`masked_region_max == 0` in the fixed `(0-6,0-6)` corner region)
 fails because that run's real-hardware calibration happened to mask hot
 pixels elsewhere on the sensor, not in that fixed corner; not touched by
 this fix and not investigated further here.
+
+### Bug fix: `TransposeCorrection`/`TransposeMirrorX`/`TransposeMirrorY`/`TransposeXY` had no effect, plus three small follow-up requests
+
+User reported the standard MM image-orientation properties (created
+automatically by `MM::CCameraBase`) appeared non-functional -- setting
+`TransposeMirrorX`/`-Y` or `TransposeXY` didn't visibly change the Live
+image. Confirmed by reading MMCore itself: it has **no** "Transpose"
+handling at all (removed from this MMCore version, if it ever had it) --
+each camera adapter is responsible for applying its own pixel transform
+from these properties, matching how e.g. the reference ABS adapter does it
+(gated on `TransposeCorrection` as a master switch). This adapter created
+the properties (for free, via the base class) but never read them anywhere.
+
+**Fix**: new `CProphEBSCamera::ApplyTranspose(ImgBuffer* target, natural,
+srcW, srcH)` reads the four properties (`TransposeCorrection` gates
+Mirror/SwapXY, same convention as ABS), resizes `target` to the swapped
+width/height if `TransposeXY` is on, and writes the mirrored/transposed
+result. Called from `BuildAndSwapFrame()` (targeting `backImg_`, on every
+frame while a real camera streams) and from `GenerateTestImage()`/
+`ApplyRoiToBuffers()`'s no-camera fallback checkerboard (targeting
+`frontImg_`) -- the no-camera path only re-renders on `Initialize()` or a
+ROI/binning change, since there's no periodic frame-builder thread without
+real hardware to pick up a bare property change on its own.
+
+Three small follow-up naming/default requests bundled into the same session:
+
+- `EBS-ViewTimeDecayTimeConstant-us` renamed to
+  `EBS-ViewModeTimeDecay_DecayTime_Constant-us` (string constant only, no
+  behavior change).
+- `EBS-ViewOffset`'s default changed from 10 to 100.
+- `EBS-ViewScale` removed entirely (scale is now always 1, i.e.
+  `pixel = clamp(EBS-ViewOffset + raw, 0, 255)`) -- per the user, an
+  unneeded extra control.
+
+**Verified**: rebuilt (0 errors) and reran the full `tools/test_prophebs.py`
+suite against the connected IMX636 -- `SUCCESS`, including a new check that
+`TransposeXY` actually swaps the reported image shape live (`(720, 1280)` ->
+`(1280, 720)`) while streaming from real hardware, and (no-camera-only)
+pixel-level checks that `TransposeMirrorX`/`-Y`/`TransposeXY` produce exactly
+`np.fliplr`/`np.flipud`/`.T` of the baseline image against the deterministic
+fallback test pattern, and are a no-op while `TransposeCorrection` is Off.
+`EBS-ViewOffset`'s new default (100) and the renamed decay-constant property
+were also asserted directly. `docs/BUILD_AND_USAGE.md` updated to match (new
+default, formula without scale, a short note on the Transpose fix and its
+no-camera caveat). Not yet verified: a real MicroManager Studio GUI
+walkthrough of Live view actually looking mirrored/transposed to the eye --
+same hand-off pattern as every prior goal.

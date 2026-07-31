@@ -10,7 +10,7 @@ core = CMMCorePlus()
 core.setDeviceAdapterSearchPaths([mm_dir])
 core.loadDevice("ProphEBSCam", "ProphEBS", "ProphEBS-Camera")
 
-# Goal 5: EBS-BiasRangeCheckBypass is a pre-init property -- MM's own
+# Goal 5: EBS-biasRangeCheckBypass is a pre-init property -- MM's own
 # convention (isPropertyPreInit()) for "settable during device setup only":
 # the Hardware Config Wizard uses this flag to grey the property out once a
 # device has been added/initialized, though MMCore itself doesn't block a
@@ -19,9 +19,9 @@ core.loadDevice("ProphEBSCam", "ProphEBS", "ProphEBS-Camera")
 # MMDevice/Property.cpp::PropertyCollection::Set(), which only checks the
 # per-property readOnly_ flag, never IsPropertyPreInit()). So the
 # behavior to check here is the metadata flag itself, not read-only-ness.
-assert core.isPropertyPreInit("ProphEBSCam", "EBS-BiasRangeCheckBypass"), \
-    "EBS-BiasRangeCheckBypass should be flagged as a pre-init property"
-core.setProperty("ProphEBSCam", "EBS-BiasRangeCheckBypass", "Off")
+assert core.isPropertyPreInit("ProphEBSCam", "EBS-biasRangeCheckBypass"), \
+    "EBS-biasRangeCheckBypass should be flagged as a pre-init property"
+core.setProperty("ProphEBSCam", "EBS-biasRangeCheckBypass", "Off")
 
 # Goal 8 follow-up: EBS-SyncMode is also pre-init-only -- see ProphEBS.h.
 # Metavision::I_CameraSynchronization documents that the mode must be set
@@ -30,13 +30,13 @@ core.setProperty("ProphEBSCam", "EBS-BiasRangeCheckBypass", "Off")
 # post-init moment at which changing it could ever take effect. It used to
 # be a live-settable property that silently reverted after Initialize()
 # (confusing, reported during a user GUI walkthrough); now it's pre-init,
-# same convention as EBS-BiasRangeCheckBypass.
+# same convention as EBS-biasRangeCheckBypass.
 assert core.isPropertyPreInit("ProphEBSCam", "EBS-SyncMode"), \
     "EBS-SyncMode should be flagged as a pre-init property"
 core.setProperty("ProphEBSCam", "EBS-SyncMode", "Standalone")
 
 core.initializeDevice("ProphEBSCam")
-print("Goal 5: EBS-BiasRangeCheckBypass is flagged pre-init, as expected")
+print("Goal 5: EBS-biasRangeCheckBypass is flagged pre-init, as expected")
 print("Goal 8: EBS-SyncMode is flagged pre-init, as expected")
 
 # Goal 2: connection/identification properties. These are populated whether
@@ -81,10 +81,10 @@ else:
     print("Goal 3: no EBS connected -- skipping event-integration checks, static test image only")
 
 # Goal 4: recording. EBS-RawFilePath/EBS-RawRecordingStatus/
-# EBS-TempRecordingFolder should exist regardless of hardware; only a
+# EBS-RawTempRecordingFolder should exist regardless of hardware; only a
 # connected camera can actually produce a .raw file (cam_.start_recording()
 # needs a real streaming camera).
-for prop in ("EBS-RawFilePath", "EBS-RawRecordingStatus", "EBS-TempRecordingFolder"):
+for prop in ("EBS-RawFilePath", "EBS-RawRecordingStatus", "EBS-RawTempRecordingFolder"):
     print(prop, "=", core.getProperty("ProphEBSCam", prop))
 
 if connection_status == "Connected":
@@ -128,7 +128,7 @@ if connection_status == "Connected":
         core.popNextImage()
     core.setProperty("ProphEBSCam", "EBS-RawFilePath", "")  # restore default (auto-discovery)
 
-    # 4b2. EBS-TempRecordingFolder overrides GenerateAutoRawFilePath()'s
+    # 4b2. EBS-RawTempRecordingFolder overrides GenerateAutoRawFilePath()'s
     # staging folder. Forced onto the local-staging path (rather than MDA
     # direct-streaming) by relying on the live profile's "save": false
     # state on this machine -- if that's not the case when this runs, the
@@ -136,7 +136,7 @@ if connection_status == "Connected":
     # so this check is best-effort depending on current MM state.
     custom_temp_folder = os.path.join(os.path.dirname(auto_path), "..", "ProphEBS_CustomTemp")
     custom_temp_folder = os.path.normpath(custom_temp_folder)
-    core.setProperty("ProphEBSCam", "EBS-TempRecordingFolder", custom_temp_folder)
+    core.setProperty("ProphEBSCam", "EBS-RawTempRecordingFolder", custom_temp_folder)
     core.startSequenceAcquisition(5, 100.0, True)
     while core.isSequenceRunning():
         time.sleep(0.05)
@@ -154,7 +154,7 @@ if connection_status == "Connected":
                   "subfolder move must have taken precedence this run, which is fine)")
     while core.getRemainingImageCount() > 0:
         core.popNextImage()
-    core.setProperty("ProphEBSCam", "EBS-TempRecordingFolder", "")  # restore default
+    core.setProperty("ProphEBSCam", "EBS-RawTempRecordingFolder", "")  # restore default
 
     # 4c. Live view (unbounded StartSequenceAcquisition) must NOT trigger raw
     # recording -- only finite/MDA-style sequences should.
@@ -308,23 +308,121 @@ for mode in ("Merged", "OnOnly", "OffOnly", "NetSigned"):
 print("Goal 6: EBS-ViewMode round-tripped through Merged/OnOnly/OffOnly/NetSigned")
 core.setProperty("ProphEBSCam", "EBS-ViewMode", original_view_mode)
 
-# Goal 6: EBS-ViewOffset/EBS-ViewScale -- the "offset +- found events" ask.
-# Probe a mid-range value from MM's own reported limits rather than a
-# hardcoded guess (same pattern as the Goal 5 bias/anti-flicker checks).
+# Goal 6: EBS-ViewOffset -- the "offset +- found events" ask. Probe a
+# mid-range value from MM's own reported limits rather than a hardcoded
+# guess (same pattern as the Goal 5 bias/anti-flicker checks).
 offset_lo = int(core.getPropertyLowerLimit("ProphEBSCam", "EBS-ViewOffset"))
 offset_hi = int(core.getPropertyUpperLimit("ProphEBSCam", "EBS-ViewOffset"))
 offset_probe = offset_lo + (offset_hi - offset_lo) // 2
 original_offset = core.getProperty("ProphEBSCam", "EBS-ViewOffset")
+assert int(original_offset) == 100, "expected EBS-ViewOffset default of 100, got " + original_offset
 core.setProperty("ProphEBSCam", "EBS-ViewOffset", str(offset_probe))
 assert int(core.getProperty("ProphEBSCam", "EBS-ViewOffset")) == offset_probe
 core.setProperty("ProphEBSCam", "EBS-ViewOffset", original_offset)
+print("Goal 6: EBS-ViewOffset round-tripped (offset probe", offset_probe, ", default 100 confirmed)")
 
-original_scale = core.getProperty("ProphEBSCam", "EBS-ViewScale")
-core.setProperty("ProphEBSCam", "EBS-ViewScale", "2.5")
-assert float(core.getProperty("ProphEBSCam", "EBS-ViewScale")) == 2.5
-core.setProperty("ProphEBSCam", "EBS-ViewScale", original_scale)
-print("Goal 6: EBS-ViewOffset/EBS-ViewScale round-tripped (offset probe",
-      offset_probe, ", scale 2.5)")
+# Bug fix: TransposeCorrection/-MirrorX/-MirrorY/TransposeXY are created
+# automatically by MM::CCameraBase, but previously had no actual effect on
+# the image -- MMCore itself does not apply them, so each adapter is
+# responsible for its own pixel transform (this adapter wasn't).
+# Exact pixel-level comparison only makes sense with no real camera
+# connected (the deterministic checkerboard+gradient fallback pattern --
+# GenerateTestImage()/ApplyRoiToBuffers() apply the same transform as
+# BuildAndSwapFrame(), see ApplyTranspose() in ProphEBS.cpp); with a real
+# camera streaming, live event data keeps changing between snaps, so only
+# the shape-swap from TransposeXY (deterministic regardless of pixel
+# content) is checked there.
+original_correction = core.getProperty("ProphEBSCam", "TransposeCorrection")
+original_mirror_x = core.getProperty("ProphEBSCam", "TransposeMirrorX")
+original_mirror_y = core.getProperty("ProphEBSCam", "TransposeMirrorY")
+original_swap_xy = core.getProperty("ProphEBSCam", "TransposeXY")
+
+core.setProperty("ProphEBSCam", "TransposeCorrection", "0")
+core.setProperty("ProphEBSCam", "TransposeMirrorX", "0")
+core.setProperty("ProphEBSCam", "TransposeMirrorY", "0")
+core.setProperty("ProphEBSCam", "TransposeXY", "0")
+core.snapImage()
+baseline_img = core.getImage().copy()
+
+if connection_status != "Connected":
+    # No real camera means no periodic frame-builder thread -- the fallback
+    # pattern only re-renders on Initialize() or a ROI/binning change (see
+    # ApplyTranspose()'s comment in ProphEBS.cpp), so a harmless clearROI()
+    # round-trip (already exercised elsewhere in this script) is used here
+    # purely to force ApplyRoiToBuffers() to pick up each new Transpose*
+    # value -- with a real camera, BuildAndSwapFrame() picks it up on its own
+    # every frame and this round-trip isn't needed (see the else branch).
+
+    # With TransposeCorrection off, MirrorX/Y/SwapXY must have no effect at all.
+    core.setProperty("ProphEBSCam", "TransposeMirrorX", "1")
+    core.setProperty("ProphEBSCam", "TransposeMirrorY", "1")
+    core.setProperty("ProphEBSCam", "TransposeXY", "1")
+    core.clearROI()
+    core.snapImage()
+    assert np.array_equal(core.getImage(), baseline_img), \
+        "TransposeMirrorX/Y/SwapXY changed the image while TransposeCorrection is Off -- should be a no-op"
+    print("Goal 9 bug fix: TransposeCorrection=Off correctly disables Mirror/SwapXY")
+
+    core.setProperty("ProphEBSCam", "TransposeCorrection", "1")
+    core.setProperty("ProphEBSCam", "TransposeMirrorX", "1")
+    core.setProperty("ProphEBSCam", "TransposeMirrorY", "0")
+    core.setProperty("ProphEBSCam", "TransposeXY", "0")
+    core.clearROI()
+    core.snapImage()
+    assert np.array_equal(core.getImage(), np.fliplr(baseline_img)), \
+        "TransposeMirrorX (Correction On) did not horizontally flip the image"
+    print("Goal 9 bug fix: TransposeCorrection+MirrorX horizontally flips the image")
+
+    core.setProperty("ProphEBSCam", "TransposeMirrorX", "0")
+    core.setProperty("ProphEBSCam", "TransposeMirrorY", "1")
+    core.clearROI()
+    core.snapImage()
+    assert np.array_equal(core.getImage(), np.flipud(baseline_img)), \
+        "TransposeMirrorY (Correction On) did not vertically flip the image"
+    print("Goal 9 bug fix: TransposeCorrection+MirrorY vertically flips the image")
+
+    core.setProperty("ProphEBSCam", "TransposeMirrorY", "0")
+    core.setProperty("ProphEBSCam", "TransposeXY", "1")
+    core.clearROI()
+    core.snapImage()
+    swapped_img = core.getImage()
+    assert swapped_img.shape == (baseline_img.shape[1], baseline_img.shape[0]), \
+        f"TransposeXY should swap image dimensions {baseline_img.shape} -> " \
+        f"{(baseline_img.shape[1], baseline_img.shape[0])}, got {swapped_img.shape}"
+    assert np.array_equal(swapped_img, baseline_img.T), \
+        "TransposeXY (Correction On) did not transpose the image"
+    print("Goal 9 bug fix: TransposeCorrection+TransposeXY transposes the image (shape",
+          baseline_img.shape, "->", swapped_img.shape, ")")
+else:
+    # Real camera: BuildAndSwapFrame() reads Transpose* fresh every frame on
+    # its own frame-builder thread, no clearROI() nudge needed -- just give
+    # it one refresh cycle (EBS-ViewDisplayRefreshMs, 1ms default) to react.
+    core.setProperty("ProphEBSCam", "TransposeCorrection", "1")
+    core.setProperty("ProphEBSCam", "TransposeXY", "1")
+    time.sleep(0.1)
+    core.snapImage()
+    swapped_img = core.getImage()
+    assert swapped_img.shape == (baseline_img.shape[1], baseline_img.shape[0]), \
+        f"TransposeXY should swap image dimensions {baseline_img.shape} -> " \
+        f"{(baseline_img.shape[1], baseline_img.shape[0])}, got {swapped_img.shape}"
+    print("Goal 9 bug fix: TransposeCorrection+TransposeXY transposes image shape",
+          baseline_img.shape, "->", swapped_img.shape,
+          "(pixel-level Mirror/SwapXY checks skipped -- real camera streaming, frame content isn't static)")
+
+core.setProperty("ProphEBSCam", "TransposeCorrection", original_correction)
+core.setProperty("ProphEBSCam", "TransposeMirrorX", original_mirror_x)
+core.setProperty("ProphEBSCam", "TransposeMirrorY", original_mirror_y)
+core.setProperty("ProphEBSCam", "TransposeXY", original_swap_xy)
+if connection_status != "Connected":
+    core.clearROI()  # picks up the restored (non-swapped) Transpose* values
+else:
+    # Real camera: give the frame-builder thread at least one refresh cycle
+    # to actually rebuild backImg_ at the restored (non-swapped) dimensions
+    # before anything downstream snaps -- otherwise a snap taken immediately
+    # after restoring TransposeXY can still catch the still-swapped frame
+    # that was mid-flight when the property was set back.
+    time.sleep(0.1)
+core.snapImage()  # restore image dimensions before any following ROI-shape assertions
 
 # Goal 6: software activity-noise filter properties.
 threshold_lo = int(core.getPropertyLowerLimit("ProphEBSCam", "EBS-ActivityFilter-Threshold-us"))
@@ -367,7 +465,7 @@ else:
 # Goal 6 follow-up: sub-millisecond integration windows. Exposure's lower
 # limit dropped from 1.0 ms to 0.001 ms (1 microsecond -- the finest
 # resolution Metavision::EventCD::t itself can represent), and a new
-# EBS-DisplayRefreshMs property decouples "how long is one integration
+# EBS-ViewDisplayRefreshMs property decouples "how long is one integration
 # window" from "how often is a frame actually published."
 assert abs(core.getPropertyLowerLimit("ProphEBSCam", "Exposure") - 0.001) < 1e-9, \
     "expected Exposure's lower limit to be 0.001 ms after the sub-ms follow-up"
@@ -376,13 +474,13 @@ assert abs(float(core.getProperty("ProphEBSCam", "Exposure")) - 0.05) < 1e-9
 print("Goal 6 follow-up: Exposure round-tripped to 0.05 ms (sub-millisecond)")
 core.setProperty("ProphEBSCam", "Exposure", original_exposure)
 
-refresh_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-DisplayRefreshMs")
-refresh_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-DisplayRefreshMs")
-original_refresh = core.getProperty("ProphEBSCam", "EBS-DisplayRefreshMs")
-core.setProperty("ProphEBSCam", "EBS-DisplayRefreshMs", "5")
-assert float(core.getProperty("ProphEBSCam", "EBS-DisplayRefreshMs")) == 5.0
-print("Goal 6 follow-up: EBS-DisplayRefreshMs round-tripped to 5 ms (limits", refresh_lo, "-", refresh_hi, ")")
-core.setProperty("ProphEBSCam", "EBS-DisplayRefreshMs", original_refresh)
+refresh_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-ViewDisplayRefreshMs")
+refresh_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-ViewDisplayRefreshMs")
+original_refresh = core.getProperty("ProphEBSCam", "EBS-ViewDisplayRefreshMs")
+core.setProperty("ProphEBSCam", "EBS-ViewDisplayRefreshMs", "5")
+assert float(core.getProperty("ProphEBSCam", "EBS-ViewDisplayRefreshMs")) == 5.0
+print("Goal 6 follow-up: EBS-ViewDisplayRefreshMs round-tripped to 5 ms (limits", refresh_lo, "-", refresh_hi, ")")
+core.setProperty("ProphEBSCam", "EBS-ViewDisplayRefreshMs", original_refresh)
 
 # Goal 6 follow-up: with a real EBS connected, run genuinely sub-millisecond
 # integration windows (down to the 0.001 ms floor) with a fast 1 ms display
@@ -393,7 +491,7 @@ core.setProperty("ProphEBSCam", "EBS-DisplayRefreshMs", original_refresh)
 # time. Snap before/after to confirm the frame pipeline is still alive and
 # producing correctly-shaped frames, not hung or crashed.
 if connection_status == "Connected":
-    core.setProperty("ProphEBSCam", "EBS-DisplayRefreshMs", "1")
+    core.setProperty("ProphEBSCam", "EBS-ViewDisplayRefreshMs", "1")
     for sub_ms_exposure in (0.1, 0.01, 0.001):
         core.setExposure("ProphEBSCam", sub_ms_exposure)
         time.sleep(0.3)
@@ -402,24 +500,24 @@ if connection_status == "Connected":
         assert img.shape == img_before.shape and img.dtype == img_before.dtype
         print("Goal 6 follow-up: Exposure =", sub_ms_exposure, "ms survived a 300ms burst, image",
               img.shape, img.dtype)
-    core.setProperty("ProphEBSCam", "EBS-DisplayRefreshMs", original_refresh)
+    core.setProperty("ProphEBSCam", "EBS-ViewDisplayRefreshMs", original_refresh)
     core.setProperty("ProphEBSCam", "Exposure", original_exposure)
 else:
     print("Goal 6 follow-up: no EBS connected -- skipping sub-millisecond stress check")
 
 # Bug fix: Live view (unbounded StartSequenceAcquisition) must push frames at
-# max(Exposure, EBS-LiveViewMinIntervalMs), never at whatever interval
+# max(Exposure, EBS-ViewLiveMinIntervalMs), never at whatever interval
 # happens to be passed in -- MMCore's own "unused" parameter contract. New
-# EBS-LiveViewMinIntervalMs property (default 5 ms) round-trip first.
-minint_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-LiveViewMinIntervalMs")
-minint_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-LiveViewMinIntervalMs")
-original_min_interval = core.getProperty("ProphEBSCam", "EBS-LiveViewMinIntervalMs")
-assert abs(float(original_min_interval) - 5.0) < 1e-9, "expected EBS-LiveViewMinIntervalMs to default to 5.0 ms"
-core.setProperty("ProphEBSCam", "EBS-LiveViewMinIntervalMs", "20")
-assert float(core.getProperty("ProphEBSCam", "EBS-LiveViewMinIntervalMs")) == 20.0
-print("Goal 6 follow-up (Live-cadence bug fix): EBS-LiveViewMinIntervalMs round-tripped to 20 ms (limits",
+# EBS-ViewLiveMinIntervalMs property (default 5 ms) round-trip first.
+minint_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-ViewLiveMinIntervalMs")
+minint_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-ViewLiveMinIntervalMs")
+original_min_interval = core.getProperty("ProphEBSCam", "EBS-ViewLiveMinIntervalMs")
+assert abs(float(original_min_interval) - 5.0) < 1e-9, "expected EBS-ViewLiveMinIntervalMs to default to 5.0 ms"
+core.setProperty("ProphEBSCam", "EBS-ViewLiveMinIntervalMs", "20")
+assert float(core.getProperty("ProphEBSCam", "EBS-ViewLiveMinIntervalMs")) == 20.0
+print("Goal 6 follow-up (Live-cadence bug fix): EBS-ViewLiveMinIntervalMs round-tripped to 20 ms (limits",
       minint_lo, "-", minint_hi, ", default 5)")
-core.setProperty("ProphEBSCam", "EBS-LiveViewMinIntervalMs", original_min_interval)
+core.setProperty("ProphEBSCam", "EBS-ViewLiveMinIntervalMs", original_min_interval)
 
 # Simulates the exact failure mode found by the user: setting a
 # sub-millisecond Exposure, then starting continuous acquisition with that
@@ -428,7 +526,7 @@ core.setProperty("ProphEBSCam", "EBS-LiveViewMinIntervalMs", original_min_interv
 # would. Before the fix this made ProphEBSSequenceThread push ~1000
 # frames/sec, overwhelming MMCore's circular buffer and producing an
 # ever-growing display backlog/latency. After the fix, Live view is bounded
-# by EBS-LiveViewMinIntervalMs (default 5 ms -> ~200 frames/sec) even though
+# by EBS-ViewLiveMinIntervalMs (default 5 ms -> ~200 frames/sec) even though
 # Exposure itself is sub-ms -- checked loosely (order-of-magnitude) since
 # real thread-wakeup jitter means an exact frame count isn't reproducible.
 if connection_status == "Connected":
@@ -440,7 +538,7 @@ if connection_status == "Connected":
     print("Goal 6 follow-up (Live-cadence bug fix): sub-ms Exposure (floor-bounded) + 1s of continuous "
           "acquisition buffered", n_buffered_sub_ms, "frames")
     assert n_buffered_sub_ms < 500, \
-        f"expected roughly ~200 frames/sec (bounded by the 5 ms EBS-LiveViewMinIntervalMs floor), " \
+        f"expected roughly ~200 frames/sec (bounded by the 5 ms EBS-ViewLiveMinIntervalMs floor), " \
         f"got {n_buffered_sub_ms} -- Live view may be pushing frames far faster than the GUI can consume again"
     while core.getRemainingImageCount() > 0:
         core.popNextImage()
@@ -463,34 +561,34 @@ if connection_status == "Connected":
 else:
     print("Goal 6 follow-up: no EBS connected -- skipping Live-cadence bug-fix check")
 
-# Follow-up: backlog detection/flush. EBS-BacklogFlushThresholdMs round-trip
+# Follow-up: backlog detection/flush. EBS-AvgBacklogFlushThresholdMs round-trip
 # first, then (with a real camera) force the threshold artificially low so
 # that ordinary real-time callback jitter reliably trips it within a short
-# streaming burst -- confirming both EBS-CallbackLagMs and
-# EBS-BacklogFlushCount are wired up and moving, not just present.
-thresh_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-BacklogFlushThresholdMs")
-thresh_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-BacklogFlushThresholdMs")
-original_threshold = core.getProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs")
-assert abs(float(original_threshold) - 250.0) < 1e-9, "expected EBS-BacklogFlushThresholdMs to default to 250 ms"
-core.setProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs", "500")
-assert float(core.getProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs")) == 500.0
-print("Follow-up: EBS-BacklogFlushThresholdMs round-tripped to 500 ms (limits", thresh_lo, "-", thresh_hi,
+# streaming burst -- confirming both EBS-AvgCallbackLagMs and
+# EBS-AvgBacklogFlushCount are wired up and moving, not just present.
+thresh_lo = core.getPropertyLowerLimit("ProphEBSCam", "EBS-AvgBacklogFlushThresholdMs")
+thresh_hi = core.getPropertyUpperLimit("ProphEBSCam", "EBS-AvgBacklogFlushThresholdMs")
+original_threshold = core.getProperty("ProphEBSCam", "EBS-AvgBacklogFlushThresholdMs")
+assert abs(float(original_threshold) - 250.0) < 1e-9, "expected EBS-AvgBacklogFlushThresholdMs to default to 250 ms"
+core.setProperty("ProphEBSCam", "EBS-AvgBacklogFlushThresholdMs", "500")
+assert float(core.getProperty("ProphEBSCam", "EBS-AvgBacklogFlushThresholdMs")) == 500.0
+print("Follow-up: EBS-AvgBacklogFlushThresholdMs round-tripped to 500 ms (limits", thresh_lo, "-", thresh_hi,
       ", default 250)")
-core.setProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs", original_threshold)
+core.setProperty("ProphEBSCam", "EBS-AvgBacklogFlushThresholdMs", original_threshold)
 
 if connection_status == "Connected":
-    lag_before = float(core.getProperty("ProphEBSCam", "EBS-CallbackLagMs"))
-    flushes_before = float(core.getProperty("ProphEBSCam", "EBS-BacklogFlushCount"))
-    core.setProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs", str(thresh_lo))  # near-guaranteed trip
+    lag_before = float(core.getProperty("ProphEBSCam", "EBS-AvgCallbackLagMs"))
+    flushes_before = float(core.getProperty("ProphEBSCam", "EBS-AvgBacklogFlushCount"))
+    core.setProperty("ProphEBSCam", "EBS-AvgBacklogFlushThresholdMs", str(thresh_lo))  # near-guaranteed trip
     time.sleep(1.0)
-    lag_after = float(core.getProperty("ProphEBSCam", "EBS-CallbackLagMs"))
-    flushes_after = float(core.getProperty("ProphEBSCam", "EBS-BacklogFlushCount"))
-    core.setProperty("ProphEBSCam", "EBS-BacklogFlushThresholdMs", original_threshold)
-    print("Follow-up: EBS-CallbackLagMs", lag_before, "->", lag_after,
-          ", EBS-BacklogFlushCount", flushes_before, "->", flushes_after,
+    lag_after = float(core.getProperty("ProphEBSCam", "EBS-AvgCallbackLagMs"))
+    flushes_after = float(core.getProperty("ProphEBSCam", "EBS-AvgBacklogFlushCount"))
+    core.setProperty("ProphEBSCam", "EBS-AvgBacklogFlushThresholdMs", original_threshold)
+    print("Follow-up: EBS-AvgCallbackLagMs", lag_before, "->", lag_after,
+          ", EBS-AvgBacklogFlushCount", flushes_before, "->", flushes_after,
           "(threshold forced to 0.001 ms for 1s)")
     assert flushes_after > flushes_before, \
-        "expected EBS-BacklogFlushCount to increase once EBS-BacklogFlushThresholdMs was forced near zero"
+        "expected EBS-AvgBacklogFlushCount to increase once EBS-AvgBacklogFlushThresholdMs was forced near zero"
     # Snap after restoring the threshold, confirming the adapter is still in
     # a normal working state post-flush (no regression from the fast path).
     img_after_flush = core.snapImage()
@@ -499,23 +597,23 @@ if connection_status == "Connected":
 else:
     print("Follow-up: no EBS connected -- skipping backlog-flush trigger check")
 
-# Goal 7: EBS-BlockedPixels -- round-trip a valid list, then confirm a
+# Goal 7: EBS-HotPixelBlockedPixels -- round-trip a valid list, then confirm a
 # malformed string is rejected wholesale (the previous valid value is
 # retained, not partially applied).
-original_blocked = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
-core.setProperty("ProphEBSCam", "EBS-BlockedPixels", "5:5;10:20")
-assert core.getProperty("ProphEBSCam", "EBS-BlockedPixels") == "5:5;10:20"
-print("Goal 7: EBS-BlockedPixels round-tripped '5:5;10:20'")
+original_blocked = core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels")
+core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", "5:5;10:20")
+assert core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels") == "5:5;10:20"
+print("Goal 7: EBS-HotPixelBlockedPixels round-tripped '5:5;10:20'")
 try:
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", "abc")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", "abc")
     malformed_rejected = False
 except Exception:
     malformed_rejected = True
-assert malformed_rejected, "expected a malformed EBS-BlockedPixels value to be rejected"
-assert core.getProperty("ProphEBSCam", "EBS-BlockedPixels") == "5:5;10:20", \
-    "expected the previous valid EBS-BlockedPixels value to be retained after a rejected malformed set"
-print("Goal 7: malformed EBS-BlockedPixels ('abc') correctly rejected, previous value retained")
-core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+assert malformed_rejected, "expected a malformed EBS-HotPixelBlockedPixels value to be rejected"
+assert core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels") == "5:5;10:20", \
+    "expected the previous valid EBS-HotPixelBlockedPixels value to be retained after a rejected malformed set"
+print("Goal 7: malformed EBS-HotPixelBlockedPixels ('abc') correctly rejected, previous value retained")
+core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", original_blocked)
 
 # Goal 7: hot-pixel calibration properties/trigger exist and round-trip.
 # With no camera streaming, triggering calibration must complete promptly
@@ -539,17 +637,17 @@ print("Goal 7: EBS-HotPixelStddevK round-tripped to 2.5 (limits", k_lo, "-", k_h
 # below needs a realistic k, not this round-trip probe value.
 core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", original_hotpixel_k)
 
-assert set(core.getAllowedPropertyValues("ProphEBSCam", "EBS-DetectHotPixelsNow")) == {"Idle", "Run"}
+assert set(core.getAllowedPropertyValues("ProphEBSCam", "EBS-HotPixelDetectNow")) == {"Idle", "Run"}
 
 if connection_status != "Connected":
     t0 = time.time()
-    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelDetectNow", "Run")
     elapsed = time.time() - t0
     assert elapsed < 5.0, f"calibration with no camera should fail promptly, took {elapsed:.1f}s"
     status = core.getProperty("ProphEBSCam", "EBS-HotPixelCalibStatus")
     assert status.startswith("Failed:"), f"expected a clean failure with no camera, got: {status}"
-    assert core.getProperty("ProphEBSCam", "EBS-DetectHotPixelsNow") == "Idle"
-    print("Goal 7: EBS-DetectHotPixelsNow with no camera failed promptly and cleanly:", status)
+    assert core.getProperty("ProphEBSCam", "EBS-HotPixelDetectNow") == "Idle"
+    print("Goal 7: EBS-HotPixelDetectNow with no camera failed promptly and cleanly:", status)
 else:
     print("Goal 7: skipping the no-camera calibration-failure check (a camera is connected)")
 
@@ -602,25 +700,25 @@ if connection_status == "Connected":
     # since ClearROI() was just called above), not the whole chip
     # unconditionally -- see ProphEBS.cpp's OnDetectHotPixelsNow().
     t0 = time.time()
-    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelDetectNow", "Run")
     elapsed = time.time() - t0
     calib_status = core.getProperty("ProphEBSCam", "EBS-HotPixelCalibStatus")
     print("Goal 7: real-hardware calibration (default 5000ms/k=10) took", f"{elapsed:.2f}s", ", status:",
           calib_status)
     assert calib_status.startswith("Done:") or calib_status.startswith("Failed:"), \
         f"expected calibration to finish in a well-defined state, got: {calib_status}"
-    assert core.getProperty("ProphEBSCam", "EBS-DetectHotPixelsNow") == "Idle"
-    blocked_after_calib = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
-    print("Goal 7: EBS-BlockedPixels after calibration:", blocked_after_calib)
+    assert core.getProperty("ProphEBSCam", "EBS-HotPixelDetectNow") == "Idle"
+    blocked_after_calib = core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels")
+    print("Goal 7: EBS-HotPixelBlockedPixels after calibration:", blocked_after_calib)
     # Sanity-check the serialized format is well-formed (parseable pairs).
     if blocked_after_calib:
         for pair in blocked_after_calib.split(";"):
             px, py = pair.split(":")
             int(px)
             int(py)
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", original_blocked)
 
-    # Confirm calibration REPLACES EBS-BlockedPixels rather than merging
+    # Confirm calibration REPLACES EBS-HotPixelBlockedPixels rather than merging
     # into it (a deliberate change: calibration now unblocks everything
     # first, then re-detects from a clean population -- see
     # ProphEBS.cpp's OnDetectHotPixelsNow()). Manually block an arbitrary
@@ -629,32 +727,32 @@ if connection_status == "Connected":
     # confirm the manually-added pixel is gone afterward -- if calibration
     # still merged, it would still be present.
     sentinel_pixel = "500:500"
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", sentinel_pixel)
-    assert core.getProperty("ProphEBSCam", "EBS-BlockedPixels") == sentinel_pixel
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", sentinel_pixel)
+    assert core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels") == sentinel_pixel
     core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "200")
     core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", original_hotpixel_k)
-    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
-    blocked_after_replace = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
-    print("Goal 7: EBS-BlockedPixels after calibration following a manual set of", sentinel_pixel, ":",
+    core.setProperty("ProphEBSCam", "EBS-HotPixelDetectNow", "Run")
+    blocked_after_replace = core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels")
+    print("Goal 7: EBS-HotPixelBlockedPixels after calibration following a manual set of", sentinel_pixel, ":",
           blocked_after_replace)
     assert sentinel_pixel not in (blocked_after_replace or "").split(";"), \
-        f"expected calibration to REPLACE EBS-BlockedPixels (clearing the manually-set {sentinel_pixel} " \
+        f"expected calibration to REPLACE EBS-HotPixelBlockedPixels (clearing the manually-set {sentinel_pixel} " \
         f"first), but it's still present after a run -- calibration is still merging, not replacing"
-    print("Goal 7: confirmed -- calibration replaced EBS-BlockedPixels rather than merging into it")
+    print("Goal 7: confirmed -- calibration replaced EBS-HotPixelBlockedPixels rather than merging into it")
     core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "5000")
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", original_blocked)
 
     # Confirm calibration is actually scoped to the active ROI, not the
     # whole chip: set a small ROI, run calibration, and check every
-    # resulting EBS-BlockedPixels coordinate falls inside that ROI's
+    # resulting EBS-HotPixelBlockedPixels coordinate falls inside that ROI's
     # bounds (with the loosest possible k, so *something* is very likely
     # to be flagged even in a short window -- this checks scoping, not
     # detection sensitivity).
     core.setROI("ProphEBSCam", roi_x, roi_y, roi_w, roi_h)
     core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", str(k_lo))
     core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "200")
-    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
-    roi_scoped_blocked = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelDetectNow", "Run")
+    roi_scoped_blocked = core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels")
     print("Goal 7: ROI-scoped calibration (ROI", (roi_x, roi_y, roi_w, roi_h), ") found:", roi_scoped_blocked)
     if roi_scoped_blocked:
         for pair in roi_scoped_blocked.split(";"):
@@ -669,46 +767,46 @@ if connection_status == "Connected":
     core.clearROI()
     core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", original_hotpixel_k)
     core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "5000")
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", original_blocked)
 
     # Deliberately loose-threshold stress test: force EBS-HotPixelStddevK to
     # its floor with a short duration so a large fraction of pixels statistically
     # qualify as "outliers," exercising the truncation-safety-cap path
-    # (EBS-BlockedPixels must never be allowed to grow past what MMCore's
+    # (EBS-HotPixelBlockedPixels must never be allowed to grow past what MMCore's
     # MM::MaxStrLength property-value limit can hold -- see ProphEBS.cpp's
     # OnDetectHotPixelsNow()/the "found via self-testing" comment there).
     core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", str(k_lo))
     core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "200")
-    core.setProperty("ProphEBSCam", "EBS-DetectHotPixelsNow", "Run")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelDetectNow", "Run")
     stress_status = core.getProperty("ProphEBSCam", "EBS-HotPixelCalibStatus")
-    stress_blocked = core.getProperty("ProphEBSCam", "EBS-BlockedPixels")
+    stress_blocked = core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels")
     print("Goal 7: loose-threshold stress calibration status:", stress_status)
     assert len(stress_blocked) <= 1024, \
-        f"EBS-BlockedPixels must never exceed MMCore's 1024-char property limit, got {len(stress_blocked)} chars"
+        f"EBS-HotPixelBlockedPixels must never exceed MMCore's 1024-char property limit, got {len(stress_blocked)} chars"
     if stress_status.startswith("Done:") and "dropped" in stress_status:
         print("Goal 7: truncation-safety cap engaged as expected under a deliberately loose threshold:",
               stress_status)
     core.setProperty("ProphEBSCam", "EBS-HotPixelStddevK", original_hotpixel_k)
     core.setProperty("ProphEBSCam", "EBS-HotPixelCalibDurationMs", "5000")
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", original_blocked)
 
-    # Manually setting EBS-BlockedPixels against real hardware shouldn't
+    # Manually setting EBS-HotPixelBlockedPixels against real hardware shouldn't
     # break subsequent snaps.
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", "3:3;7:9")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", "3:3;7:9")
     core.snapImage()
     core.getImage()
-    print("Goal 7: manual EBS-BlockedPixels set against real hardware, snap still succeeded")
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+    print("Goal 7: manual EBS-HotPixelBlockedPixels set against real hardware, snap still succeeded")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", original_blocked)
 
     # Does blocking a pixel actually stop it from generating events, or just
-    # get recorded in EBS-BlockedPixels without hardware effect? Block a
+    # get recorded in EBS-HotPixelBlockedPixels without hardware effect? Block a
     # 7x7 region (0,0)-(6,6) -- 49 entries, deliberately kept under this
     # sensor's 64-slot I_DigitalEventMask hardware limit (see
     # ApplyBlockedPixelsToHardware()) so every single one of these pixels
-    # is actually pushed to hardware, not just listed in EBS-BlockedPixels
-    # -- and watch that exact region in the live view: with
-    # EBS-ViewOffset=0 and a large EBS-ViewScale, even a single CD event in
-    # a window makes its pixel visibly nonzero. Critically, this needs a
+    # is actually pushed to hardware, not just listed in EBS-HotPixelBlockedPixels
+    # -- and watch that exact region in the live view: with EBS-ViewOffset=0,
+    # even a single CD event in a window makes its pixel visibly nonzero
+    # (raw count >= 1). Critically, this needs a
     # real BEFORE/AFTER comparison of the *same* region, not just "is it
     # zero" -- a corner of the sensor could easily show zero activity on
     # its own (dark/no motion there), which would make the assertion pass
@@ -719,7 +817,6 @@ if connection_status == "Connected":
     # goes to zero while the rest of the frame keeps showing activity.
     original_view_mode2 = core.getProperty("ProphEBSCam", "EBS-ViewMode")
     original_view_offset2 = core.getProperty("ProphEBSCam", "EBS-ViewOffset")
-    original_view_scale2 = core.getProperty("ProphEBSCam", "EBS-ViewScale")
     original_exposure2 = core.getProperty("ProphEBSCam", "Exposure")
     MASK_TEST_REGION = 7  # 7*7 = 49, comfortably under the 64-slot hardware limit
     block_region = ";".join(f"{x}:{y}" for x in range(MASK_TEST_REGION) for y in range(MASK_TEST_REGION))
@@ -749,10 +846,9 @@ if connection_status == "Connected":
           core.getProperty("ProphEBSCam", "EBS-bias_diff_on"), ", EBS-bias_diff_off =",
           core.getProperty("ProphEBSCam", "EBS-bias_diff_off"))
 
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", "")
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", "")
     core.setProperty("ProphEBSCam", "EBS-ViewMode", "Merged")
     core.setProperty("ProphEBSCam", "EBS-ViewOffset", "0")
-    core.setProperty("ProphEBSCam", "EBS-ViewScale", "50")
 
     def sample_region_max(region_slice, exposure_ms, n_snaps):
         core.setProperty("ProphEBSCam", "Exposure", str(exposure_ms))
@@ -779,8 +875,8 @@ if connection_status == "Connected":
               "exposure up to 1000ms; masking effectiveness cannot be conclusively tested this run "
               "(inconclusive, not a pass or fail) -- likely just a quiet/dark corner of the current scene")
     else:
-        core.setProperty("ProphEBSCam", "EBS-BlockedPixels", block_region)
-        assert core.getProperty("ProphEBSCam", "EBS-BlockedPixels") == block_region
+        core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", block_region)
+        assert core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels") == block_region
         masked_region_max = sample_region_max(region_slice, exposure_ms, 10)
         rest_of_frame_max = 0
         core.snapImage()
@@ -791,7 +887,7 @@ if connection_status == "Connected":
         assert rest_of_frame_max > 0, \
             "expected real activity somewhere outside the blocked region as a sanity control -- got none at all"
         assert masked_region_max == 0, \
-            f"EBS-BlockedPixels claims {MASK_TEST_REGION * MASK_TEST_REGION} pixels in {region_label} are " \
+            f"EBS-HotPixelBlockedPixels claims {MASK_TEST_REGION * MASK_TEST_REGION} pixels in {region_label} are " \
             f"masked, but events are still landing there (max pixel value {masked_region_max}, vs " \
             f"{baseline_max} unmasked at the same exposure) -- hardware masking is not actually suppressing them"
         print("Goal 7: confirmed -- region", region_label, "went from real activity (unmasked) to zero events "
@@ -799,11 +895,10 @@ if connection_status == "Connected":
 
     core.setProperty("ProphEBSCam", "EBS-ViewMode", original_view_mode2)
     core.setProperty("ProphEBSCam", "EBS-ViewOffset", original_view_offset2)
-    core.setProperty("ProphEBSCam", "EBS-ViewScale", original_view_scale2)
     core.setProperty("ProphEBSCam", "Exposure", original_exposure2)
     core.setProperty("ProphEBSCam", "EBS-bias_diff_on", original_bias_on)
     core.setProperty("ProphEBSCam", "EBS-bias_diff_off", original_bias_off)
-    core.setProperty("ProphEBSCam", "EBS-BlockedPixels", original_blocked)
+    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", original_blocked)
 else:
     print("Goal 7: no EBS connected -- skipping hardware ROI/hot-pixel-calibration checks "
           "(GetROI/SetROI/ClearROI round-trip still exercised via the fallback checkerboard below)")
@@ -918,11 +1013,11 @@ print("Goal 8: EBS-SyncMode (pre-init) still reads back its configured value:", 
 # real, changing scene to observe meaningfully -- see the user's GUI
 # walkthrough for that).
 original_view_mode3 = core.getProperty("ProphEBSCam", "EBS-ViewMode")
-original_decay_us = core.getProperty("ProphEBSCam", "EBS-TimeDecay-TimeConstant-us")
+original_decay_us = core.getProperty("ProphEBSCam", "EBS-ViewModeTimeDecay_DecayTime_Constant-us")
 core.setProperty("ProphEBSCam", "EBS-ViewMode", "TimeDecay")
 assert core.getProperty("ProphEBSCam", "EBS-ViewMode") == "TimeDecay"
-core.setProperty("ProphEBSCam", "EBS-TimeDecay-TimeConstant-us", "5000")
-assert float(core.getProperty("ProphEBSCam", "EBS-TimeDecay-TimeConstant-us")) == 5000.0
+core.setProperty("ProphEBSCam", "EBS-ViewModeTimeDecay_DecayTime_Constant-us", "5000")
+assert float(core.getProperty("ProphEBSCam", "EBS-ViewModeTimeDecay_DecayTime_Constant-us")) == 5000.0
 if connection_status == "Connected":
     time.sleep(0.3)  # let a few real events accumulate under the new mode
 core.snapImage()
@@ -930,8 +1025,160 @@ decay_img = core.getImage()
 assert decay_img.shape == (full_h, full_w) and decay_img.dtype == np.uint8, \
     f"TimeDecay mode: expected shape {(full_h, full_w)} uint8, got {decay_img.shape} {decay_img.dtype}"
 core.setProperty("ProphEBSCam", "EBS-ViewMode", original_view_mode3)
-core.setProperty("ProphEBSCam", "EBS-TimeDecay-TimeConstant-us", original_decay_us)
+core.setProperty("ProphEBSCam", "EBS-ViewModeTimeDecay_DecayTime_Constant-us", original_decay_us)
 print("Goal 8: TimeDecay view mode round-tripped, snap shape/dtype:", decay_img.shape, decay_img.dtype)
+
+# ---------------------------------------------------------------------------
+# Goal 9: full-suite polishing -- negative/error-path checks. Goals 1-8's
+# self-test was almost entirely happy-path round-trips (the one exception
+# being the malformed EBS-HotPixelBlockedPixels check above); the checks
+# below specifically probe MMCore's SetPropertyLimits()/AddAllowedValue()
+# enforcement (rejecting bad input), since that enforcement is the actual
+# "error handling" this adapter relies on -- a broken/missing
+# SetPropertyLimits()/AddAllowedValue() call would otherwise slip by
+# unnoticed by a purely happy-path suite.
+# ---------------------------------------------------------------------------
+
+
+def assert_rejected(prop, bad_value):
+    """True if MMCore refused bad_value for prop -- either by raising, or by
+    silently leaving the property at its prior value (some limit paths clamp
+    rather than throw). Restores the property to its prior value either way."""
+    before = core.getProperty("ProphEBSCam", prop)
+    try:
+        core.setProperty("ProphEBSCam", prop, str(bad_value))
+        rejected = False
+    except Exception:
+        rejected = True
+    after = core.getProperty("ProphEBSCam", prop)
+    if not rejected:
+        rejected = (after == before)
+    core.setProperty("ProphEBSCam", prop, before)
+    return rejected
+
+
+# Out-of-range checks against properties whose limits are set unconditionally
+# in Initialize() (i.e. regardless of whether a camera is connected), so
+# these always run.
+duration_hi_oob = core.getPropertyUpperLimit("ProphEBSCam", "EBS-HotPixelCalibDurationMs") + 100000.0
+assert assert_rejected("EBS-HotPixelCalibDurationMs", duration_hi_oob), \
+    "expected an out-of-range EBS-HotPixelCalibDurationMs to be rejected"
+print("Goal 9: out-of-range EBS-HotPixelCalibDurationMs correctly rejected")
+
+k_hi_oob = core.getPropertyUpperLimit("ProphEBSCam", "EBS-HotPixelStddevK") + 1000.0
+assert assert_rejected("EBS-HotPixelStddevK", k_hi_oob), \
+    "expected an out-of-range EBS-HotPixelStddevK to be rejected"
+print("Goal 9: out-of-range EBS-HotPixelStddevK correctly rejected")
+
+assert assert_rejected("EBS-TriggerOut-DutyCycle", 5.0), \
+    "expected an out-of-range EBS-TriggerOut-DutyCycle (5.0, limit is 0.0-1.0) to be rejected"
+print("Goal 9: out-of-range EBS-TriggerOut-DutyCycle correctly rejected")
+
+assert assert_rejected("EBS-ViewOffset", 99999), \
+    "expected an out-of-range EBS-ViewOffset (limit is 0-255) to be rejected"
+print("Goal 9: out-of-range EBS-ViewOffset correctly rejected")
+
+assert assert_rejected("Exposure", -5.0), \
+    "expected a negative Exposure (limit floor is 0.001 ms) to be rejected"
+print("Goal 9: negative Exposure correctly rejected")
+
+# Out-of-range checks against properties whose limits are only established
+# once a real camera reports its supported range (Goal 5/8) -- only
+# meaningful, and only run, with hardware connected.
+if connection_status == "Connected":
+    if core.hasPropertyLimits("ProphEBSCam", "EBS-ERC-EventRate"):
+        erc_hi_oob = core.getPropertyUpperLimit("ProphEBSCam", "EBS-ERC-EventRate") + 1000000000.0
+        assert assert_rejected("EBS-ERC-EventRate", erc_hi_oob), \
+            "expected an out-of-range EBS-ERC-EventRate to be rejected"
+        print("Goal 9: out-of-range EBS-ERC-EventRate correctly rejected")
+
+    if bias_props and core.hasPropertyLimits("ProphEBSCam", bias_props[0]):
+        bias_hi_oob = core.getPropertyUpperLimit("ProphEBSCam", bias_props[0]) + 100000
+        assert assert_rejected(bias_props[0], bias_hi_oob), \
+            f"expected an out-of-range {bias_props[0]} to be rejected"
+        print(f"Goal 9: out-of-range {bias_props[0]} correctly rejected")
+
+    if core.hasPropertyLimits("ProphEBSCam", "EBS-AntiFlicker-HighFreq"):
+        af_hi_oob = core.getPropertyUpperLimit("ProphEBSCam", "EBS-AntiFlicker-HighFreq") + 100000
+        assert assert_rejected("EBS-AntiFlicker-HighFreq", af_hi_oob), \
+            "expected an out-of-range EBS-AntiFlicker-HighFreq to be rejected"
+        print("Goal 9: out-of-range EBS-AntiFlicker-HighFreq correctly rejected")
+
+    if core.hasPropertyLimits("ProphEBSCam", "EBS-EventRateFilter-UpperStop"):
+        erf_hi_oob = core.getPropertyUpperLimit("ProphEBSCam", "EBS-EventRateFilter-UpperStop") + 1000000000.0
+        assert assert_rejected("EBS-EventRateFilter-UpperStop", erf_hi_oob), \
+            "expected an out-of-range EBS-EventRateFilter-UpperStop to be rejected"
+        print("Goal 9: out-of-range EBS-EventRateFilter-UpperStop correctly rejected")
+else:
+    print("Goal 9: no EBS connected -- skipping out-of-range checks for hardware-range-dependent "
+          "properties (bias/ERC/anti-flicker/event-rate-filter have no limits set without a "
+          "connected camera, so there is nothing to enforce)")
+
+# Invalid-enum-string rejection: each of these uses AddAllowedValue(), so a
+# nonsense string should be rejected outright by MMCore, with the previous
+# valid value retained -- not silently substituted or accepted.
+for prop, valid_restore in (
+    ("EBS-ViewMode", "NetSigned"),
+    ("EBS-EventTrailFilter-Mode", "TRAIL"),
+    ("EBS-TriggerIn-Channel", None),
+    ("EBS-AntiFlicker-FilterType", "Band Cut"),
+):
+    before = core.getProperty("ProphEBSCam", prop)
+    try:
+        core.setProperty("ProphEBSCam", prop, "NotARealValue")
+        rejected = False
+    except Exception:
+        rejected = True
+    after = core.getProperty("ProphEBSCam", prop)
+    assert rejected or after == before, f"expected an invalid enum string for {prop} to be rejected"
+    if valid_restore is not None:
+        core.setProperty("ProphEBSCam", prop, valid_restore)
+    print(f"Goal 9: invalid enum value for {prop} correctly rejected, previous value retained")
+
+# Pre-init-only properties (EBS-biasRangeCheckBypass, EBS-SyncMode): raw
+# MMCore's own PropertyCollection::Set() (MMDevice/Property.cpp) only ever
+# checks the per-property readOnly_ flag, never IsPropertyPreInit() -- so at
+# the bare Core API level a post-init setProperty() call is not blocked
+# there (see the comment near the top of this script). But this harness
+# goes through pymmcore-plus's CMMCorePlus.setProperty(), which adds its own
+# extra guard on top of that and actually raises RuntimeError for a
+# pre-init property once the device is initialized -- discovered while
+# writing this very check (an assumption from prose in docs/DEVLOG.md turned
+# out to only describe the bare-Core layer, not this harness's actual
+# wrapper). Confirms the real, observed behavior through this test harness:
+# post-init attempts are rejected, and the value is left unchanged.
+for prop, current_value in (
+    ("EBS-biasRangeCheckBypass", "Off"),
+    ("EBS-SyncMode", "Standalone"),
+):
+    try:
+        core.setProperty("ProphEBSCam", prop, current_value)
+        preinit_rejected = False
+    except RuntimeError:
+        preinit_rejected = True
+    assert preinit_rejected, f"expected pymmcore-plus to reject a post-init setProperty() on {prop}"
+    readback = core.getProperty("ProphEBSCam", prop)
+    assert readback == current_value, f"expected {prop} to still read back {current_value}"
+print("Goal 9: post-init setProperty() on pre-init-only properties "
+      "(EBS-biasRangeCheckBypass, EBS-SyncMode) is correctly rejected by pymmcore-plus "
+      "(RuntimeError), value unchanged")
+
+# Negative/zero SetROI bounds -- confirm a degenerate window doesn't crash
+# the adapter or corrupt the current ROI state. A zero-size window is
+# documented (ProphEBS.cpp, SetROI()) to behave like ClearROI() rather than
+# being rejected outright.
+before_roi = core.getROI("ProphEBSCam")
+try:
+    core.setROI("ProphEBSCam", 0, 0, 0, 0)
+    zero_size_ok = True
+except Exception:
+    zero_size_ok = False
+assert zero_size_ok, "expected a zero-size SetROI to be handled gracefully (equivalent to ClearROI())"
+after_zero = core.getROI("ProphEBSCam")
+print("Goal 9: zero-size SetROI handled gracefully (ROI now", after_zero, ") -- restoring")
+core.setROI("ProphEBSCam", *before_roi)
+assert core.getROI("ProphEBSCam") == before_roi
+print("Goal 9: SetROI restored to", before_roi, "after the zero-size probe, no crash/corruption")
 
 core.unloadDevice("ProphEBSCam")
 print("SUCCESS")
