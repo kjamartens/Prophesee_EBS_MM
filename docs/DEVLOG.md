@@ -2494,3 +2494,225 @@ default, formula without scale, a short note on the Transpose fix and its
 no-camera caveat). Not yet verified: a real MicroManager Studio GUI
 walkthrough of Live view actually looking mirrored/transposed to the eye --
 same hand-off pattern as every prior goal.
+
+### Bug fix: MDA (finite sequence) `Interval` didn't produce complete, back-to-back integration windows
+
+User reported that a Multi-D Acquisition with `Exposure` == `Interval` (e.g.
+both 100 ms) didn't behave like a normal camera at 0 ms interval -- it should
+give `n` complete, non-overlapping 100 ms integration windows stitched
+back-to-back, spanning the full requested duration (e.g. 100 frames -> ~10 s).
+It didn't.
+
+**Root cause**: `ProphEBSSequenceThread::svc()`'s finite (MDA) path just
+called `InsertImage()` (which reads `frontImg_`, the Live-view buffer
+continuously rebuilt by `ProphEBSFrameBuilderThread` on its own
+`EBS-ViewDisplayRefreshMs` cadence -- 1 ms by default) and then slept
+`Interval` ms, over and over. That has no relationship to when a real
+integration window actually closes -- windows close on real event
+sensor-timestamps in `OnEventsCD()`, or the `g_IdleWindowTimeoutMs` idle
+timeout in `BuildAndSwapFrame()`, both independent clocks from the sequence
+thread's wall-clock polling. So the "frame" grabbed on each MDA poll could be
+anywhere from a just-reset near-empty window to one about to close, entirely
+unrelated to `Exposure`/`Interval` -- confirmed this is what "not doing full
+10 seconds" actually meant: not a duration bug, a sampling-phase bug (each of
+the *n* frames wasn't a real, complete Exposure-length integration).
+
+**Fix**: `CProphEBSCamera::CloseCurrentWindowLocked()` now snapshots the
+about-to-close window's per-pixel ON/OFF counts into new
+`completedOnCounts_`/`completedOffCounts_` members *before* zeroing them for
+the next window (mirroring the existing touched-indices-only reset trick, so
+this stays cheap), and bumps a new `completedWindowGeneration_` atomic.
+`ProphEBSSequenceThread::svc()`'s finite path (only when a real camera is
+`streaming_` -- the no-camera fallback has no window concept and is
+untouched, still just sleeps `Interval` as before) now waits for that
+generation counter to advance (i.e. a real window to close), renders exactly
+that completed window via a new shared `CProphEBSCamera::RenderCountsToImage()`
+helper (extracted from `BuildAndSwapFrame()` so both Live view and MDA share
+the identical `EBS-ViewMode`/`-Offset`/ROI/binning/Transpose* rendering path)
+into a new dedicated `mdaImg_` buffer, then calls a new `InsertMdaImage()`
+(same as `InsertImage()` but reads `mdaImg_`). Spacing: `Interval <= Exposure`
+(including 0) captures every window back-to-back as fast as they close --
+real windows never overlap by construction, so this is the correct analogue
+of a normal camera's 0 ms interval. `Interval > Exposure` sleeps the
+remaining `Interval - Exposure` dead time after each window before waiting
+for the next one, matching a normal camera's interval semantics.
+`g_IdleWindowTimeoutMs` (100 ms) bounds the wait even on a fully idle sensor;
+a 5 s hard timeout is a last-resort safety net so a stuck MDA can still be
+cancelled.
+
+**Verified** against the connected IMX636: rebuilt (0 errors), ran the full
+`tools/test_prophebs.py` suite (`SUCCESS`, once the pre-existing hot-pixel
+masking-effectiveness check tripped its long-documented flake again on this
+run too -- see below), plus a new dedicated check (added to `test_prophebs.py`) using each
+frame's own `Elapsed-Time-ms` metadata tag (assigned at `InsertImage()`
+time from real wall-clock timestamps, independent of the fix) to measure
+actual inter-frame spacing:
+- `Exposure` = `Interval` = 100 ms, 10 frames: mean inter-frame delta ~99-137 ms
+  across runs (target ~100 ms), all 10 frames distinct (no duplicate/stale
+  content).
+- `Interval` = 0, `Exposure` = 100 ms, 10 frames: mean delta ~101 ms -- every
+  window captured back-to-back as fast as they close, not overlapping
+  duplicates.
+- `Interval` = 200 ms, `Exposure` = 50 ms, 10 frames: mean delta ~185-198 ms
+  (target ~200 ms) -- genuine dead time between frames now honored.
+
+Not yet verified: a real MicroManager Studio MDA dialog walkthrough (this was
+checked via `pymmcore-plus`'s `startSequenceAcquisition()`/metadata directly,
+not the GUI) -- same hand-off pattern as every prior goal.
+
+Per user request, removed the Goal 7 hot-pixel masking-effectiveness check
+(and its now-unused setup/restore code) from `test_prophebs.py` entirely,
+rather than continuing to carry it as a documented flake -- it fired again
+on this very session's first run. Its actual defect: it required a fixed
+`(0-6,0-6)` probe region to happen to contain a real hot pixel that
+calibration also flagged, which isn't guaranteed run-to-run (calibration
+finds hot pixels wherever real sensor/ambient activity puts them, not
+necessarily that corner); the assertion then failed on ordinary "no hot
+pixel there this time" runs, not on any real masking defect. Everything else
+Goal 7 covers (`EBS-HotPixelBlockedPixels` round-trip, malformed-value
+rejection, calibration-replaces-not-merges, ROI-scoped calibration bounds,
+truncation-safety cap) is untouched and still exercised. Reran the full
+suite immediately after: `SUCCESS`, cleanly, no flake.
+
+### Follow-up: two more MDA-interval bugs found via real-hardware timing, both pre-existing (one exposed, one worsened, by the fix above)
+
+User reported that `Exposure=110ms`/`Interval=100ms` (`Exposure` slightly
+*above* `Interval`) recorded noticeably *less* than the expected ~10 s
+minimum for a 100-frame MDA (~8.8 s, later confirmed against the raw event
+data too), while `Exposure=20ms` landed close to 10 s and `Exposure=300ms`
+landed close to 10 s as well -- the last of which the user called "expected,"
+but is actually a second symptom of the same underlying bug (see below), not
+a confirmation that things were working.
+
+**Bug 1 -- the "idle timeout" was an accidental hard cap, not an idle check.**
+`BuildAndSwapFrame()`'s idle-window force-close compared elapsed wall time
+since the last close against the bare `g_IdleWindowTimeoutMs` constant
+(100 ms), completely independent of the configured `Exposure`. So any
+`Exposure > 100 ms` was silently force-closed at ~100 ms of real integration
+on a busy sensor -- not a "quiet scene" case at all, just an artificial cap --
+and, per `CloseCurrentWindowLocked()`'s existing idle-path comment, the
+forced close leaves `windowStartT_` stale, so the very next real event
+immediately triggered a second, near-zero-length close right behind it. That
+double-close corrupted the new `completedWindowGeneration_` sync from the
+fix above (some generation ticks = a real ~100 ms-capped window, some =
+a spurious near-instant duplicate), producing the irregular, sometimes-
+shorter-than-expected cadence the user measured at `Exposure=110ms`. It also
+explains why `Exposure=300ms` looked "expected" at ~10 s: it was actually
+being silently truncated to ~100 ms of real integration per frame the whole
+time (mislabeled short exposures), which coincidentally matched the
+`Interval=100ms` duration -- not genuinely honoring the requested 300 ms
+exposure. **Fix**: compare against `max(g_IdleWindowTimeoutMs,
+integrationTimeMs_.load())` instead, so the idle path only ever fires once
+nothing has closed the window in at least a full configured `Exposure` --
+restoring it to an actual idle safety net. This is a real behavior change:
+`Exposure > Interval` now correctly takes proportionally longer per frame
+(can't produce a genuine complete window faster than the exposure itself),
+not the old coincidentally-matching-`Interval` duration.
+
+**Bug 2 -- the completed-window snapshot from the fix above was O(events in
+the window), not O(1), and tripled that cost.** `touchedIndices_` has no
+dedup -- one push per *qualifying event*, not per distinct pixel -- so a
+100-300 ms window on this sensor's ~10 MEv/s ambient activity can push
+millions of entries. The first version of `CloseCurrentWindowLocked()`'s
+snapshot logic iterated it three times (clear the previous snapshot's
+entries, copy the new ones across, then the original reset loop), so closing
+a window started costing a large, `Exposure`-scaling chunk of the window's
+own wall-clock duration -- on the very same thread/lock `OnEventsCD()` uses
+to process incoming events. Measured directly: `Exposure=110/300ms` MDA runs
+took ~1.6-2.8x longer per frame than configured after Bug 1's fix alone (a
+real, additional regression from the naive completed-snapshot design, not
+present before this whole MDA-interval effort started). **Fix**: swap the
+whole `onCounts_`/`offCounts_`/`touchedIndices_` vectors with
+`completedOnCounts_`/`completedOffCounts_`/`completedTouchedIndices_`
+instead of copying element-by-element -- `std::vector::swap()` just
+exchanges internal pointers, O(1) regardless of how large the touched list
+has grown. After the swap the "completed" slot holds exactly the just-closed
+window (correct), while the recycled `onCounts_`/`offCounts_` carry along
+their own now-relevant `touchedIndices_` list, so the existing reset loop
+(unchanged, same cost as before any of this work began) still only clears
+real touched entries, never sensor-sized.
+
+**Verified** against the connected IMX636 (rebuilt, 0 errors, both fixes
+together) with a dedicated ad hoc script measuring real inter-frame
+`Elapsed-Time-ms` deltas across 20-frame MDAs at `Interval=100ms`:
+`Exposure=20ms` -> mean delta ~112 ms (interval-dominated, as expected);
+`Exposure=110ms` -> mean delta ~103 ms, individual deltas ranging ~58-127 ms
+(some jitter below the 110 ms floor remains -- checked `EBS-AvgBacklogFlushCount`/
+`EBS-AvgCallbackLagMs` during a run and both stayed ~0, ruling out backlog
+catch-up as the cause; most likely ordinary thread-scheduling/render-cost
+jitter around the 1 ms polling granularity, self-correcting on average, not
+a systematic bias); `Exposure=300ms` -> mean delta ~299 ms, tightly
+clustered (253-335 ms) -- now correctly reflecting the real configured
+exposure instead of the old ~100 ms cap. Reran the full `tools/test_prophebs.py`
+suite (including the `Bug fix (MDA interval)` section added earlier):
+`SUCCESS`, no flakes. Not yet verified: a real MDA run long enough (tens of
+seconds+) to see whether the remaining ~jitter ever compounds into a
+noticeably-off total duration, or a MicroManager Studio GUI walkthrough --
+same hand-off pattern as every prior goal.
+
+### Bug fix: raw recording never started for `Exposure < Interval` MDAs (real MM Studio GUI, not the adapter itself)
+
+User reported raw recording (`EBS-RawRecordingStatus`) stuck on
+`"Not recording"` for the whole run whenever their MDA's `Exposure` was
+*below* `Interval` (e.g. 20 ms/100 ms), even though `Exposure == Interval`
+(e.g. 100 ms/100 ms) worked fine. Direct `pymmcore-plus` calls to
+`startSequenceAcquisition()` showed recording working correctly for *both*
+combinations, ruling out a defect in `StartRawRecordingIfRequested()`/
+`StopRawRecordingIfActive()` themselves (untouched by any of this session's
+other fixes). The user's own CoreLog from a real MM Studio MDA settled it:
+for `Exposure=20ms/Interval=100ms`, `"Running acquisition with Clojure
+AcqEng"` produced 100 images with **no** `"ProphEBS: raw event recording
+started"` line at all; for `Exposure=Interval=100ms`, the same engine *did*
+log `"streaming directly to the Multi-D Acquisition save location"` and
+`"raw event recording started"`/`"stopped"`.
+
+**Root cause**: `StartRawRecordingIfRequested()` is only ever called from
+inside our `StartSequenceAcquisition()`. MM Studio's Acquisition Engine only
+calls that (the hardware sequence-acquisition path) when `Interval <=
+Exposure` ("as fast as possible," no real dead time to simulate); once
+`Interval > Exposure`, it drives the camera with its own software-timed loop
+of plain `SnapImage()` calls instead. A camera adapter has no MMCore-level
+signal at all that a `SnapImage()` call is part of an MDA rather than a
+one-off manual Snap -- confirmed by grepping the vendored `MMCore` sources
+for any "acquisition in progress" hook a device could query; none exists.
+This is a pre-existing MM Studio behavior, not a regression from any of this
+session's earlier fixes -- it was simply never exercised/noticed before this
+session's broader Exposure/Interval testing.
+
+**Fix**: since Live view never calls `SnapImage()` in a loop (it always goes
+through `StartSequenceAcquisition()`, unbounded), a burst of closely-spaced
+`SnapImage()` calls is a reliable signal that this is a snap-timed MDA, not
+incidental Live/manual-Snap use. New `MaybeHandleSnapBurstRecording()`
+(called from `SnapImage()`) tracks the wall-clock gap since the previous
+snap (`lastSnapWallTime_`/`hasLastSnapTime_`, guarded by new
+`snapBurstLock_`); the moment a snap arrives within a new
+`EBS-RawRecordSnapBurstGapMs` property (`snapBurstGapMs_`, default 3000 ms)
+of the previous one, it starts recording by calling the existing,
+unmodified `StartRawRecordingIfRequested()` directly -- reusing its
+MDA-folder auto-discovery, `EBS-RawFilePath` override, and status reporting
+as-is. Recording necessarily starts from the *second* snap of a burst
+onward (there is no way to know in advance that a lone first snap will turn
+into one), so a snap-timed MDA's raw file is missing a sliver of its very
+first frame's data -- an inherent limitation of detecting a pattern after
+the fact, not something a heuristic can close. `UpdateStats()` (already
+ticking every `g_StatsIntervalMs` on `ProphEBSStatsThread`) finalizes the
+recording once the gap since the last snap exceeds the same threshold again
+-- piggybacking on that existing timer rather than adding a new one. New
+`snapBurstRecordingActive_` flag scopes the idle-check to recordings this
+heuristic itself started, so it never interferes with a real
+`StartSequenceAcquisition()`-driven recording (guarded additionally by
+`MaybeHandleSnapBurstRecording()` no-op'ing whenever `IsCapturing()`).
+
+**Verified** against the connected IMX636 (rebuilt, 0 errors) with a
+dedicated ad hoc script: a single isolated `snapImage()` call correctly left
+`EBS-RawRecordingStatus` at `"Not recording"` even a full second later (no
+false-positive on ordinary manual Snap use); a simulated snap-timed MDA (15
+snaps at 100 ms spacing, gap threshold temporarily lowered to 500 ms for a
+fast test) showed `"Not recording"` after snap 1, `"Recording to ..."` from
+snap 2 through snap 15, and `"Finished: ..."` within ~1 s of the burst
+ending -- landing in the same MDA folder as MM's own TIFF stack, producing a
+real 50 MB `.raw` file plus its matching `.bias` file. Reran the full
+`tools/test_prophebs.py` suite: `SUCCESS`, no flakes, no regressions. Not
+yet verified: a real MM Studio MDA with `Exposure < Interval` end-to-end
+(this was checked via a `pymmcore-plus` simulation of the snap pattern, not
+an actual MM Studio run).

@@ -57,6 +57,10 @@ const char* g_PropRawFilePath = "EBS-RawFilePath";
 const char* g_PropRawRecordingStatus = "EBS-RawRecordingStatus";
 const char* g_PropTempFolder = "EBS-RawTempRecordingFolder";
 
+// Bug fix: snap-timed MDA raw-recording gap -- see g_DefaultSnapBurstGapMs
+// in ProphEBS.h.
+const char* g_PropRawRecordSnapBurstGapMs = "EBS-RawRecordSnapBurstGapMs";
+
 // Goal 5 property names.
 const char* g_PropBiasRangeCheckBypass = "EBS-biasRangeCheckBypass";
 
@@ -681,6 +685,7 @@ CProphEBSCamera::CProphEBSCamera() :
    backImg_(&imgBufferB_),
    windowStartT_(0),
    lastWindowCloseWallTime_(std::chrono::steady_clock::now()),
+   completedWindowGeneration_(0),
    nowT_(0),
    nowWallAnchor_(std::chrono::steady_clock::now()),
    timeDecayTimeConstantUs_(g_DefaultTimeDecayTimeConstantUs),
@@ -701,6 +706,9 @@ CProphEBSCamera::CProphEBSCamera() :
    frameBuilderThd_(nullptr),
    rawRecordingActive_(false),
    movePendingToMdaFolder_(false),
+   hasLastSnapTime_(false),
+   snapBurstRecordingActive_(false),
+   snapBurstGapMs_(g_DefaultSnapBurstGapMs),
    localErcEnabled_(false),
    localErcEventRate_(50000000),
    localEventTrailFilterEnabled_(false),
@@ -911,6 +919,19 @@ int CProphEBSCamera::Initialize()
       return nRet;
 
    nRet = CreateStringProperty(g_PropTempFolder, "", false);
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   // Bug fix: MM's Acquisition Engine only calls StartSequenceAcquisition()
+   // (recording's sole trigger above) when Interval <= Exposure; for
+   // Interval > Exposure it times snaps itself instead, so recording never
+   // started at all for that MDA configuration. See snapBurstGapMs_ in
+   // ProphEBS.h/MaybeHandleSnapBurstRecording() for the snap-burst-based fix.
+   nRet = CreateFloatProperty(g_PropRawRecordSnapBurstGapMs, snapBurstGapMs_.load(), false,
+      new CPropertyAction(this, &CProphEBSCamera::OnRawRecordSnapBurstGapMs));
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = SetPropertyLimits(g_PropRawRecordSnapBurstGapMs, 200.0, 30000.0);
    if (DEVICE_OK != nRet)
       return nRet;
 
@@ -2945,6 +2966,26 @@ int CProphEBSCamera::OnLiveViewMinIntervalMs(MM::PropertyBase* pProp, MM::Action
 }
 
 /**
+ * Bug fix: gap (ms) MaybeHandleSnapBurstRecording()/UpdateStats() use to
+ * detect and finalize a snap-timed MDA's raw recording -- see
+ * g_PropRawRecordSnapBurstGapMs.
+ */
+int CProphEBSCamera::OnRawRecordSnapBurstGapMs(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+   if (eAct == MM::BeforeGet)
+   {
+      pProp->Set(snapBurstGapMs_.load());
+   }
+   else if (eAct == MM::AfterSet)
+   {
+      double value;
+      pProp->Get(value);
+      snapBurstGapMs_ = std::max(1.0, value);
+   }
+   return DEVICE_OK;
+}
+
+/**
  * Goal 6: EBS-ViewMode -- selects which raw per-pixel quantity
  * BuildAndSwapFrame() renders (Merged/OnOnly/OffOnly/NetSigned). Plain
  * atomic-backed settable property; see g_PropViewMode for the formula.
@@ -3069,6 +3110,13 @@ void CProphEBSCamera::StartEventStreaming()
    lastWindowCloseWallTime_ = std::chrono::steady_clock::now();
    totalRawBytes_ = 0;
    totalEventCount_ = 0;
+
+   // MDA-interval fix: sized/cleared alongside onCounts_/offCounts_ above --
+   // see the completedOnCounts_ comment in ProphEBS.h.
+   completedOnCounts_.assign(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+   completedOffCounts_.assign(static_cast<size_t>(sensorWidth_) * sensorHeight_, 0);
+   completedTouchedIndices_.clear();
+   completedWindowGeneration_ = 0;
 
    // Goal 8: time-decay view-mode state -- -1 sentinel means "never fired
    // this session," so a pixel that hasn't seen an event yet renders at the
@@ -3362,6 +3410,35 @@ void CProphEBSCamera::FlushBacklogLocked(std::chrono::steady_clock::time_point n
  */
 void CProphEBSCamera::CloseCurrentWindowLocked(bool fromEvent, Metavision::timestamp eventT)
 {
+   // Bug fix: touchedIndices_ has no dedup -- one push per *qualifying
+   // event*, not per distinct pixel -- so on a busy sensor over a long
+   // Exposure it can grow to many times the sensor's own pixel count
+   // (millions of entries for a 100-300 ms window at ~10 MEv/s). The first
+   // version of the completed-window snapshot below iterated it up to three
+   // times (clear the previous snapshot's touched entries, copy the new
+   // ones across, then the original reset loop), tripling the cost of
+   // closing a window -- and since that cost scales with real event
+   // activity, it started eating a large, Exposure-scaling chunk of the
+   // window's own wall-clock duration, right here on the same thread/lock
+   // OnEventsCD() uses to process incoming events (measured: Exposure=110ms
+   // and 300ms MDA runs took ~1.6-2.8x longer than the configured Exposure
+   // per frame after the naive version of this fix).
+   //
+   // Fixed by swapping the whole onCounts_/offCounts_/touchedIndices_
+   // vectors with completedOnCounts_/completedOffCounts_/
+   // completedTouchedIndices_ -- std::vector::swap() just exchanges internal
+   // pointers, O(1) regardless of touchedIndices_'s size. After the swap,
+   // the "completed" slot holds exactly this just-closed window's data
+   // (correct), while onCounts_/offCounts_/touchedIndices_ hold whatever the
+   // completed slot held two closes ago -- along with precisely the
+   // touched-index list describing which of *those* entries are stale, so
+   // the reset loop below (unchanged from before this whole fix existed)
+   // still only clears real touched entries, never sensor-sized.
+   std::swap(onCounts_, completedOnCounts_);
+   std::swap(offCounts_, completedOffCounts_);
+   std::swap(touchedIndices_, completedTouchedIndices_);
+   completedWindowGeneration_.fetch_add(1, std::memory_order_release);
+
    for (uint32_t idx : touchedIndices_)
    {
       onCounts_[idx] = 0;
@@ -3414,7 +3491,23 @@ void CProphEBSCamera::BuildAndSwapFrame()
       MMThreadGuard g(eventCountsLock_);
       auto idleMs = std::chrono::duration<double, std::milli>(
          std::chrono::steady_clock::now() - lastWindowCloseWallTime_).count();
-      if (idleMs >= g_IdleWindowTimeoutMs)
+      // Bug fix: this used to compare against the bare g_IdleWindowTimeoutMs
+      // constant (100 ms) regardless of Exposure -- so any Exposure > 100 ms
+      // was silently force-closed at ~100 ms of real integration on a busy
+      // sensor, not the requested duration, and not just on a genuinely idle
+      // scene (the whole point of this check). Worse, the forced close
+      // leaves windowStartT_ stale (see CloseCurrentWindowLocked()), so the
+      // very next real event immediately triggered a second, near-zero-length
+      // close right behind it -- corrupting both Live view's per-frame
+      // integration and (once completedWindowGeneration_ was added for the
+      // MDA-interval fix) the MDA sequence thread's window-boundary sync,
+      // making its effective frame cadence irregular. Comparing against
+      // max(g_IdleWindowTimeoutMs, integrationTimeMs_) restores this to an
+      // actual idle safety net -- it only force-closes once nothing has
+      // closed the window in at least a full configured Exposure, never
+      // sooner.
+      double idleThresholdMs = std::max(g_IdleWindowTimeoutMs, integrationTimeMs_.load());
+      if (idleMs >= idleThresholdMs)
          CloseCurrentWindowLocked(false, 0);
       onCounts = onCounts_;
       offCounts = offCounts_;
@@ -3426,6 +3519,29 @@ void CProphEBSCamera::BuildAndSwapFrame()
       nowWallAnchor = nowWallAnchor_;
    }
 
+   RenderCountsToImage(backImg_, onCounts, offCounts, lastEventTimeUs, lastEventPolarity, nowT, nowWallAnchor);
+
+   {
+      MMThreadGuard g(frontImgLock_);
+      std::swap(frontImg_, backImg_);
+   }
+}
+
+/**
+ * MDA-interval fix: the per-pixel-counts-to-8-bit-image rendering body,
+ * extracted out of BuildAndSwapFrame() unchanged so both Live view (the live,
+ * continuously-changing onCounts_/offCounts_) and ProphEBSSequenceThread's
+ * finite (MDA) path (the completedOnCounts_/completedOffCounts_ snapshot of
+ * one finished window) render through the exact same EBS-ViewMode/-Offset/
+ * ROI/binning/EBS-Transpose* logic. Does not swap any buffers itself --
+ * callers own that (BuildAndSwapFrame() swaps frontImg_/backImg_; the MDA
+ * path renders straight into its own dedicated mdaImg_).
+ */
+void CProphEBSCamera::RenderCountsToImage(ImgBuffer* target, const std::vector<int32_t>& onCounts,
+   const std::vector<int32_t>& offCounts, const std::vector<int64_t>& lastEventTimeUs,
+   const std::vector<int8_t>& lastEventPolarity, Metavision::timestamp nowT,
+   std::chrono::steady_clock::time_point nowWallAnchor)
+{
    ProphEBSViewMode mode = static_cast<ProphEBSViewMode>(viewMode_.load());
    double offset = viewOffset_.load();
 
@@ -3530,12 +3646,7 @@ void CProphEBSCamera::BuildAndSwapFrame()
       }
    }
 
-   ApplyTranspose(backImg_, natural, outW, outH);
-
-   {
-      MMThreadGuard g(frontImgLock_);
-      std::swap(frontImg_, backImg_);
-   }
+   ApplyTranspose(target, natural, outW, outH);
 }
 
 /**
@@ -3619,6 +3730,35 @@ void CProphEBSCamera::UpdateStats()
 {
    if (!cameraConnected_)
       return;
+
+   // Bug fix: finalize a snap-burst-triggered raw recording (see
+   // MaybeHandleSnapBurstRecording()) once no further SnapImage() call has
+   // arrived for snapBurstGapMs_ -- this is the only place that notices the
+   // *absence* of snaps, since SnapImage() itself only runs on an actual
+   // snap. Piggybacks on this thread's existing g_StatsIntervalMs tick
+   // rather than a dedicated timer.
+   {
+      bool shouldStop = false;
+      {
+         MMThreadGuard g(snapBurstLock_);
+         if (snapBurstRecordingActive_ && hasLastSnapTime_)
+         {
+            double idleMs = std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - lastSnapWallTime_).count();
+            if (idleMs > snapBurstGapMs_.load())
+            {
+               snapBurstRecordingActive_ = false;
+               shouldStop = true;
+            }
+         }
+      }
+      if (shouldStop)
+      {
+         LogMessage("ProphEBS: no further Snap calls for EBS-RawRecordSnapBurstGapMs -- "
+            "finalizing snap-burst raw recording", true);
+         StopRawRecordingIfActive();
+      }
+   }
 
    uint64_t bytes = totalRawBytes_.exchange(0);
    uint64_t events = totalEventCount_.exchange(0);
@@ -4026,11 +4166,56 @@ void CProphEBSCamera::GenerateTestImage()
 
 int CProphEBSCamera::SnapImage()
 {
+   MaybeHandleSnapBurstRecording();
+
    // No shutter to trigger -- frontImg_ already holds either the static test
    // pattern (no hardware) or the most recently built event-integration
    // frame (real camera streaming continuously via the frame-builder
    // thread); either way this is a no-op.
    return DEVICE_OK;
+}
+
+/**
+ * Bug fix: see the snapBurstGapMs_ comment in ProphEBS.h for the full
+ * rationale. Starts raw recording (via the existing
+ * StartRawRecordingIfRequested(), unchanged) the moment a SnapImage() call
+ * arrives within snapBurstGapMs_ of the previous one -- i.e. from the second
+ * snap of a burst onward, since there is no way to know in advance that a
+ * lone first snap will turn into one. UpdateStats() (already ticking every
+ * g_StatsIntervalMs) finalizes the recording once the gap since the last
+ * snap exceeds snapBurstGapMs_ again. No-op whenever a real
+ * StartSequenceAcquisition() already owns recording (IsCapturing()) or a
+ * recording (of either kind) is already active.
+ */
+void CProphEBSCamera::MaybeHandleSnapBurstRecording()
+{
+   if (!cameraConnected_ || IsCapturing())
+      return;
+
+   auto now = std::chrono::steady_clock::now();
+   bool startNow = false;
+   {
+      MMThreadGuard g(snapBurstLock_);
+      double gapMs = hasLastSnapTime_
+         ? std::chrono::duration<double, std::milli>(now - lastSnapWallTime_).count()
+         : std::numeric_limits<double>::infinity();
+      bool continuingBurst = gapMs <= snapBurstGapMs_.load();
+      lastSnapWallTime_ = now;
+      hasLastSnapTime_ = true;
+      if (continuingBurst && !snapBurstRecordingActive_ && !rawRecordingActive_)
+      {
+         snapBurstRecordingActive_ = true;
+         startNow = true;
+      }
+   }
+
+   if (startNow)
+   {
+      LogMessage("ProphEBS: detected a burst of repeated Snap calls (e.g. an MDA using "
+         "per-frame timing rather than hardware sequence acquisition) -- starting raw recording",
+         true);
+      StartRawRecordingIfRequested();
+   }
 }
 
 const unsigned char* CProphEBSCamera::GetImageBuffer()
@@ -4331,6 +4516,28 @@ int CProphEBSCamera::InsertImage()
       bytesPerPixel, GetNumberOfComponents(), md.Serialize());
 }
 
+/**
+ * MDA-interval fix: same as InsertImage() above but reads mdaImg_ (the
+ * completed-window snapshot ProphEBSSequenceThread's finite path just
+ * rendered via RenderCountsToImage()) instead of frontImg_. mdaImg_ is only
+ * ever touched from the sequence thread itself, so no lock is needed around
+ * it (unlike frontImg_, which the frame-builder thread swaps concurrently).
+ */
+int CProphEBSCamera::InsertMdaImage()
+{
+   MM::MMTime timeStamp = GetCurrentMMTime();
+   char label[MM::MaxStrLength];
+   GetLabel(label);
+
+   MM::CameraImageMetadata md;
+   md.AddTag(MM::g_Keyword_Metadata_CameraLabel, label);
+   std::string elapsed = CDeviceUtils::ConvertToString((timeStamp - sequenceStartTime_).getMsec());
+   md.AddTag(MM::g_Keyword_Elapsed_Time_ms, elapsed);
+
+   return GetCoreCallback()->InsertImage(this, mdaImg_.GetPixels(), mdaImg_.Width(), mdaImg_.Height(),
+      mdaImg_.Depth(), GetNumberOfComponents(), md.Serialize());
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // ProphEBSSequenceThread implementation
 ///////////////////////////////////////////////////////////////////////////////
@@ -4380,29 +4587,115 @@ int ProphEBSSequenceThread::svc()
    int ret = DEVICE_ERR;
    try
    {
+      // MDA-interval fix: previously a finite (MDA) sequence just sampled
+      // frontImg_ -- the Live-view buffer, continuously rebuilt by
+      // ProphEBSFrameBuilderThread on its own EBS-ViewDisplayRefreshMs
+      // cadence -- at an arbitrary wall-clock phase every intervalMs_. That
+      // phase has no relationship to when an integration window actually
+      // closes (windows close on real event sensor-timestamps in
+      // OnEventsCD(), or the idle timeout in BuildAndSwapFrame()), so the
+      // "frame" captured could be anywhere from a just-reset near-empty
+      // window to one about to close, regardless of how Exposure/interval
+      // were set -- e.g. Exposure=Interval=100 ms never actually produced
+      // 100 back-to-back, complete 100 ms windows.
+      //
+      // Fixed by waiting for a real window to close (tracked by
+      // CProphEBSCamera::completedWindowGeneration_, bumped in
+      // CloseCurrentWindowLocked() right before it would otherwise discard
+      // the closed window's counts) and rendering exactly that window's
+      // snapshot (completedOnCounts_/completedOffCounts_) via
+      // RenderCountsToImage(), instead of whatever the live accumulator
+      // holds. intervalMs_ <= Exposure (including 0) captures every window
+      // back-to-back as fast as they close -- the correct analogue of a
+      // normal camera's "0 ms interval" here, since real windows never
+      // overlap by construction. intervalMs_ > Exposure adds the remaining
+      // dead time after each window before waiting for the next one, same
+      // spacing intent as a normal camera. Only applies once a real camera
+      // is actually streaming -- the no-camera fallback (a static test
+      // pattern with no window concept at all) keeps the original simple
+      // polling loop below, so it can never wait for a window that will
+      // never close.
+      bool useWindowSync = (numImages_ != LONG_MAX) && camera_->streaming_;
+      uint64_t lastGeneration = useWindowSync
+         ? camera_->completedWindowGeneration_.load(std::memory_order_acquire)
+         : 0;
+
       do
       {
-         ret = camera_->InsertImage();
-         if (ret != DEVICE_OK)
-            break;
-         // Bug fix: for an unbounded (Live view) sequence, intervalMs_ is
-         // whatever MMCore's "unused" startContinuousSequenceAcquisition
-         // parameter happened to be -- per MMCore's own contract, devices
-         // must ignore it. Use max(Exposure, EBS-ViewLiveMinIntervalMs)
-         // instead (see g_PropLiveViewMinIntervalMs for the full story):
-         // Live view naturally follows Exposure like any other camera for
-         // normal exposure times, but never faster than the floor once
-         // Exposure goes below it -- trusting intervalMs_ directly here let
-         // Exposure's sub-ms follow-up accidentally drive Live view to push
-         // frames far faster than the GUI/circular buffer can consume,
-         // causing an ever-growing display backlog. camera_ is a friend, so
-         // this reads integrationTimeMs_/liveViewMinIntervalMs_ directly. A
-         // finite (MDA) sequence still honors the caller's real,
-         // user-configured intervalMs_ exactly as before.
-         double sleepMs = (numImages_ == LONG_MAX)
-            ? std::max(camera_->integrationTimeMs_.load(), camera_->liveViewMinIntervalMs_.load())
-            : intervalMs_;
-         CDeviceUtils::SleepMs(static_cast<long>(std::max(1.0, sleepMs)));
+         if (useWindowSync)
+         {
+            // g_IdleWindowTimeoutMs (BuildAndSwapFrame()) guarantees a
+            // window closes at least that often even on a fully idle
+            // sensor, so this cannot spin forever in ordinary operation;
+            // maxWaitMs is only a last-resort safety net (e.g. streaming
+            // stops mid-wait) so a stuck MDA can still be cancelled.
+            uint64_t targetGeneration = lastGeneration + 1;
+            const long maxWaitMs = 5000;
+            long waitedMs = 0;
+            while (!IsStopped()
+               && camera_->completedWindowGeneration_.load(std::memory_order_acquire) < targetGeneration
+               && waitedMs < maxWaitMs)
+            {
+               CDeviceUtils::SleepMs(1);
+               waitedMs += 1;
+            }
+            if (IsStopped())
+               break;
+
+            lastGeneration = camera_->completedWindowGeneration_.load(std::memory_order_acquire);
+
+            std::vector<int32_t> onCounts, offCounts;
+            std::vector<int64_t> lastEventTimeUs;
+            std::vector<int8_t> lastEventPolarity;
+            Metavision::timestamp nowT;
+            std::chrono::steady_clock::time_point nowWallAnchor;
+            {
+               MMThreadGuard g(camera_->eventCountsLock_);
+               onCounts = camera_->completedOnCounts_;
+               offCounts = camera_->completedOffCounts_;
+               lastEventTimeUs = camera_->lastEventTimeUs_;
+               lastEventPolarity = camera_->lastEventPolarity_;
+               nowT = camera_->nowT_;
+               nowWallAnchor = camera_->nowWallAnchor_;
+            }
+            camera_->RenderCountsToImage(&camera_->mdaImg_, onCounts, offCounts,
+               lastEventTimeUs, lastEventPolarity, nowT, nowWallAnchor);
+
+            ret = camera_->InsertMdaImage();
+            if (ret != DEVICE_OK)
+               break;
+
+            double exposureMs = camera_->integrationTimeMs_.load();
+            double extraMs = intervalMs_ - exposureMs;
+            if (extraMs > 0.0)
+               CDeviceUtils::SleepMs(static_cast<long>(extraMs));
+         }
+         else
+         {
+            ret = camera_->InsertImage();
+            if (ret != DEVICE_OK)
+               break;
+            // Bug fix: for an unbounded (Live view) sequence, intervalMs_ is
+            // whatever MMCore's "unused" startContinuousSequenceAcquisition
+            // parameter happened to be -- per MMCore's own contract, devices
+            // must ignore it. Use max(Exposure, EBS-ViewLiveMinIntervalMs)
+            // instead (see g_PropLiveViewMinIntervalMs for the full story):
+            // Live view naturally follows Exposure like any other camera for
+            // normal exposure times, but never faster than the floor once
+            // Exposure goes below it -- trusting intervalMs_ directly here let
+            // Exposure's sub-ms follow-up accidentally drive Live view to push
+            // frames far faster than the GUI/circular buffer can consume,
+            // causing an ever-growing display backlog. camera_ is a friend, so
+            // this reads integrationTimeMs_/liveViewMinIntervalMs_ directly.
+            // (No-camera-fallback finite sequences fall through to this same
+            // branch too, since useWindowSync is false whenever
+            // camera_->streaming_ is false -- intervalMs_ is honored exactly
+            // as before in that case.)
+            double sleepMs = (numImages_ == LONG_MAX)
+               ? std::max(camera_->integrationTimeMs_.load(), camera_->liveViewMinIntervalMs_.load())
+               : intervalMs_;
+            CDeviceUtils::SleepMs(static_cast<long>(std::max(1.0, sleepMs)));
+         }
       } while (!IsStopped() && ++imageCounter_ < numImages_);
    }
    catch (...)

@@ -171,6 +171,66 @@ if connection_status == "Connected":
 else:
     print("Goal 4: no EBS connected -- cam_.start_recording() needs a real streaming camera, skipping recording checks")
 
+# Bug fix: MDA interval. User reported that a finite (MDA) sequence with
+# Exposure == Interval didn't produce back-to-back, complete Exposure-length
+# windows spanning the requested total duration -- e.g. 100 frames at 100 ms
+# Exposure/100 ms Interval should span ~10s, each frame a genuine, complete
+# 100 ms integration, the same way a normal camera's "0 ms interval" gives
+# back-to-back full exposures. Root cause: ProphEBSSequenceThread's finite
+# path used to just sample frontImg_ (the Live-view buffer, continuously
+# rebuilt on its own EBS-ViewDisplayRefreshMs cadence) at an arbitrary
+# wall-clock phase every Interval, with no relationship to when a real
+# integration window (driven by event sensor-timestamps) actually closed --
+# so the "frame" grabbed could be anywhere from just-reset to about-to-close.
+# Fixed by having the finite path wait for and render the actual
+# completed-window snapshot (CProphEBSCamera::completedOnCounts_/
+# completedWindowGeneration_, captured in CloseCurrentWindowLocked()) instead
+# of the live accumulator. Checked here via each frame's own
+# Elapsed-Time-ms metadata tag (real wall-clock timestamps assigned at
+# InsertImage() time, independent of the fix itself) rather than pixel
+# content, since real ambient event data isn't deterministic. Real
+# hardware only -- the no-camera fallback has no window concept to
+# synchronize to and is untouched by this fix (still just sleeps Interval).
+if connection_status == "Connected":
+    _exposure_before_mda_check = core.getProperty("ProphEBSCam", "Exposure")
+
+    def _run_mda_and_get_deltas(n, interval_ms, exposure_ms):
+        core.setExposure("ProphEBSCam", exposure_ms)
+        core.startSequenceAcquisition(n, interval_ms, True)
+        while core.isSequenceRunning():
+            time.sleep(0.01)
+        elapsed_vals = []
+        while core.getRemainingImageCount() > 0:
+            _, md = core.popNextImageAndMD()
+            elapsed_vals.append(float(md["ElapsedTime-ms"]))
+        return [b - a for a, b in zip(elapsed_vals, elapsed_vals[1:])]
+
+    # Exposure == Interval: each frame should land roughly one Exposure
+    # apart (allowing generous slack for real thread-wakeup/event-timing
+    # jitter -- this checks the fix's order-of-magnitude effect, not exact
+    # real-time scheduling precision).
+    deltas_equal = _run_mda_and_get_deltas(10, 100.0, 100.0)
+    mean_equal = sum(deltas_equal) / len(deltas_equal)
+    print("Bug fix (MDA interval): Exposure=Interval=100ms, inter-frame deltas (ms):",
+          [f"{d:.1f}" for d in deltas_equal], ", mean:", f"{mean_equal:.1f}")
+    assert 60.0 <= mean_equal <= 160.0, \
+        f"expected ~100 ms between MDA frames with Exposure=Interval=100ms, got mean delta {mean_equal:.1f} ms"
+
+    # Interval > Exposure: real dead time between frames, spacing should
+    # follow Interval (not Exposure).
+    deltas_gap = _run_mda_and_get_deltas(10, 200.0, 50.0)
+    mean_gap = sum(deltas_gap) / len(deltas_gap)
+    print("Bug fix (MDA interval): Exposure=50ms, Interval=200ms, inter-frame deltas (ms):",
+          [f"{d:.1f}" for d in deltas_gap], ", mean:", f"{mean_gap:.1f}")
+    assert 140.0 <= mean_gap <= 260.0, \
+        f"expected ~200 ms between MDA frames with Interval=200ms > Exposure=50ms, got mean delta {mean_gap:.1f} ms"
+
+    core.setProperty("ProphEBSCam", "Exposure", _exposure_before_mda_check)
+    print("Bug fix (MDA interval): confirmed MDA frame spacing follows max(Exposure, Interval), "
+          "not an arbitrary Live-view sample phase")
+else:
+    print("Bug fix (MDA interval): no EBS connected -- skipping (needs real completed-window timing)")
+
 # Goal 5: static read-only info properties. Non-empty regardless of
 # connection state (fall back to "N/A" like the Goal 2 identification
 # properties), but only meaningfully populated when connected.
@@ -796,108 +856,6 @@ if connection_status == "Connected":
     core.snapImage()
     core.getImage()
     print("Goal 7: manual EBS-HotPixelBlockedPixels set against real hardware, snap still succeeded")
-    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", original_blocked)
-
-    # Does blocking a pixel actually stop it from generating events, or just
-    # get recorded in EBS-HotPixelBlockedPixels without hardware effect? Block a
-    # 7x7 region (0,0)-(6,6) -- 49 entries, deliberately kept under this
-    # sensor's 64-slot I_DigitalEventMask hardware limit (see
-    # ApplyBlockedPixelsToHardware()) so every single one of these pixels
-    # is actually pushed to hardware, not just listed in EBS-HotPixelBlockedPixels
-    # -- and watch that exact region in the live view: with EBS-ViewOffset=0,
-    # even a single CD event in a window makes its pixel visibly nonzero
-    # (raw count >= 1). Critically, this needs a
-    # real BEFORE/AFTER comparison of the *same* region, not just "is it
-    # zero" -- a corner of the sensor could easily show zero activity on
-    # its own (dark/no motion there), which would make the assertion pass
-    # without proving masking did anything at all. So: first confirm this
-    # exact region shows real activity while UNMASKED (retrying with a
-    # longer window if the first attempt sees none, since ambient activity
-    # there isn't guaranteed), then block it and confirm that same region
-    # goes to zero while the rest of the frame keeps showing activity.
-    original_view_mode2 = core.getProperty("ProphEBSCam", "EBS-ViewMode")
-    original_view_offset2 = core.getProperty("ProphEBSCam", "EBS-ViewOffset")
-    original_exposure2 = core.getProperty("ProphEBSCam", "Exposure")
-    MASK_TEST_REGION = 7  # 7*7 = 49, comfortably under the 64-slot hardware limit
-    block_region = ";".join(f"{x}:{y}" for x in range(MASK_TEST_REGION) for y in range(MASK_TEST_REGION))
-
-    # Push the ON/OFF contrast-detection biases toward maximum sensitivity so
-    # the test isn't at the mercy of whatever's actually happening in front
-    # of the sensor right now -- lower bias_diff_on/bias_diff_off means more
-    # sensitive (more events, including pure noise), which is exactly what's
-    # wanted here: a reliable, real baseline signal in an arbitrary 10x10
-    # corner, not a genuine low-noise imaging setting. Clamped to whatever
-    # this sensor actually reports as its supported range.
-    original_bias_on = core.getProperty("ProphEBSCam", "EBS-bias_diff_on")
-    original_bias_off = core.getProperty("ProphEBSCam", "EBS-bias_diff_off")
-
-    def clamp_to_prop_limits(prop, value):
-        if core.hasPropertyLimits("ProphEBSCam", prop):
-            lo = int(core.getPropertyLowerLimit("ProphEBSCam", prop))
-            hi = int(core.getPropertyUpperLimit("ProphEBSCam", prop))
-            return max(lo, min(hi, value))
-        return value
-
-    bias_on_target = clamp_to_prop_limits("EBS-bias_diff_on", -40)
-    bias_off_target = clamp_to_prop_limits("EBS-bias_diff_off", -20)
-    core.setProperty("ProphEBSCam", "EBS-bias_diff_on", str(bias_on_target))
-    core.setProperty("ProphEBSCam", "EBS-bias_diff_off", str(bias_off_target))
-    print("Goal 7: boosted sensitivity for the masking-effectiveness check -- EBS-bias_diff_on =",
-          core.getProperty("ProphEBSCam", "EBS-bias_diff_on"), ", EBS-bias_diff_off =",
-          core.getProperty("ProphEBSCam", "EBS-bias_diff_off"))
-
-    core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", "")
-    core.setProperty("ProphEBSCam", "EBS-ViewMode", "Merged")
-    core.setProperty("ProphEBSCam", "EBS-ViewOffset", "0")
-
-    def sample_region_max(region_slice, exposure_ms, n_snaps):
-        core.setProperty("ProphEBSCam", "Exposure", str(exposure_ms))
-        time.sleep(0.3)  # let the new Exposure take effect on a fresh window
-        peak = 0
-        for _ in range(n_snaps):
-            core.snapImage()
-            img = core.getImage()
-            peak = max(peak, int(img[region_slice].max()))
-            time.sleep(exposure_ms / 1000.0 + 0.05)
-        return peak
-
-    region_slice = np.s_[0:MASK_TEST_REGION, 0:MASK_TEST_REGION]
-    region_label = f"(0-{MASK_TEST_REGION - 1},0-{MASK_TEST_REGION - 1})"
-    baseline_max = 0
-    for exposure_ms in (100, 300, 1000):
-        baseline_max = sample_region_max(region_slice, exposure_ms, 10)
-        if baseline_max > 0:
-            break
-    print("Goal 7: baseline (UNMASKED) activity in region", region_label, ":", baseline_max,
-          "(exposure that found it:", exposure_ms, "ms)")
-    if baseline_max == 0:
-        print("Goal 7: WARNING -- region", region_label, "showed no activity even unmasked after escalating "
-              "exposure up to 1000ms; masking effectiveness cannot be conclusively tested this run "
-              "(inconclusive, not a pass or fail) -- likely just a quiet/dark corner of the current scene")
-    else:
-        core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", block_region)
-        assert core.getProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels") == block_region
-        masked_region_max = sample_region_max(region_slice, exposure_ms, 10)
-        rest_of_frame_max = 0
-        core.snapImage()
-        rest_of_frame_max = int(core.getImage()[MASK_TEST_REGION:, :].max())
-        print("Goal 7: hot-pixel masking effectiveness check -- same region", region_label,
-              "MASKED max pixel value:", masked_region_max, "(baseline unmasked was", baseline_max,
-              "), rest-of-frame max:", rest_of_frame_max)
-        assert rest_of_frame_max > 0, \
-            "expected real activity somewhere outside the blocked region as a sanity control -- got none at all"
-        assert masked_region_max == 0, \
-            f"EBS-HotPixelBlockedPixels claims {MASK_TEST_REGION * MASK_TEST_REGION} pixels in {region_label} are " \
-            f"masked, but events are still landing there (max pixel value {masked_region_max}, vs " \
-            f"{baseline_max} unmasked at the same exposure) -- hardware masking is not actually suppressing them"
-        print("Goal 7: confirmed -- region", region_label, "went from real activity (unmasked) to zero events "
-              "(masked), while the rest of the frame kept showing activity")
-
-    core.setProperty("ProphEBSCam", "EBS-ViewMode", original_view_mode2)
-    core.setProperty("ProphEBSCam", "EBS-ViewOffset", original_view_offset2)
-    core.setProperty("ProphEBSCam", "Exposure", original_exposure2)
-    core.setProperty("ProphEBSCam", "EBS-bias_diff_on", original_bias_on)
-    core.setProperty("ProphEBSCam", "EBS-bias_diff_off", original_bias_off)
     core.setProperty("ProphEBSCam", "EBS-HotPixelBlockedPixels", original_blocked)
 else:
     print("Goal 7: no EBS connected -- skipping hardware ROI/hot-pixel-calibration checks "

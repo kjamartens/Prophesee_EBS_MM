@@ -291,6 +291,15 @@ const double g_DefaultDisplayRefreshMs = 1.0;
 // per explicit user decision ("100ms or so" is fine as a constant).
 const double g_IdleWindowTimeoutMs = 100.0;
 
+// Bug fix: default gap (ms) MaybeHandleSnapBurstRecording()/UpdateStats() use
+// to detect/finalize a snap-timed MDA's raw recording -- see
+// g_PropRawRecordSnapBurstGapMs and snapBurstGapMs_ in this class. Generous
+// on purpose: comfortably above any realistic MDA Interval so real snap
+// bursts are never mistaken for finished, while still promptly finalizing
+// an idle recording (checked every g_StatsIntervalMs).
+extern const char* g_PropRawRecordSnapBurstGapMs;
+const double g_DefaultSnapBurstGapMs = 3000.0;
+
 // Bug fix (found after the sub-ms follow-up above): MMCore's own
 // CMMCore::startContinuousSequenceAcquisition(double unused) names its
 // parameter "unused" and its own MMCore.cpp comment says "the MM::Camera
@@ -557,6 +566,12 @@ public:
    // into the MMCore circular buffer.
    int InsertImage();
 
+   // MDA-interval fix: same as InsertImage() but pushes mdaImg_ (the just-
+   // rendered completed-window snapshot) instead of frontImg_ -- used by
+   // ProphEBSSequenceThread's finite (MDA) path only; Live view keeps using
+   // plain InsertImage() unchanged.
+   int InsertMdaImage();
+
    // Goal 5: property action handlers. One shared OnBias() handles every
    // bias property (looks up which one via pProp->GetName()) rather than a
    // handler per bias, since the actual set of biases is fetched from the
@@ -593,6 +608,11 @@ public:
    // Bug fix: floor on Live view's frame-push cadence -- see
    // g_PropLiveViewMinIntervalMs and ProphEBSSequenceThread::svc().
    int OnLiveViewMinIntervalMs(MM::PropertyBase* pProp, MM::ActionType eAct);
+
+   // Bug fix: gap (ms) used to detect a snap-timed MDA and to control the
+   // property's own settable range -- see g_PropRawRecordSnapBurstGapMs and
+   // MaybeHandleSnapBurstRecording()/UpdateStats().
+   int OnRawRecordSnapBurstGapMs(MM::PropertyBase* pProp, MM::ActionType eAct);
 
    // Goal 6: view-mode/offset handlers -- see g_PropViewMode above for what
    // each does. Both are plain atomic-backed settable properties; AfterSet
@@ -811,6 +831,16 @@ private:
    // no-camera fallback pattern). See the .cpp for the full rationale.
    void ApplyTranspose(ImgBuffer* target, const std::vector<unsigned char>& natural, unsigned srcW, unsigned srcH);
 
+   // MDA-interval fix: the per-pixel-counts-to-8-bit-image rendering body
+   // extracted out of BuildAndSwapFrame() (mode/offset/ROI/binning lookup,
+   // transpose, the works) so it can be reused for the completed-window
+   // snapshot ProphEBSSequenceThread's finite (MDA) path renders, not just
+   // the live onCounts_/offCounts_ BuildAndSwapFrame() itself uses.
+   void RenderCountsToImage(ImgBuffer* target, const std::vector<int32_t>& onCounts,
+      const std::vector<int32_t>& offCounts, const std::vector<int64_t>& lastEventTimeUs,
+      const std::vector<int8_t>& lastEventPolarity, Metavision::timestamp nowT,
+      std::chrono::steady_clock::time_point nowWallAnchor);
+
    // Goal 4: builds a local staging raw-file path (Documents\
    // ProphEBS_Recordings\ProphEBS_<timestamp>.raw), creating the folder if
    // needed. Used by StartRawRecordingIfRequested() as the actual recording
@@ -855,6 +885,16 @@ private:
    // pairing as StartRawRecordingIfRequested() above, for the same reason.
    void StopRawRecordingIfActive();
 
+   // Bug fix: called from SnapImage() on every snap. Detects a burst of
+   // closely-spaced snaps (see snapBurstGapMs_/snapBurstRecordingActive_
+   // above) and, on the first snap that continues one, starts raw recording
+   // by calling StartRawRecordingIfRequested() directly -- reusing its
+   // MDA-folder auto-discovery, EBS-RawFilePath override, and status
+   // reporting exactly as-is. No-op whenever a real StartSequenceAcquisition()
+   // is already driving recording (IsCapturing()) or a recording is already
+   // active, so it never double-starts one.
+   void MaybeHandleSnapBurstRecording();
+
    bool initialized_;
    // Goal 7: roiX_/roiY_/roiXSize_/roiYSize_ now drive a real hardware crop
    // (Metavision::I_ROI), applied by SetROI()/ClearROI() -- previously
@@ -898,6 +938,15 @@ private:
    ImgBuffer* frontImg_;
    ImgBuffer* backImg_;
    mutable MMThreadLock frontImgLock_;
+
+   // MDA-interval fix: dedicated render target for ProphEBSSequenceThread's
+   // finite (MDA) path, built from the completed-window snapshot above.
+   // Kept separate from frontImg_/backImg_ (Live view's own double buffer)
+   // so an MDA in progress never races with Live view's frame swapping;
+   // only ever touched from the sequence thread itself (StartSequenceAcquisition()
+   // refuses a second concurrent sequence via IsCapturing()), so it needs no
+   // lock of its own.
+   ImgBuffer mdaImg_;
 
    // Goal 6: per-pixel ON/OFF CD event counts accumulated since the current
    // integration window opened, written by OnEventsCD() (Metavision's
@@ -948,6 +997,26 @@ private:
    Metavision::timestamp windowStartT_;
    std::vector<uint32_t> touchedIndices_;
    std::chrono::steady_clock::time_point lastWindowCloseWallTime_;
+
+   // MDA-interval fix: snapshot of the integration window that just closed,
+   // captured by CloseCurrentWindowLocked() right before it zeros
+   // onCounts_/offCounts_ for the next window -- otherwise that content is
+   // gone the instant the window closes. ProphEBSSequenceThread's finite
+   // (MDA) path renders this snapshot instead of sampling the live,
+   // continuously-changing onCounts_/offCounts_ at an arbitrary wall-clock
+   // phase (which is what let an MDA "interval" sample anywhere from an
+   // empty just-reset window to a stale one about to close, rather than a
+   // genuine, complete exposure-length window every time). Guarded by
+   // eventCountsLock_ like onCounts_/offCounts_ above; sized/cleared
+   // alongside them in StartEventStreaming(). completedTouchedIndices_
+   // mirrors the touchedIndices_ trick so clearing the previous snapshot
+   // before writing a new one stays proportional to real event activity,
+   // not sensor size. completedWindowGeneration_ is bumped every close so a
+   // waiter can detect a fresh window without taking eventCountsLock_ itself.
+   std::vector<int32_t> completedOnCounts_;
+   std::vector<int32_t> completedOffCounts_;
+   std::vector<uint32_t> completedTouchedIndices_;
+   std::atomic<uint64_t> completedWindowGeneration_;
 
    // Follow-up: backlog detection/flush state, all touched only from
    // OnEventsCD() (Metavision's own callback thread) except
@@ -1058,6 +1127,32 @@ private:
    bool rawRecordingActive_;
    std::string currentRawFilePath_;
    bool movePendingToMdaFolder_;
+
+   // Bug fix: MM's Acquisition Engine only calls StartSequenceAcquisition()
+   // (the sole trigger for the recording above) when Interval <= Exposure --
+   // for Interval > Exposure it drives the camera with plain SnapImage()
+   // calls timed by its own software loop instead, so raw recording never
+   // started at all for that (very common) MDA configuration. Since Live
+   // view never calls SnapImage() in a loop (it always goes through
+   // StartSequenceAcquisition(), unbounded), a burst of closely-spaced
+   // SnapImage() calls is a reliable signal that this is a snap-timed MDA,
+   // not incidental Live/manual-Snap use. MaybeHandleSnapBurstRecording()
+   // (called from SnapImage()) starts recording (reusing
+   // StartRawRecordingIfRequested() as-is) the moment a snap arrives within
+   // snapBurstGapMs_ of the previous one; UpdateStats() (already ticking
+   // every g_StatsIntervalMs) finalizes it (via StopRawRecordingIfActive())
+   // once no further snap arrives within that same window -- see
+   // g_PropRawRecordSnapBurstGapMs. snapBurstRecordingActive_ tracks whether
+   // the *current* raw recording (if any) was started by this heuristic
+   // specifically, so the idle-check never touches a recording that a real
+   // StartSequenceAcquisition() started instead. All three fields are
+   // guarded by snapBurstLock_ (touched from whatever thread calls
+   // SnapImage() and, separately, from ProphEBSStatsThread's own thread).
+   std::chrono::steady_clock::time_point lastSnapWallTime_;
+   bool hasLastSnapTime_;
+   bool snapBurstRecordingActive_;
+   std::atomic<double> snapBurstGapMs_;
+   MMThreadLock snapBurstLock_;
 
    // Goal 5: bias property state. When cameraConnected_, biasNames_ holds
    // the SDK-reported keys from I_LL_Biases::get_all_biases() (property
