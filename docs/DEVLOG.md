@@ -2716,3 +2716,59 @@ real 50 MB `.raw` file plus its matching `.bias` file. Reran the full
 yet verified: a real MM Studio MDA with `Exposure < Interval` end-to-end
 (this was checked via a `pymmcore-plus` simulation of the snap pattern, not
 an actual MM Studio run).
+
+### Follow-up: HDF5 recording toggle
+
+Metavision SDK supports recording to either `.raw` or `.hdf5` -- confirmed
+by reading `Camera::start_recording()`'s header doc in
+`metavision/sdk/stream/camera.h`: it "enables writing to supported formats
+other than RAW file" and, per `metavision_file_cutter`'s sample code,
+selects the writer purely from the output path's *extension*. So no new
+Metavision API surface was needed -- just controlling which extension this
+adapter's own path-building uses.
+
+New `EBS-RawRecordingFormat` property (`RAW`/`HDF5` dropdown, **defaults to
+HDF5** per the user's request) controls the extension used by
+`GenerateAutoRawFilePath()` and `ComputeNumberedMdaDestination()` (now takes
+an `extension` parameter) for auto-generated/MDA-discovered paths, plus the
+flat-fallback naming in `StopRawRecordingIfActive()`. Has no effect when
+`EBS-RawFilePath` is set explicitly -- that path's own extension was already
+honored verbatim (a manual `.hdf5` path already worked before this
+property existed; this only affects the paths this adapter builds itself).
+New `GetRecordingFileExtension()` helper reads the property once and
+returns `.raw` or `.hdf5`.
+
+**Bug fix found while testing this**: `tools/test_prophebs.py`'s Goal 4a
+check (auto-discovered path) failed intermittently -- the file the test
+expected didn't exist at the path `EBS-RawRecordingStatus` reported. Root
+cause, found via `enableStderrLog(True)`/`enableDebugLog(True)` and
+CoreLog timestamps: `StopRawRecordingIfActive()` is called unconditionally
+from several unrelated places (Live-view's `StopSequenceAcquisition()`,
+`Shutdown()`, a finite sequence's own natural completion), any of which can
+stop a recording that Goal 4's `MaybeHandleSnapBurstRecording()` snap-burst
+heuristic actually started. Previously, `snapBurstRecordingActive_` was
+only cleared inside `UpdateStats()`'s own gap-check -- so if one of those
+*other* paths stopped the recording first, the flag stayed stuck `true`.
+Minutes later, `UpdateStats()` would find it still set, conclude the
+snap-burst had gone idle, and issue a second, spurious
+`StopRawRecordingIfActive()` call -- except by then a completely unrelated
+recording (e.g. the next finite MDA) was the one actually active, and that
+one got finalized early instead. This is orthogonal to RAW vs HDF5 (would
+reproduce identically on `main` with `.raw`) and only became visible now
+because a leftover real MM Studio profile on this dev machine
+(`C:\Data\EBSMMTest7`, `save: true`) gives `TryDiscoverMdaRootPrefix()` a
+real destination to race over. **Fix**: `StopRawRecordingIfActive()` now
+clears `snapBurstRecordingActive_` itself, unconditionally, every time it
+runs -- after any stop, by definition no recording is active, regardless of
+which mechanism started it, so the flag can never outlive the thing it was
+tracking.
+
+**Verified** against the connected IMX636 (rebuilt, 0 errors): a dedicated
+ad hoc script confirmed `Camera::start_recording()` produces a valid,
+non-empty `.hdf5` file for an explicit path, for the MDA flat-fallback path,
+and for the `GenerateAutoRawFilePath()` staging path followed by a move to
+a discovered MDA folder. Extended `tools/test_prophebs.py` (Goal 4 section)
+to assert `EBS-RawRecordingFormat` defaults to `HDF5` with allowed values
+`{RAW, HDF5}`, that an auto-discovered recording under the default produces
+a `.hdf5` file, and that switching to `RAW` mid-session produces a `.raw`
+file instead. Reran the full suite: `SUCCESS`, no flakes, no regressions.

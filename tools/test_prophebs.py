@@ -84,8 +84,18 @@ else:
 # EBS-RawTempRecordingFolder should exist regardless of hardware; only a
 # connected camera can actually produce a .raw file (cam_.start_recording()
 # needs a real streaming camera).
-for prop in ("EBS-RawFilePath", "EBS-RawRecordingStatus", "EBS-RawTempRecordingFolder"):
+for prop in ("EBS-RawFilePath", "EBS-RawRecordingStatus", "EBS-RawTempRecordingFolder", "EBS-RawRecordingFormat"):
     print(prop, "=", core.getProperty("ProphEBSCam", prop))
+
+# EBS-RawRecordingFormat: RAW vs HDF5 toggle for auto-generated/MDA-discovered
+# paths. Metavision's Camera::start_recording() picks the format purely from
+# the path's extension, so this just controls which extension
+# GenerateAutoRawFilePath()/ComputeNumberedMdaDestination() use. Defaults to
+# HDF5 per the user's request.
+assert core.getProperty("ProphEBSCam", "EBS-RawRecordingFormat") == "HDF5", \
+    "expected EBS-RawRecordingFormat to default to HDF5"
+assert set(core.getAllowedPropertyValues("ProphEBSCam", "EBS-RawRecordingFormat")) == {"RAW", "HDF5"}
+print("EBS-RawRecordingFormat defaults to HDF5, allowed values {RAW, HDF5} confirmed")
 
 if connection_status == "Connected":
     # 4a. EBS-RawFilePath is left empty -- the adapter should auto-discover
@@ -109,6 +119,28 @@ if connection_status == "Connected":
     assert os.path.isfile(auto_path), f"expected raw file at {auto_path}"
     assert os.path.getsize(auto_path) > 0, f"expected non-empty raw file at {auto_path}"
     print("Goal 4a: raw file created at", auto_path, "size", os.path.getsize(auto_path), "bytes")
+    assert auto_path.endswith(".hdf5"), \
+        f"expected auto-generated recording to use .hdf5 (default EBS-RawRecordingFormat), got {auto_path}"
+    while core.getRemainingImageCount() > 0:
+        core.popNextImage()
+
+    # EBS-RawRecordingFormat=RAW should switch the auto-generated/MDA-discovered
+    # extension back to .raw.
+    core.setProperty("ProphEBSCam", "EBS-RawRecordingFormat", "RAW")
+    core.startSequenceAcquisition(5, 100.0, True)
+    while core.isSequenceRunning():
+        time.sleep(0.05)
+    time.sleep(1.0)
+    status_after_raw_format = core.getProperty("ProphEBSCam", "EBS-RawRecordingStatus")
+    print("EBS-RawRecordingFormat=RAW: EBS-RawRecordingStatus =", status_after_raw_format)
+    assert status_after_raw_format.startswith("Finished:"), \
+        f"expected recording to finish cleanly, got: {status_after_raw_format}"
+    raw_format_path = status_after_raw_format[len("Finished: "):]
+    assert raw_format_path.endswith(".raw"), \
+        f"expected EBS-RawRecordingFormat=RAW to produce a .raw file, got {raw_format_path}"
+    assert os.path.isfile(raw_format_path) and os.path.getsize(raw_format_path) > 0
+    print("EBS-RawRecordingFormat=RAW: .raw file created at", raw_format_path)
+    core.setProperty("ProphEBSCam", "EBS-RawRecordingFormat", "HDF5")  # restore default
     while core.getRemainingImageCount() > 0:
         core.popNextImage()
 

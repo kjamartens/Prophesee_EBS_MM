@@ -56,6 +56,9 @@ const char* g_PropIntegrator = "EBS-Integrator";
 const char* g_PropRawFilePath = "EBS-RawFilePath";
 const char* g_PropRawRecordingStatus = "EBS-RawRecordingStatus";
 const char* g_PropTempFolder = "EBS-RawTempRecordingFolder";
+const char* g_PropRecordingFormat = "EBS-RawRecordingFormat";
+const char* g_RecordingFormatRaw = "RAW";
+const char* g_RecordingFormatHdf5 = "HDF5";
 
 // Bug fix: snap-timed MDA raw-recording gap -- see g_DefaultSnapBurstGapMs
 // in ProphEBS.h.
@@ -631,12 +634,13 @@ namespace
    // Combines FindHighestNumberedMdaSubfolder() with a short retry (MM may
    // still be creating its own folder for this run at the exact moment
    // this is called -- see the two call sites in ProphEBS.cpp for why the
-   // margin differs) and the "<N>_events_Pos0.raw" naming convention,
-   // returning the full destination path -- or empty if no numbered
-   // subfolder ever appears within the retry budget, which the caller
-   // treats as "not available right now."
+   // margin differs) and the "<N>_events_Pos0<extension>" naming convention
+   // (extension is ".hdf5" or ".raw", per EBS-RawRecordingFormat), returning
+   // the full destination path -- or empty if no numbered subfolder ever
+   // appears within the retry budget, which the caller treats as "not
+   // available right now."
    std::string ComputeNumberedMdaDestination(const std::string& mdaRoot, const std::string& mdaPrefix,
-      int maxRetries, int retryDelayMs)
+      int maxRetries, int retryDelayMs, const std::string& extension)
    {
       namespace fs = std::filesystem;
       std::error_code ec;
@@ -653,7 +657,7 @@ namespace
 
       fs::path destDir = fs::path(mdaRoot) / numberedFolder;
       fs::create_directories(destDir, ec);
-      return (destDir / (numberedFolder + "_events_Pos0.raw")).string();
+      return (destDir / (numberedFolder + "_events_Pos0" + extension)).string();
    }
 } // anonymous namespace
 
@@ -919,6 +923,18 @@ int CProphEBSCamera::Initialize()
       return nRet;
 
    nRet = CreateStringProperty(g_PropTempFolder, "", false);
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   // EBS-RawRecordingFormat: RAW vs HDF5 for auto-generated/MDA-discovered
+   // recording paths -- see g_PropRecordingFormat above. Defaults to HDF5.
+   nRet = CreateStringProperty(g_PropRecordingFormat, g_RecordingFormatHdf5, false);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = AddAllowedValue(g_PropRecordingFormat, g_RecordingFormatHdf5);
+   if (DEVICE_OK != nRet)
+      return nRet;
+   nRet = AddAllowedValue(g_PropRecordingFormat, g_RecordingFormatRaw);
    if (DEVICE_OK != nRet)
       return nRet;
 
@@ -3883,8 +3899,10 @@ int CProphEBSCamera::OnBacklogFlushThresholdMs(MM::PropertyBase* pProp, MM::Acti
 }
 
 /**
- * Builds <folder>\ProphEBS_<timestamp>.raw, creating the folder if needed.
- * <folder> is EBS-RawTempRecordingFolder if the user has set it, else
+ * Builds <folder>\ProphEBS_<timestamp>.hdf5 (or .raw, per
+ * EBS-RawRecordingFormat -- see GetRecordingFileExtension()), creating the
+ * folder if needed. <folder> is EBS-RawTempRecordingFolder if the user has
+ * set it, else
  * Documents\ProphEBS_Recordings under the current user's profile (falling
  * back to a relative "ProphEBS_Recordings" if USERPROFILE isn't set
  * either). This is always the actual recording destination when
@@ -3897,6 +3915,13 @@ int CProphEBSCamera::OnBacklogFlushThresholdMs(MM::PropertyBase* pProp, MM::Acti
  * -- see the Goal 4 "doesn't get stored anywhere" incident in
  * docs/DEVLOG.md).
  */
+std::string CProphEBSCamera::GetRecordingFileExtension() const
+{
+   char formatBuf[MM::MaxStrLength];
+   GetProperty(g_PropRecordingFormat, formatBuf);
+   return std::string(formatBuf) == g_RecordingFormatRaw ? ".raw" : ".hdf5";
+}
+
 std::string CProphEBSCamera::GenerateAutoRawFilePath() const
 {
    namespace fs = std::filesystem;
@@ -3926,9 +3951,9 @@ std::string CProphEBSCamera::GenerateAutoRawFilePath() const
    std::tm tmBuf;
    localtime_s(&tmBuf, &now);
    char nameBuf[64];
-   std::strftime(nameBuf, sizeof(nameBuf), "ProphEBS_%Y%m%d_%H%M%S.raw", &tmBuf);
+   std::strftime(nameBuf, sizeof(nameBuf), "ProphEBS_%Y%m%d_%H%M%S", &tmBuf);
 
-   return (folder / nameBuf).string();
+   return (folder / (std::string(nameBuf) + GetRecordingFileExtension())).string();
 }
 
 /**
@@ -3980,7 +4005,7 @@ void CProphEBSCamera::StartRawRecordingIfRequested()
          // Modest retry budget here -- MM has just started the acquisition
          // engine moments ago and may still be setting up its own save
          // folder for this run.
-         path = ComputeNumberedMdaDestination(mdaRoot, mdaPrefix, 4, 150);
+         path = ComputeNumberedMdaDestination(mdaRoot, mdaPrefix, 4, 150, GetRecordingFileExtension());
          if (!path.empty())
             LogMessage("ProphEBS: streaming directly to the Multi-D Acquisition save location -> "
                + path, false);
@@ -4028,9 +4053,27 @@ void CProphEBSCamera::StartRawRecordingIfRequested()
  * (renamed, or copied+deleted across drives) there. If discovery fails, or
  * the recording used an explicit EBS-RawFilePath, the file is left exactly
  * where it was recorded.
+ *
+ * Bug fix: this is called from several unrelated paths (Live-view stop,
+ * Shutdown(), a finite sequence's own natural completion), any of which can
+ * stop a recording that MaybeHandleSnapBurstRecording() actually started.
+ * Always clearing snapBurstRecordingActive_ here (not only from
+ * UpdateStats()'s own gap-check) prevents it from staying stuck true after
+ * one of those other paths already stopped the recording -- otherwise
+ * UpdateStats() would later find the flag still set and issue a second,
+ * spurious StopRawRecordingIfActive() call against whatever unrelated
+ * recording (e.g. a subsequent finite MDA) happens to be active by then,
+ * finalizing it early. Found via test_prophebs.py's Goal 4a check failing
+ * after Goal 3's snaps (which trigger the snap-burst path) ran immediately
+ * before it.
  */
 void CProphEBSCamera::StopRawRecordingIfActive()
 {
+   {
+      MMThreadGuard g(snapBurstLock_);
+      snapBurstRecordingActive_ = false;
+   }
+
    if (!rawRecordingActive_)
       return;
 
@@ -4062,13 +4105,13 @@ void CProphEBSCamera::StopRawRecordingIfActive()
          // A short retry allows for MM still finishing its own folder
          // creation at the very instant this runs -- by design this fires
          // right as the acquisition ends, so normally no retry is needed.
-         fs::path dest = ComputeNumberedMdaDestination(mdaRoot, mdaPrefix, 4, 150);
+         fs::path dest = ComputeNumberedMdaDestination(mdaRoot, mdaPrefix, 4, 150, GetRecordingFileExtension());
          if (dest.empty())
          {
             // No numbered subfolder ever appeared -- likely a save mode
             // that doesn't use one. Fall back to the flat layout directly
             // under mdaRoot.
-            dest = fs::path(mdaRoot) / (mdaPrefix + "_prophesee_events.raw");
+            dest = fs::path(mdaRoot) / (mdaPrefix + "_prophesee_events" + GetRecordingFileExtension());
             fs::create_directories(mdaRoot, ec);
          }
 

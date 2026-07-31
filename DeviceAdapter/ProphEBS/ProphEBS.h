@@ -166,9 +166,19 @@ extern const char* g_PropIntegrator;
 //   into (or records to permanently, if MDA-folder discovery never
 //   resolves). Empty (the default) keeps using
 //   Documents\ProphEBS_Recordings.
+// - g_PropRecordingFormat: RAW vs HDF5. Metavision's Camera::start_recording()
+//   picks the file format purely from the path's extension, so this just
+//   controls the extension used for auto-generated/MDA-discovered paths
+//   (GenerateAutoRawFilePath(), ComputeNumberedMdaDestination()). Defaults to
+//   HDF5. Has no effect when g_PropRawFilePath is set explicitly -- that
+//   path's own extension is used verbatim in that case, so a manual .raw or
+//   .hdf5 path already works today without touching this property.
 extern const char* g_PropRawFilePath;
 extern const char* g_PropRawRecordingStatus;
 extern const char* g_PropTempFolder;
+extern const char* g_PropRecordingFormat;
+extern const char* g_RecordingFormatRaw;
+extern const char* g_RecordingFormatHdf5;
 
 // Goal 5: pre-init-only property. Must be set (in the Hardware Configuration
 // Wizard, or via loadDevice/before initializeDevice) before Initialize() --
@@ -849,6 +859,13 @@ private:
    // StopRawRecordingIfActive(), not here (see that method's comment for
    // why) -- and remains the final location if that later discovery fails.
    std::string GenerateAutoRawFilePath() const;
+
+   // Reads EBS-RawRecordingFormat and returns the matching file extension
+   // (".hdf5" or ".raw") -- used for auto-generated/MDA-discovered paths.
+   // Metavision's Camera::start_recording() picks the format from the
+   // extension alone, so this is the only piece of format-selection logic
+   // needed.
+   std::string GetRecordingFileExtension() const;
 
    // Called from StartSequenceAcquisition() only for finite (MDA-style)
    // sequences with a connected camera -- resolves the recording path
