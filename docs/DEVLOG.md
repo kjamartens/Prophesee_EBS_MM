@@ -2921,3 +2921,183 @@ practice for anything GUI-shaped.
   distinct from the existing "Metavision SDK not on PATH at all" entry,
   since here the SDK *is* installed and on `PATH`, just a different version
   than whatever the DLL was linked against.
+
+## Backend-shim refactor: mmgr_dal_ProphEBS.dll now loads a per-SDK-generation Metavision backend DLL at runtime
+
+The immediately-preceding incident's fix (`__has_include`-gated
+`metavision/sdk/stream/camera.h` vs. `metavision/sdk/driver/camera.h`, plus
+the `PROPHEBS_CAMERA_HAS_GET_FACILITY`/`PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER`/
+`PROPHEBS_HAVE_ROI_PIXEL_MASK` compile-time macros) fixed the immediate
+symptom but not the underlying limitation it was built on top of: a single
+statically-linked `mmgr_dal_ProphEBS.dll` can only ever be linked against
+*one* Metavision SDK generation at a time, decided once at build time on the
+build machine. Ship a DLL built against 5.x and it fails to load on a 4.3.0
+machine (the original incident); build against 4.3.0 instead and the reverse
+happens on a 5.x machine, with two real HAL facilities (`I_EventRateActivityFilterModule`,
+`I_RoiPixelMask`) permanently compiled out even where the installed SDK
+*does* have them. There is no third option within a single binary — two
+translation units compiled against the two different SDK header sets both
+define the identical mangled `Metavision::Camera::*` symbols, so even
+attempting to link both into one DLL would have the linker silently bind
+everything to whichever `.lib` happened to be listed first, not a real
+per-call dispatch.
+
+**Design**: split the adapter into two binaries along the Metavision SDK
+boundary itself, so the *choice* of SDK generation moves from build time to
+`Initialize()`-time on whichever machine the adapter actually runs on:
+
+- `mmgr_dal_ProphEBS.dll` (the only thing MicroManager ever loads) now
+  contains **zero** `metavision/...` includes and holds no
+  `Metavision::Camera` — every previous `cam_.foo()` /
+  `GetCamFacility<Metavision::X>()` call site now goes through a small pure
+  C++ interface, `IProphEBSBackend`
+  (`DeviceAdapter/ProphEBS/Backend/IProphEBSBackend.h`), via a
+  `ProphEBSBackendHandle backendHandle_` member.
+- At `Initialize()`/`ConnectToCamera()` time, `BackendLoader.cpp`
+  (`LoadBestAvailableBackend()`) probes which Metavision SDK generation is
+  actually installed on *this* machine — cheaply, via
+  `LoadLibraryExA(..., LOAD_LIBRARY_AS_DATAFILE | DONT_RESOLVE_DLL_REFERENCES)`
+  against a marker DLL name unique to each known generation
+  (`metavision_sdk_stream.dll` for 5.x, `metavision_sdk_driver.dll` for
+  4.3.0), never actually loading/running the SDK itself just to check — and
+  `LoadLibraryA`s the matching `ProphEBS_Backend_<tag>.dll`, resolving its
+  three required exports (`CreateProphEBSBackend`/`DestroyProphEBSBackend`/
+  `ProphEBSBackendAbiTag`) and verifying the ABI tag string
+  (`PROPHEBS_BACKEND_ABI_TAG`) matches before trusting it — a sanity check
+  against a stale/mismatched backend DLL left behind by a partial copy, not
+  a real versioned-plugin negotiation (main DLL and every backend DLL are
+  always built and shipped together from the same repo commit).
+- Each `ProphEBS_Backend_<tag>.dll` is a completely separate VS project,
+  statically linked against exactly one SDK generation, implementing every
+  `IProphEBSBackend` virtual method for real against that generation's own
+  headers/types. Only `Backend/SDK5x/` (`ProphEBSBackendSDK5x`) exists today
+  — this dev machine has Metavision SDK 5.1.1 ("stream" module) installed,
+  confirmed via the same `metavision_software_info.exe` check the previous
+  incident used. A `Backend/SDK43/` backend for 4.3.0 is designed for
+  (`BackendLoader.cpp`'s `g_BackendCandidates` table already has a
+  commented-in row for it, `ProphEBS_Backend_SDK43.dll`) but **not
+  implemented or built** — explicit follow-up, since there is no 4.3.0 SDK
+  installed on this dev machine to build/test it against; see "Adding a new
+  Metavision SDK generation backend" in `docs/BUILD_AND_USAGE.md` for the
+  recipe once one is available.
+- `IProphEBSBackend.h`'s interface is deliberately POD-only across its
+  surface (fixed-size char buffers, plain C function pointers, no
+  `std::string`/`std::vector`/`std::function`/exceptions in any virtual
+  signature) — a `ProphEBSResult` enum (`Ok`/`Unsupported`/`Error`)
+  distinguishes "this facility doesn't exist on this SDK generation/sensor"
+  from "it exists but this specific call failed," mirroring the
+  `catch (const std::exception&)`-per-facility pattern this codebase already
+  used everywhere, just without the exception itself crossing the DLL
+  boundary. One real, unavoidable loss: exact exception text
+  (`e.what()`) from a Metavision SDK call can no longer reach the main
+  adapter's log messages in every case — `Connect()` is the one place that
+  still copies `e.what()` into a fixed buffer explicitly (the main adapter's
+  own connection-status/log text depended on it), but most other call sites
+  now log a generic "backend reported an error"-style message instead of
+  the original SDK exception text. Considered acceptable: the log call
+  itself is unchanged, only the message's specificity, and every one of
+  these sites already only ever *logged and continued* rather than acting
+  on the exception text programmatically.
+
+**Two non-mechanical pieces, called out explicitly since everything else was
+a type-only substitution**:
+
+- `OnEventsCD()`'s signature changed from
+  `(const Metavision::EventCD* begin, const Metavision::EventCD* end)` to
+  `(const ProphEBSEvent* begin, size_t count)` — matching
+  `ProphEBSCdCallback`'s C-function-pointer shape — with every
+  `Metavision::timestamp` in the touched code paths (`windowStartT_`,
+  `streamSensorStart_`, `nowT_`, and every function signature carrying one)
+  replaced by plain `int64_t`. The actual windowing/backlog-flush/
+  activity-filter algorithm is byte-for-byte the same logic, just reading
+  `ev->polarity`/`ev->tUs` instead of `ev->p`/`ev->t`. `CdCallbackTrampoline`/
+  `RawDataCallbackTrampoline`/`ExtTriggerCallbackTrampoline` (three static
+  methods, `void(void* ctx, ...)`) are what `StartEventStreaming()` actually
+  registers with the backend (`RegisterCdCallback(&CProphEBSCamera::CdCallbackTrampoline, this)`
+  etc.) — each casts `ctx` back to `CProphEBSCamera*` and forwards.
+- Hot-pixel calibration (`OnDetectHotPixelsNow()`) previously registered its
+  **own second, independent** `cam_.cd().add_callback()` for the scan
+  window, running alongside the main streaming callback. `IProphEBSBackend`
+  intentionally supports only one registered CD callback
+  (`RegisterCdCallback()`, called once from `StartEventStreaming()`) — a
+  second callback slot was considered and rejected as unnecessary interface
+  surface for what's fundamentally a "the one callback that's already
+  running should also do this, sometimes" need. Instead: a new
+  `std::atomic<bool> hotPixelCalibActive_` plus
+  `hotPixelCalibOnCounts_`/`-OffCounts_` accumulator vectors and their own
+  `hotPixelCalibLock_` (separate from `eventCountsLock_`, since calibration
+  runs on a different calling thread than the streaming callback).
+  `OnEventsCD()` now checks `hotPixelCalibActive_` near the top of every
+  batch (a single relaxed atomic load when inactive — negligible on the hot
+  path) and, when true, additionally tallies in-ROI raw events into the
+  calibration accumulators, *alongside* its normal window/backlog
+  processing rather than instead of it — functionally identical to the
+  original two-independent-observers design, just multiplexed through the
+  one callback the interface actually allows.
+
+**`Shutdown()`/backend DLL lifetime**: `Shutdown()` now calls
+`backendHandle_.Get()->Disconnect()` but deliberately does **not**
+`Reset()` (unload) the backend module — the backend DLL stays loaded across
+a `Shutdown()`/re-`Initialize()` cycle so a later `Initialize()` can
+`Connect()` again immediately without re-probing which SDK generation is
+installed and repeating the `LoadLibrary`/`GetProcAddress`/ABI-tag dance.
+The backend module is only actually unloaded in `CProphEBSCamera`'s
+destructor, via `ProphEBSBackendHandle`'s own RAII (`~ProphEBSBackendHandle()`
+calls `Reset()`) — no explicit destructor-side call needed.
+
+**Build layout**: `ProphEBS_Backend_SDK5x` is a new, separate VS project
+(`Backend/SDK5x/ProphEBS_Backend_SDK5x.vcxproj`) added to `ProphEBS.sln`.
+Deliberately does **not** import `MMDeviceAdapter.props`/`MMCommon.props`
+(unlike `ProphEBS.vcxproj`) — it implements `IProphEBSBackend` only, links
+no MM/MMDevice headers at all, and must not pick up MM's
+`mmgr_dal_<ProjectName>` output-naming convention. `OutDir`/`IntDir` are set
+explicitly instead, pointed at the same `$(SolutionDir)build\$(Configuration)\$(Platform)\`
+folder `ProphEBS.vcxproj` uses (via `MMCommon.props`, without needing to
+import it) so both DLLs land side by side, ready to be copied to a
+MicroManager install folder together — see "Adding a new Metavision SDK
+generation backend" in `docs/BUILD_AND_USAGE.md`. `ProphEBS.vcxproj` itself
+lost its entire `MetavisionSdkRoot`/`AdditionalIncludeDirectories`/
+`AdditionalDependencies` Metavision block (nothing there needs it any more)
+and gained `Backend/IProphEBSBackend.h`, `Backend/BackendLoader.h`,
+`Backend/BackendLoader.cpp` to its item groups.
+
+**Verified**: `ProphEBS_Backend_SDK5x.vcxproj` built standalone with
+`MSBuild ... /p:Configuration=Release /p:Platform=x64` — 0 errors, 0
+warnings, real link against this machine's installed SDK 5.1.1
+(`metavision_hal.lib`/`metavision_sdk_base.lib`/`metavision_sdk_stream.lib`).
+`grep -rn "Metavision::" ProphEBS.cpp ProphEBS.h` returns only prose
+comments, no code — confirmed by hand that every remaining hit is inside a
+`//`/`/* */` block. `ProphEBS.cpp`/`ProphEBS.h` were verified with a
+syntax-only compiler pass (`cl.exe /Zs`, full front-end type-checking, no
+codegen/link) against a minimal local stub of the two `boost::property_tree`
+headers Goal 4's MDA-JSON-discovery code already depended on before this
+refactor (`boost/property_tree/ptree.hpp`/`json_parser.hpp`) — 0 errors.
+**Could not get a genuine end-to-end link of `mmgr_dal_ProphEBS.dll` itself
+in this sandboxed environment**: `MMCommon.props`' `MM_3RDPARTYPUBLIC`
+(`boost-versions/boost_1_77_0`, a real Boost install, not vendored in this
+repo or any of its submodules) lives one directory above the repo root on
+disk and isn't reachable from this isolated workspace — a pre-existing,
+undocumented external dependency of the Goal 4 MDA-JSON-parsing feature,
+unrelated to this refactor (it was already required by `ProphEBS.cpp`
+before this change, for the exact same `#include <boost/property_tree/...>`
+lines, untouched here). The orchestrating session, with access to the real
+dev machine's full environment, still needs to run the actual
+`MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64` and the
+`tools/test_prophebs.py` pass against real hardware.
+
+### Open questions / TODO
+
+- Build and verify a `Backend/SDK43/` backend once a 4.3.0 SDK install is
+  available to test against — the recipe is fully documented in
+  `docs/BUILD_AND_USAGE.md` and every `IProphEBSBackend` method that 4.3.0
+  can't support has an `Unsupported`-returning path already exercised by
+  the "no camera connected" fallback logic in the main adapter, so this
+  should be close to copy-paste-and-fill-in against `Backend/SDK5x/`'s
+  worked example.
+- Confirm the real end-to-end build
+  (`MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`) on the
+  actual dev machine, and re-run `tools/test_prophebs.py` plus a real
+  Hardware Configuration Wizard pass against the physically-attached
+  camera — this refactor touches every hardware-facing code path in the
+  adapter, even though each individual change was intended to be a
+  mechanical, behavior-preserving translation.

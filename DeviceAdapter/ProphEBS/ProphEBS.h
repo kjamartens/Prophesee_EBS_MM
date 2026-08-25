@@ -112,69 +112,16 @@
 #include "DeviceThreads.h"
 #include "ImgBuffer.h"
 
-// Metavision renamed the module that provides Camera.h from "stream" to
-// "driver" (older SDKs, e.g. 4.3.0, ship metavision/sdk/driver/camera.h and
-// metavision_sdk_driver.lib; newer ones ship metavision/sdk/stream/camera.h
-// and metavision_sdk_stream.lib) -- pick whichever this installed SDK
-// actually has at compile time, and link the matching .lib automatically, so
-// a DLL built against one SDK version doesn't fail to load with a missing-
-// module error on a machine whose installed SDK uses the other name.
-#if __has_include(<metavision/sdk/stream/camera.h>)
-#include <metavision/sdk/stream/camera.h>
-#ifdef _DEBUG
-#pragma comment(lib, "metavision_sdk_stream_d.lib")
-#else
-#pragma comment(lib, "metavision_sdk_stream.lib")
-#endif
-// The "stream" module's Camera also grew a convenience get_facility<T>()
-// that throws and returns T& directly; the older "driver" module only has
-// the lower-level Camera::get_device().get_facility<T>(), which returns a
-// possibly-null T* instead (see GetCamFacility() below, which normalizes
-// both to the same throwing-T&-reference shape this file's try/catch-per-
-// facility pattern is written against).
-#define PROPHEBS_CAMERA_HAS_GET_FACILITY 1
-#else
-#include <metavision/sdk/driver/camera.h>
-#ifdef _DEBUG
-#pragma comment(lib, "metavision_sdk_driver_d.lib")
-#else
-#pragma comment(lib, "metavision_sdk_driver.lib")
-#endif
-#endif
-#include <metavision/hal/facilities/i_antiflicker_module.h>
-#include <metavision/hal/facilities/i_camera_synchronization.h>
-#include <metavision/hal/facilities/i_erc_module.h>
-#include <metavision/hal/facilities/i_event_trail_filter_module.h>
-#include <metavision/hal/facilities/i_ll_biases.h>
-#include <metavision/hal/facilities/i_digital_event_mask.h>
-#include <metavision/hal/facilities/i_roi.h>
-#include <metavision/hal/facilities/i_trigger_in.h>
-#include <metavision/hal/facilities/i_trigger_out.h>
-
-// Both of these HAL facilities are absent entirely from some installed SDK
-// versions (confirmed missing in Metavision SDK 4.3.0 -- no renamed
-// equivalent either, unlike the stream/driver Camera module above):
-// - I_EventRateActivityFilterModule (Goal 8 EBS-EventRateFilter-* band-pass
-//   hysteresis filter). 4.3.0's closest facility,
-//   I_EventRateNoiseFilterModule, is a different, single-threshold API and
-//   not a drop-in replacement, so the feature is disabled rather than
-//   mis-implemented against it.
-// - I_RoiPixelMask (Goal 7 hot-pixel masking's secondary/"belt and
-//   suspenders" mechanism -- I_DigitalEventMask, still included above, is
-//   the facility that actually enforces the mask on this sensor generation
-//   per ApplyBlockedPixelsToHardware()'s own comment, so losing this one is
-//   cosmetic).
-// Gated so the adapter still builds (with these two features/fallbacks
-// silently absent) against an older SDK install instead of failing outright.
-#if __has_include(<metavision/hal/facilities/i_event_rate_activity_filter_module.h>)
-#include <metavision/hal/facilities/i_event_rate_activity_filter_module.h>
-#define PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER 1
-#endif
-#if __has_include(<metavision/hal/facilities/i_roi_pixel_mask.h>)
-#include <metavision/hal/facilities/i_roi_pixel_mask.h>
-#define PROPHEBS_HAVE_ROI_PIXEL_MASK 1
-#endif
-#include <metavision/sdk/cv/algorithms/activity_noise_filter_algorithm.h>
+// Backend-shim refactor: this file (and ProphEBS.cpp) must never reference
+// Metavision::-anything directly any more -- all Metavision SDK/HAL access
+// goes through IProphEBSBackend, implemented by a separate,
+// per-SDK-generation DLL loaded dynamically at Initialize() time. See
+// Backend/IProphEBSBackend.h for the full rationale (this replaces the
+// compile-time __has_include(<metavision/...>) approach from the
+// immediately-preceding DEVLOG entry, which could still only ever link
+// against one SDK generation per build).
+#include "Backend/BackendLoader.h"
+#include "Backend/IProphEBSBackend.h"
 
 #include <memory>
 
@@ -838,7 +785,24 @@ private:
    // it's driven by the sensor's own microsecond-resolution clock rather
    // than a wall-clock Sleep(). All the actual frame rendering still happens
    // in BuildAndSwapFrame(), off this hot path.
-   void OnEventsCD(const Metavision::EventCD* begin, const Metavision::EventCD* end);
+   // Backend-shim refactor: signature changed from
+   // (const Metavision::EventCD*, const Metavision::EventCD*) to
+   // (const ProphEBSEvent*, size_t) -- a type-only substitution matching
+   // ProphEBSCdCallback's shape (Backend/IProphEBSBackend.h); the actual
+   // windowing/backlog/activity-filter algorithm below is unchanged. Also
+   // now the sole place hot-pixel calibration (OnDetectHotPixelsNow()) taps
+   // into the live event stream -- see hotPixelCalibActive_ below, since the
+   // backend interface only supports one registered CD callback.
+   void OnEventsCD(const ProphEBSEvent* begin, size_t count);
+
+   // Backend-shim refactor: trampolines matching the plain-C-function-pointer
+   // shape RegisterCdCallback()/RegisterRawDataCallback()/
+   // RegisterExtTriggerCallback() require (Backend/IProphEBSBackend.h) --
+   // each casts ctx back to CProphEBSCamera* and forwards to the matching
+   // instance method/counter.
+   static void CdCallbackTrampoline(void* ctx, const ProphEBSEvent* begin, size_t count);
+   static void RawDataCallbackTrampoline(void* ctx, size_t sizeBytes);
+   static void ExtTriggerCallbackTrampoline(void* ctx, const ProphEBSExtTriggerEvent* begin, size_t count);
 
    // Goal 6 follow-up: closes the current integration window -- resets only
    // the specific pixels touched since it opened (touchedIndices_), not the
@@ -850,7 +814,7 @@ private:
    // BuildAndSwapFrame()) windowStartT_ is left as-is -- it'll simply look
    // very stale to the next real event, which harmlessly triggers an
    // immediate (already-empty) close and a fresh windowStartT_ right then.
-   void CloseCurrentWindowLocked(bool fromEvent, Metavision::timestamp eventT);
+   void CloseCurrentWindowLocked(bool fromEvent, int64_t eventT);
 
    // Follow-up: performs the actual backlog flush -- wipes onCounts_/
    // offCounts_/touchedIndices_, re-anchors windowStartT_ and the
@@ -864,7 +828,7 @@ private:
    // batch-entry-only check let a single slow batch blow past
    // EBS-AvgBacklogFlushThresholdMs before ever getting flushed.
    void FlushBacklogLocked(std::chrono::steady_clock::time_point nowWall,
-      Metavision::timestamp eventT, double lagMs);
+      int64_t eventT, double lagMs);
 
    // Called by ProphEBSFrameBuilderThread every EBS-ViewDisplayRefreshMs (Goal 6
    // follow-up -- decoupled from the Exposure/integration-window length):
@@ -898,7 +862,7 @@ private:
    // the live onCounts_/offCounts_ BuildAndSwapFrame() itself uses.
    void RenderCountsToImage(ImgBuffer* target, const std::vector<int32_t>& onCounts,
       const std::vector<int32_t>& offCounts, const std::vector<int64_t>& lastEventTimeUs,
-      const std::vector<int8_t>& lastEventPolarity, Metavision::timestamp nowT,
+      const std::vector<int8_t>& lastEventPolarity, int64_t nowT,
       std::chrono::steady_clock::time_point nowWallAnchor);
 
    // Goal 4: builds a local staging raw-file path (Documents\
@@ -980,29 +944,14 @@ private:
    ProphEBSSequenceThread* thd_;
    friend class ProphEBSSequenceThread;
 
-   // Goal 2: real EBS connection state. cam_ is default-constructed (not
-   // connected to anything) until ConnectToCamera() succeeds.
-   Metavision::Camera cam_;
-
-   // Every facility lookup in this file is written as
-   // GetCamFacility<Metavision::I_Whatever>() inside a try/catch(const
-   // std::exception&) -- this normalizes the SDK-version split between
-   // Camera::get_facility<T>() (throwing T&, "stream"-module SDKs) and
-   // Camera::get_device().get_facility<T>() (possibly-null T*, "driver"-
-   // module SDKs) onto the same throwing-T&-reference shape, so call sites
-   // don't need to know which SDK generation is actually installed.
-   template <typename T>
-   T& GetCamFacility()
-   {
-#ifdef PROPHEBS_CAMERA_HAS_GET_FACILITY
-      return cam_.get_facility<T>();
-#else
-      T* f = cam_.get_device().get_facility<T>();
-      if (!f)
-         throw std::runtime_error("facility not available on this device");
-      return *f;
-#endif
-   }
+   // Backend-shim refactor: replaces the old Metavision::Camera cam_ member
+   // entirely -- every facility call in this file now goes through
+   // backendHandle_.Get()->Foo(...) instead of GetCamFacility<T>(). Loaded
+   // once by ConnectToCamera() (LoadBestAvailableBackend()); kept loaded
+   // (just Disconnect()ed) across a Shutdown()/re-Initialize() cycle so a
+   // later Initialize() can Connect() again without re-probing/re-loading
+   // the backend DLL -- see Shutdown()'s own comment in ProphEBS.cpp.
+   ProphEBSBackendHandle backendHandle_;
 
    bool cameraConnected_;
    std::string connectionStatus_;
@@ -1064,7 +1013,7 @@ private:
    // so the decay clock keeps advancing through a flush instead of freezing).
    std::vector<int64_t> lastEventTimeUs_;
    std::vector<int8_t> lastEventPolarity_;
-   Metavision::timestamp nowT_;
+   int64_t nowT_;
    std::chrono::steady_clock::time_point nowWallAnchor_;
    std::atomic<double> timeDecayTimeConstantUs_;
 
@@ -1082,7 +1031,7 @@ private:
    // second. lastWindowCloseWallTime_ is a plain (non-sensor) wall-clock
    // timestamp of the last close, used only by BuildAndSwapFrame()'s idle
    // timeout (g_IdleWindowTimeoutMs).
-   Metavision::timestamp windowStartT_;
+   int64_t windowStartT_;
    std::vector<uint32_t> touchedIndices_;
    std::chrono::steady_clock::time_point lastWindowCloseWallTime_;
 
@@ -1147,7 +1096,7 @@ private:
    // properties (EBS-AvgCallbackLagMs/EBS-AvgBacklogFlushCount), pushed on the
    // existing Goal 5 stats cadence by UpdateStats().
    std::chrono::steady_clock::time_point streamWallStart_;
-   Metavision::timestamp streamSensorStart_;
+   int64_t streamSensorStart_;
    std::atomic<double> callbackLagMs_;
    std::atomic<uint64_t> backlogFlushCount_;
    std::atomic<double> backlogFlushThresholdMs_;
@@ -1184,24 +1133,52 @@ private:
    std::atomic<int> viewMode_;
    std::atomic<double> viewOffset_;
 
-   // Goal 6: software activity-noise filter. Constructed only inside
+   // Goal 6: software activity-noise filter. Backend-shim refactor: the
+   // actual Metavision::ActivityNoiseFilterAlgorithm instance is now owned
+   // by the backend DLL (ActivityFilterConstruct()/-SetThreshold()/-Destroy()/
+   // -Process(), Backend/IProphEBSBackend.h) -- this file no longer holds a
+   // filter object itself, only a bool tracking whether it's currently
+   // constructed (activityFilterConstructed_, so OnEventsCD() knows whether
+   // to call ActivityFilterProcess() at all). Constructed only inside
    // StartEventStreaming() (needs sensorWidth_/sensorHeight_, known only
-   // once connected) and destroyed in StopEventStreaming(); null the rest of
-   // the time, so OnEventsCD() and the property handlers both null-check
-   // before using it. activityFilterEnabled_/-ThresholdUs_ are the
-   // user-facing state (settable any time, even with no camera connected,
-   // mirroring EBS-EventTrailFilter-* from Goal 5); activityFilterLock_
-   // guards activityFilter_ itself (both process_events() from OnEventsCD()
-   // and set_threshold()/reconstruction from the property handlers).
-   std::unique_ptr<Metavision::ActivityNoiseFilterAlgorithm<>> activityFilter_;
+   // once connected) and destroyed in StopEventStreaming().
+   // activityFilterEnabled_/-ThresholdUs_ are the user-facing state (settable
+   // any time, even with no camera connected, mirroring
+   // EBS-EventTrailFilter-* from Goal 5); activityFilterLock_ guards
+   // activityFilterConstructed_ and every backend ActivityFilter* call (both
+   // ActivityFilterProcess() from OnEventsCD() and
+   // ActivityFilterSetThreshold()/reconstruction from the property
+   // handlers).
+   bool activityFilterConstructed_;
    MMThreadLock activityFilterLock_;
    bool activityFilterEnabled_;
    long activityFilterThresholdUs_;
 
    bool streaming_;
-   Metavision::CallbackId cdCallbackId_;
    ProphEBSFrameBuilderThread* frameBuilderThd_;
    friend class ProphEBSFrameBuilderThread;
+
+   // Goal 7 follow-up (backend-shim refactor): hot-pixel calibration state.
+   // The backend interface supports only one registered CD callback
+   // (RegisterCdCallback(), called once from StartEventStreaming()), so
+   // OnDetectHotPixelsNow() can no longer register its own second, temporary
+   // callback the way the original two-callback design did. Instead, the
+   // single OnEventsCD() callback checks hotPixelCalibActive_ on every batch
+   // and, when true, additionally tallies in-ROI events into
+   // hotPixelCalibOnCounts_/-OffCounts_ (ROI-local, sized/zeroed by
+   // OnDetectHotPixelsNow() before setting hotPixelCalibActive_ = true) --
+   // guarded by their own dedicated hotPixelCalibLock_, separate from
+   // eventCountsLock_, since OnDetectHotPixelsNow() runs on a different
+   // thread (whatever calls the property's AfterSet) than OnEventsCD()
+   // (Metavision's own callback thread, via the backend).
+   std::atomic<bool> hotPixelCalibActive_;
+   std::vector<uint32_t> hotPixelCalibOnCounts_;
+   std::vector<uint32_t> hotPixelCalibOffCounts_;
+   unsigned hotPixelCalibRoiX_;
+   unsigned hotPixelCalibRoiY_;
+   unsigned hotPixelCalibRoiW_;
+   unsigned hotPixelCalibRoiH_;
+   MMThreadLock hotPixelCalibLock_;
 
    // Goal 4: raw event-file recording state. rawRecordingActive_/
    // currentRawFilePath_/movePendingToMdaFolder_ are only meaningful between
@@ -1327,16 +1304,16 @@ private:
    // what's just a running total.
    std::atomic<uint64_t> totalRawBytes_;
    std::atomic<uint64_t> totalEventCount_;
-   Metavision::CallbackId rawDataCallbackId_;
    ProphEBSStatsThread* statsThd_;
    friend class ProphEBSStatsThread;
 
    // Goal 8 follow-up: EBS-TriggerIn-Count backing state -- see
-   // g_PropTriggerInCount. triggerInCallbackId_ is only valid while
-   // streaming_ (registered/removed in Start/StopEventStreaming(), same as
-   // cdCallbackId_/rawDataCallbackId_ above).
+   // g_PropTriggerInCount. Incremented by ExtTriggerCallbackTrampoline(),
+   // registered/unregistered by the backend itself inside
+   // Start/StopEventStreaming() (RegisterExtTriggerCallback()/
+   // UnregisterCallbacks() -- the backend owns the underlying
+   // Metavision::CallbackId now, not this file).
    std::atomic<uint64_t> triggerInCount_;
-   Metavision::CallbackId triggerInCallbackId_;
 
    // Goal 5: cached stat values, written only by UpdateStats() (on
    // statsThd_'s thread) and read only by OnStat() (called synchronously by

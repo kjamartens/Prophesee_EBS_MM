@@ -11,8 +11,8 @@
     </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
-    <ProjectGuid>{76D00169-6C00-48DC-969A-E87D9249759C}</ProjectGuid>
-    <RootNamespace>ProphEBS</RootNamespace>
+    <ProjectGuid>{5A1C9E2B-3D4F-4A6E-9B7C-1F2E3D4C5B6A}</ProjectGuid>
+    <RootNamespace>ProphEBS_Backend_SDK5x</RootNamespace>
     <Keyword>Win32Proj</Keyword>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
@@ -33,52 +33,44 @@
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
   <!--
-    These two .props files come from the mmCoreAndDevices submodule
-    (third_party/mmCoreAndDevices/buildscripts/VisualStudio/). They set up
-    the MMDevice include path, common warning/language settings, the
-    "mmgr_dal_<ProjectName>" output naming convention, and the shared
-    build output directory. Every Micro-Manager device adapter imports
-    these same two files.
+    Deliberately does NOT import MMCommon.props/MMDeviceAdapter.props (unlike
+    ProphEBS.vcxproj): this project implements IProphEBSBackend only, links
+    no MM/MMDevice headers at all, and must not pick up MM's
+    "mmgr_dal_(ProjectName)" output-naming convention. OutDir/IntDir are set
+    explicitly below instead, pointed at the same shared build output folder
+    ProphEBS.vcxproj uses (via MMCommon.props' SolutionDir\build\...
+    convention) so both DLLs land side by side, ready to be copied to a
+    MicroManager install folder together. See docs/BUILD_AND_USAGE.md,
+    "Adding a new Metavision SDK generation backend."
   -->
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
-    <Import Project="..\..\third_party\mmCoreAndDevices\buildscripts\VisualStudio\MMCommon.props" />
-    <Import Project="..\..\third_party\mmCoreAndDevices\buildscripts\VisualStudio\MMDeviceAdapter.props" />
   </ImportGroup>
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
-    <Import Project="..\..\third_party\mmCoreAndDevices\buildscripts\VisualStudio\MMCommon.props" />
-    <Import Project="..\..\third_party\mmCoreAndDevices\buildscripts\VisualStudio\MMDeviceAdapter.props" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <_ProjectFileVersion>10.0.40219.1</_ProjectFileVersion>
     <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkIncremental>
     <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
+    <!-- Mirrors ProphEBS.vcxproj's own build-output convention
+         ($(SolutionDir)build\$(Configuration)\$(Platform)\, from
+         MMCommon.props) without needing to import that file; this project
+         is always built either standalone or as part of ProphEBS.sln, whose
+         SolutionDir is DeviceAdapter\ProphEBS\. -->
+    <OutDir>$(SolutionDir)build\$(Configuration)\$(Platform)\</OutDir>
+    <IntDir>$(SolutionDir)build\intermediates\$(Configuration)\$(Platform)\$(ProjectName)\</IntDir>
+    <TargetName>ProphEBS_Backend_SDK5x</TargetName>
   </PropertyGroup>
   <!--
-    Backend-shim refactor: this project no longer links the Prophesee
-    Metavision SDK at all; every Metavision::-facing call now lives in a
-    separate per-SDK-generation backend DLL (Backend/SDK5x/, etc.), loaded
-    dynamically at runtime by BackendLoader.cpp. See
-    Backend/IProphEBSBackend.h and docs/BUILD_AND_USAGE.md, "Adding a new
-    Metavision SDK generation backend."
-
-    This project does, however, still need Boost headers on its own account
-    -- the Goal 4 MDA-save-path auto-discovery code (TryDiscoverMdaRootPrefix()
-    in ProphEBS.cpp) uses boost::property_tree to parse MicroManager's own
-    JSON files, which has nothing to do with Metavision. Before this refactor
-    that include path came along for free as a side effect of
-    $(MetavisionSdkRoot)\third_party\include (the Metavision SDK installer
-    happens to bundle Boost for its own OpenCV/HDF5 dependencies); now that
-    this project no longer references MetavisionSdkRoot at all, BoostRoot is
-    its own explicit override point, defaulting to that same bundled copy
-    since it's already known to work and be present wherever the Metavision
-    SDK is installed on a build machine. Header-only usage (property_tree),
-    so no library to link.
+    Same MetavisionSdkRoot override point as ProphEBS.vcxproj used to have
+    (before the backend-shim refactor moved all SDK linkage into backend
+    projects like this one). Pass /p:MetavisionSdkRoot=... to MSBuild, or
+    edit the default below, if the SDK is installed elsewhere.
   -->
   <PropertyGroup>
-    <BoostRoot Condition="'$(BoostRoot)'==''">C:\Program Files\Prophesee\third_party\include</BoostRoot>
+    <MetavisionSdkRoot Condition="'$(MetavisionSdkRoot)'==''">C:\Program Files\Prophesee</MetavisionSdkRoot>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <Midl>
@@ -88,20 +80,25 @@
       <Optimization>Disabled</Optimization>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <PreprocessorDefinitions>NOMINMAX;WIN32;_DEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NOMINMAX;WIN32;_DEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeTypeInfo>true</RuntimeTypeInfo>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <WarningLevel>Level4</WarningLevel>
+      <DisableSpecificWarnings>4127;4290;4828;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <PrecompiledHeader>
       </PrecompiledHeader>
-      <DisableSpecificWarnings>4290;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(BoostRoot);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MetavisionSdkRoot)\include;$(MetavisionSdkRoot)\third_party\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
       <DataExecutionPrevention>
       </DataExecutionPrevention>
-      <AdditionalDependencies>Winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(MetavisionSdkRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>Winmm.lib;metavision_hal_d.lib;metavision_sdk_base_d.lib;metavision_sdk_stream_d.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -112,37 +109,35 @@
       <Optimization>MaxSpeed</Optimization>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <PreprocessorDefinitions>NOMINMAX;WIN32;NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NOMINMAX;WIN32;NDEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeTypeInfo>true</RuntimeTypeInfo>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <WarningLevel>Level4</WarningLevel>
+      <DisableSpecificWarnings>4127;4290;4828;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <PrecompiledHeader>
       </PrecompiledHeader>
-      <DisableSpecificWarnings>4290;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(BoostRoot);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MetavisionSdkRoot)\include;$(MetavisionSdkRoot)\third_party\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <DataExecutionPrevention>
       </DataExecutionPrevention>
-      <AdditionalDependencies>Winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(MetavisionSdkRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>Winmm.lib;metavision_hal.lib;metavision_sdk_base.lib;metavision_sdk_stream.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="ProphEBS.cpp" />
-    <ClCompile Include="ProphEBSModule.cpp" />
-    <ClCompile Include="Backend\BackendLoader.cpp" />
+    <ClCompile Include="ProphEBSBackendSDK5x.cpp" />
+    <ClCompile Include="ProphEBSBackendSDK5xExports.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="ProphEBS.h" />
-    <ClInclude Include="Backend\IProphEBSBackend.h" />
-    <ClInclude Include="Backend\BackendLoader.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\..\third_party\mmCoreAndDevices\MMDevice\MMDevice-SharedRuntime.vcxproj">
-      <Project>{b8c95f39-54bf-40a9-807b-598df2821d55}</Project>
-    </ProjectReference>
+    <ClInclude Include="ProphEBSBackendSDK5x.h" />
+    <ClInclude Include="..\IProphEBSBackend.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

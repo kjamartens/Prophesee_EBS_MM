@@ -6,6 +6,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ProphEBS", "ProphEBS.vcxpro
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MMDevice-SharedRuntime", "..\..\third_party\mmCoreAndDevices\MMDevice\MMDevice-SharedRuntime.vcxproj", "{B8C95F39-54BF-40A9-807B-598DF2821D55}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ProphEBS_Backend_SDK5x", "Backend\SDK5x\ProphEBS_Backend_SDK5x.vcxproj", "{5A1C9E2B-3D4F-4A6E-9B7C-1F2E3D4C5B6A}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -20,6 +22,10 @@ Global
 		{B8C95F39-54BF-40A9-807B-598DF2821D55}.Debug|x64.Build.0 = Debug|x64
 		{B8C95F39-54BF-40A9-807B-598DF2821D55}.Release|x64.ActiveCfg = Release|x64
 		{B8C95F39-54BF-40A9-807B-598DF2821D55}.Release|x64.Build.0 = Release|x64
+		{5A1C9E2B-3D4F-4A6E-9B7C-1F2E3D4C5B6A}.Debug|x64.ActiveCfg = Debug|x64
+		{5A1C9E2B-3D4F-4A6E-9B7C-1F2E3D4C5B6A}.Debug|x64.Build.0 = Debug|x64
+		{5A1C9E2B-3D4F-4A6E-9B7C-1F2E3D4C5B6A}.Release|x64.ActiveCfg = Release|x64
+		{5A1C9E2B-3D4F-4A6E-9B7C-1F2E3D4C5B6A}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
