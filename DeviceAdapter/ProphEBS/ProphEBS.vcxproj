@@ -64,8 +64,8 @@
     Backend/IProphEBSBackend.h and docs/BUILD_AND_USAGE.md, "Adding a new
     Metavision SDK generation backend."
 
-    This project does, however, still need Boost headers on its own account
-    -- the Goal 4 MDA-save-path auto-discovery code (TryDiscoverMdaRootPrefix()
+    This project does, however, still need Boost headers on its own account:
+    the Goal 4 MDA-save-path auto-discovery code (TryDiscoverMdaRootPrefix()
     in ProphEBS.cpp) uses boost::property_tree to parse MicroManager's own
     JSON files, which has nothing to do with Metavision. Before this refactor
     that include path came along for free as a side effect of

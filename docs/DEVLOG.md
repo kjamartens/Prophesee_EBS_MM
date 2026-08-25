@@ -3085,6 +3085,46 @@ dev machine's full environment, still needs to run the actual
 `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64` and the
 `tools/test_prophebs.py` pass against real hardware.
 
+### Follow-up: real end-to-end build + self-test on the actual dev machine
+
+The worktree agent's build was sandboxed away from the real Boost install
+and had no MicroManager/hardware to test against (see "Verified" above).
+Completed here, on the real machine:
+
+- Found the missing piece the worktree couldn't see: `ProphEBS.vcxproj`
+  losing its entire Metavision block also silently dropped
+  `$(MetavisionSdkRoot)\third_party\include` — which happened to be the
+  *only* reason the Goal 4 `boost::property_tree` includes ever resolved
+  (the Metavision SDK installer bundles a full Boost copy under its own
+  `third_party\include`, for its own OpenCV/HDF5 dependencies; `ProphEBS.cpp`
+  was quietly riding on that path this whole time, unrelated to anything
+  Metavision itself). Fixed by giving `ProphEBS.vcxproj` its own explicit
+  `BoostRoot` MSBuild property (defaulting to that same bundled path, header-
+  only usage, no library to link) instead of resurrecting the Metavision
+  path wholesale.
+- `MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64` now
+  succeeds end-to-end for all three projects (`ProphEBS_Backend_SDK5x`,
+  `MMDevice-SharedRuntime`, `ProphEBS`) — 0 warnings, 0 errors — producing
+  `mmgr_dal_ProphEBS.dll` and `ProphEBS_Backend_SDK5x.dll` side by side in
+  `build\Release\x64\`.
+- Copied both DLLs into the active MicroManager install
+  (`Micro-Manager_2.0.3_20260724`, DIV 75) and ran
+  `tools\mm_python_env\Scripts\python.exe tools\test_prophebs.py`: full
+  suite passes (`SUCCESS`), covering every Goal 1-9 property/behavior check
+  that doesn't require a physically-attached camera. `EBS-ConnectionStatus`
+  correctly reports the real Metavision SDK exception text
+  ("Error 101001: Camera not found...") — confirming `BackendLoader` found
+  and loaded `ProphEBS_Backend_SDK5x.dll` (its marker DLL,
+  `metavision_sdk_stream.dll`, resolved) and the new adapter's `Connect()`
+  genuinely reached into the real SDK rather than short-circuiting. No EBS
+  was physically attached to this dev machine during this test run
+  (confirmed separately via `metavision_platform_info.exe`, which reported
+  an empty "SYSTEMS AVAILABLE" list) — this is a pre-existing hardware
+  condition unrelated to the refactor, not a regression; Goal 2/3's own
+  history already established this exact code path works against real
+  hardware, and this pass confirms the new backend-shim plumbing reaches
+  the identical `Metavision::Camera::from_first_available()` call correctly.
+
 ### Open questions / TODO
 
 - Build and verify a `Backend/SDK43/` backend once a 4.3.0 SDK install is
@@ -3094,10 +3134,9 @@ dev machine's full environment, still needs to run the actual
   the "no camera connected" fallback logic in the main adapter, so this
   should be close to copy-paste-and-fill-in against `Backend/SDK5x/`'s
   worked example.
-- Confirm the real end-to-end build
-  (`MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`) on the
-  actual dev machine, and re-run `tools/test_prophebs.py` plus a real
-  Hardware Configuration Wizard pass against the physically-attached
-  camera — this refactor touches every hardware-facing code path in the
-  adapter, even though each individual change was intended to be a
-  mechanical, behavior-preserving translation.
+- A full in-GUI Hardware Configuration Wizard / Live-Snap-with-a-physically-
+  attached-camera pass is still up to the user, per this project's
+  established practice for anything GUI-shaped — the self-test above proves
+  the adapter loads, the backend probing/loading works, and every
+  property/fallback path behaves correctly, but doesn't exercise real event
+  streaming (no camera attached during this pass).
