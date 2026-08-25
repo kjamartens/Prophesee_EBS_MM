@@ -18,11 +18,6 @@
 #include "CameraImageMetadata.h"
 #include "ModuleInterface.h"
 
-#include <metavision/hal/facilities/i_geometry.h>
-#include <metavision/hal/facilities/i_hw_identification.h>
-#include <metavision/hal/facilities/i_monitoring.h>
-#include <metavision/hal/utils/device_config.h>
-
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 
@@ -137,28 +132,6 @@ const char* g_PropEventRateFilterUpperStop = "EBS-EventRateFilter-UpperStop";
 
 const char* g_PropSyncMode = "EBS-SyncMode";
 
-// Goal 8: I_TriggerIn::Channel <-> string conversions (the enum has no
-// built-in stream operator, same situation as I_EventTrailFilterModule::Type
-// above).
-const char* TriggerChannelToString(Metavision::I_TriggerIn::Channel ch)
-{
-   switch (ch)
-   {
-      case Metavision::I_TriggerIn::Channel::Main: return "Main";
-      case Metavision::I_TriggerIn::Channel::Aux: return "Aux";
-      case Metavision::I_TriggerIn::Channel::Loopback: return "Loopback";
-   }
-   return "Main";
-}
-
-bool TriggerChannelFromString(const std::string& s, Metavision::I_TriggerIn::Channel& outCh)
-{
-   if (s == "Main") { outCh = Metavision::I_TriggerIn::Channel::Main; return true; }
-   if (s == "Aux") { outCh = Metavision::I_TriggerIn::Channel::Aux; return true; }
-   if (s == "Loopback") { outCh = Metavision::I_TriggerIn::Channel::Loopback; return true; }
-   return false;
-}
-
 // Follow-up: how many events OnEventsCD()'s per-event loop processes between
 // wall-clock lag rechecks -- see FlushBacklogLocked()/g_PropBacklogFlushThresholdMs
 // in ProphEBS.h for why a single large/slow batch needs this instead of only
@@ -175,27 +148,6 @@ const size_t g_LagCheckEventInterval = 8192;
 // terminology the user asked for.
 const char* const g_AntiFlickerFilterTypeBandPass = "Band Pass";
 const char* const g_AntiFlickerFilterTypeBandCut = "Band Cut";
-
-// Event-trail-filter Type <-> string conversions (Metavision::
-// I_EventTrailFilterModule::Type has no built-in stream operator).
-const char* EventTrailFilterTypeToString(Metavision::I_EventTrailFilterModule::Type type)
-{
-   switch (type)
-   {
-      case Metavision::I_EventTrailFilterModule::Type::TRAIL: return "TRAIL";
-      case Metavision::I_EventTrailFilterModule::Type::STC_CUT_TRAIL: return "STC_CUT_TRAIL";
-      case Metavision::I_EventTrailFilterModule::Type::STC_KEEP_TRAIL: return "STC_KEEP_TRAIL";
-   }
-   return "TRAIL";
-}
-
-bool EventTrailFilterTypeFromString(const std::string& s, Metavision::I_EventTrailFilterModule::Type& outType)
-{
-   if (s == "TRAIL") { outType = Metavision::I_EventTrailFilterModule::Type::TRAIL; return true; }
-   if (s == "STC_CUT_TRAIL") { outType = Metavision::I_EventTrailFilterModule::Type::STC_CUT_TRAIL; return true; }
-   if (s == "STC_KEEP_TRAIL") { outType = Metavision::I_EventTrailFilterModule::Type::STC_KEEP_TRAIL; return true; }
-   return false;
-}
 
 // Goal 6: EBS-ViewMode <-> ProphEBSViewMode string conversions.
 const char* ViewModeToString(ProphEBSViewMode mode)
@@ -703,11 +655,16 @@ CProphEBSCamera::CProphEBSCamera() :
    liveViewMinIntervalMs_(g_DefaultLiveViewMinIntervalMs),
    viewMode_(static_cast<int>(ProphEBSViewMode::NetSigned)),
    viewOffset_(static_cast<double>(g_DefaultViewOffset)),
+   activityFilterConstructed_(false),
    activityFilterEnabled_(false),
    activityFilterThresholdUs_(g_DefaultActivityFilterThresholdUs),
    streaming_(false),
-   cdCallbackId_(),
    frameBuilderThd_(nullptr),
+   hotPixelCalibActive_(false),
+   hotPixelCalibRoiX_(0),
+   hotPixelCalibRoiY_(0),
+   hotPixelCalibRoiW_(0),
+   hotPixelCalibRoiH_(0),
    rawRecordingActive_(false),
    movePendingToMdaFolder_(false),
    hasLastSnapTime_(false),
@@ -742,10 +699,8 @@ CProphEBSCamera::CProphEBSCamera() :
    dataEncodingFormat_("N/A"),
    totalRawBytes_(0),
    totalEventCount_(0),
-   rawDataCallbackId_(),
    statsThd_(nullptr),
    triggerInCount_(0),
-   triggerInCallbackId_(),
    avgDataRateMBps_(0.0),
    avgEventRateMEvps_(0.0),
    avgErcDropRateKEvps_(0.0),
@@ -1085,9 +1040,15 @@ int CProphEBSCamera::Shutdown()
    StopEventStreaming();
    if (cameraConnected_)
    {
-      // Release the HAL device handle by replacing cam_ with a fresh,
-      // unopened Camera.
-      cam_ = Metavision::Camera();
+      // Backend-shim refactor: release the HAL device handle
+      // (Disconnect()), but deliberately keep the backend DLL itself loaded
+      // (do not Reset() the handle) -- a later Initialize() can then
+      // Connect() again immediately without re-probing which SDK generation
+      // is installed and re-doing the LoadLibrary/GetProcAddress/ABI-tag
+      // dance. The backend module is only actually unloaded (Reset()) in
+      // the destructor, once this device object itself is going away.
+      if (backendHandle_.IsLoaded())
+         backendHandle_.Get()->Disconnect();
       cameraConnected_ = false;
    }
    initialized_ = false;
@@ -1095,82 +1056,95 @@ int CProphEBSCamera::Shutdown()
 }
 
 /**
- * Attempts to open the first available Prophesee EBS via the Metavision
- * SDK. On success, reads back identification info (serial, sensor name,
- * connection type, integrator) through the HAL's I_HW_Identification
- * facility so it can be exposed as read-only MM properties -- this is the
- * "report back the model number/serial so we can assure the connection is
- * good" requirement from Goal 2.
+ * Loads the best-available backend DLL for whichever Metavision SDK
+ * generation is actually installed (LoadBestAvailableBackend()), then asks
+ * it to open the first available Prophesee EBS. On success, reads back
+ * identification info (serial, sensor name, connection type, integrator)
+ * via GetIdentification() so it can be exposed as read-only MM properties --
+ * this is the "report back the model number/serial so we can assure the
+ * connection is good" requirement from Goal 2.
  *
  * Deliberately does not throw and does not fail Initialize(): a missing
- * camera (or missing Metavision driver/plugin) is an expected condition
- * during development without hardware attached, not a fatal adapter error.
+ * camera (or missing Metavision driver/plugin, or no matching backend DLL at
+ * all) is an expected condition during development without hardware
+ * attached, not a fatal adapter error -- same never-fail contract as before
+ * the backend-shim refactor.
  */
 void CProphEBSCamera::ConnectToCamera()
 {
-   try
+   std::string loadError;
+   backendHandle_ = LoadBestAvailableBackend(loadError);
+   if (!backendHandle_.IsLoaded())
    {
-      // Goal 5: EBS-biasRangeCheckBypass is a pre-init property (see the
-      // constructor), so it's safe to read here -- it can no longer change
-      // once Initialize()/ConnectToCamera() runs. Mirrors Metavision
-      // Studio's "bypass biases range check" checkbox.
-      char bypassBuf[MM::MaxStrLength];
-      GetProperty(g_PropBiasRangeCheckBypass, bypassBuf);
-      Metavision::DeviceConfig deviceConfig;
-      deviceConfig.enable_biases_range_check_bypass(std::string(bypassBuf) == "On");
-
-      cam_ = Metavision::Camera::from_first_available(deviceConfig);
-
-      // Throws CameraException (caught below) if the facility isn't
-      // available -- every real Prophesee device registers it, so this only
-      // trips for unusual/unsupported hardware.
-      Metavision::I_HW_Identification& hwId = GetCamFacility<Metavision::I_HW_Identification>();
-
-      cameraSerial_ = hwId.get_serial();
-      connectionType_ = hwId.get_connection_type();
-      integrator_ = hwId.get_integrator();
-      dataEncodingFormat_ = hwId.get_current_data_encoding_format();
-
-      Metavision::I_HW_Identification::SensorInfo sensorInfo = hwId.get_sensor_info();
-      std::ostringstream modelStream;
-      modelStream << sensorInfo.name_ << " (Gen " << sensorInfo.major_version_
-                  << "." << sensorInfo.minor_version_ << ")";
-      cameraModel_ = modelStream.str();
-
-      std::ostringstream genStream;
-      genStream << sensorInfo.major_version_ << "." << sensorInfo.minor_version_;
-      generation_ = genStream.str();
-
-      // Real sensor geometry, used from here on instead of the
-      // g_TestImageWidth/Height fallback (throws CameraException, caught
-      // below, on the same unusual "no I_Geometry facility" condition as
-      // I_HW_Identification above).
-      Metavision::I_Geometry& geometry = GetCamFacility<Metavision::I_Geometry>();
-      sensorWidth_ = static_cast<unsigned>(geometry.get_width());
-      sensorHeight_ = static_cast<unsigned>(geometry.get_height());
-
-      cameraConnected_ = true;
-      connectionStatus_ = "Connected";
-
-      std::ostringstream logMsg;
-      logMsg << "ProphEBS: connected to " << cameraModel_ << ", serial=" << cameraSerial_
-             << ", connection=" << connectionType_ << ", geometry=" << sensorWidth_ << "x"
-             << sensorHeight_;
-      LogMessage(logMsg.str(), false);
-   }
-   catch (const std::exception& e)
-   {
-      // Covers Metavision::CameraException (thrown when no camera is found,
-      // the driver isn't installed, or the HAL plugin can't load) as well as
-      // any other std::exception the SDK might raise.
       cameraConnected_ = false;
-      connectionStatus_ = std::string("Not connected: ") + e.what();
-
-      std::ostringstream logMsg;
-      logMsg << "ProphEBS: no EBS camera connected (" << e.what()
-             << ") -- falling back to static test image, as in Goal 1";
-      LogMessage(logMsg.str(), false);
+      connectionStatus_ = "Not connected: " + loadError;
+      LogMessage("ProphEBS: no backend DLL could be loaded (" + loadError +
+         ") -- falling back to static test image, as in Goal 1", false);
+      return;
    }
+
+   // Goal 5: EBS-biasRangeCheckBypass is a pre-init property (see the
+   // constructor), so it's safe to read here -- it can no longer change
+   // once Initialize()/ConnectToCamera() runs. Mirrors Metavision Studio's
+   // "bypass biases range check" checkbox.
+   char bypassBuf[MM::MaxStrLength];
+   GetProperty(g_PropBiasRangeCheckBypass, bypassBuf);
+   bool bypass = std::string(bypassBuf) == "On";
+
+   char errorBuf[512] = { 0 };
+   if (!backendHandle_.Get()->Connect(bypass, errorBuf, sizeof(errorBuf)))
+   {
+      // Covers "no camera found," "driver not installed," "HAL plugin can't
+      // load," and any other backend-reported connection failure -- the
+      // exact original exception text is preserved here (Connect() copies
+      // e.what() into errorBuf on the backend side), same detail level as
+      // before the backend-shim refactor.
+      cameraConnected_ = false;
+      connectionStatus_ = std::string("Not connected: ") + errorBuf;
+      LogMessage("ProphEBS: no EBS camera connected (" + std::string(errorBuf) +
+         ") -- falling back to static test image, as in Goal 1", false);
+      return;
+   }
+
+   ProphEBSIdentification ident{};
+   if (!backendHandle_.Get()->GetIdentification(ident))
+   {
+      // Unusual/unsupported hardware -- connected, but the identification/
+      // geometry facilities themselves aren't available. Mirrors the
+      // original single try/catch around both facilities.
+      cameraConnected_ = false;
+      connectionStatus_ = "Not connected: identification/geometry facilities unavailable on this device";
+      LogMessage("ProphEBS: connected but could not read identification/geometry -- "
+         "falling back to static test image, as in Goal 1", false);
+      backendHandle_.Get()->Disconnect();
+      return;
+   }
+
+   cameraSerial_ = ident.serial;
+   connectionType_ = ident.connectionType;
+   integrator_ = ident.integrator;
+   dataEncodingFormat_ = ident.dataEncodingFormat;
+
+   std::ostringstream modelStream;
+   modelStream << ident.sensorName << " (Gen " << ident.sensorMajorVersion
+               << "." << ident.sensorMinorVersion << ")";
+   cameraModel_ = modelStream.str();
+
+   std::ostringstream genStream;
+   genStream << ident.sensorMajorVersion << "." << ident.sensorMinorVersion;
+   generation_ = genStream.str();
+
+   sensorWidth_ = ident.width;
+   sensorHeight_ = ident.height;
+
+   cameraConnected_ = true;
+   connectionStatus_ = "Connected";
+
+   std::ostringstream logMsg;
+   logMsg << "ProphEBS: connected to " << cameraModel_ << ", serial=" << cameraSerial_
+          << ", connection=" << connectionType_ << ", geometry=" << sensorWidth_ << "x"
+          << sensorHeight_ << " (backend '" << backendHandle_.Tag() << "')";
+   LogMessage(logMsg.str(), false);
 }
 
 /**
@@ -1199,31 +1173,26 @@ void CProphEBSCamera::CreateBiasProperties()
 
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      size_t count = backend->GetBiasCount();
+      if (count > 0)
       {
-         Metavision::I_LL_Biases& biases = GetCamFacility<Metavision::I_LL_Biases>();
-         std::map<std::string, int> allBiases = biases.get_all_biases();
-         for (const auto& kv : allBiases)
+         for (size_t i = 0; i < count; i++)
          {
-            biasNames_.push_back(kv.first);
-            std::string propName = std::string("EBS-") + kv.first;
-            CreateIntegerProperty(propName.c_str(), kv.second, false,
+            ProphEBSBiasInfo info;
+            if (!backend->GetBiasInfo(i, info))
+               continue;
+            biasNames_.push_back(info.name);
+            std::string propName = std::string("EBS-") + info.name;
+            CreateIntegerProperty(propName.c_str(), info.value, false,
                new CPropertyAction(this, &CProphEBSCamera::OnBias));
-
-            Metavision::LL_Bias_Info info;
-            if (biases.get_bias_info(kv.first, info))
-            {
-               std::pair<int, int> range = info.get_bias_range();
-               SetPropertyLimits(propName.c_str(), range.first, range.second);
-            }
+            if (info.hasRange)
+               SetPropertyLimits(propName.c_str(), info.minValue, info.maxValue);
          }
          return;
       }
-      catch (const std::exception& e)
-      {
-         LogMessage(std::string("ProphEBS: could not read biases from hardware (") + e.what() +
-            ") -- falling back to the default bias name list", false);
-      }
+      LogMessage("ProphEBS: could not read biases from hardware -- "
+         "falling back to the default bias name list", false);
    }
 
    for (const char* name : g_FallbackBiasNames)
@@ -1249,48 +1218,42 @@ int CProphEBSCamera::OnBias(MM::PropertyBase* pProp, MM::ActionType eAct)
 
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_LL_Biases& biases = GetCamFacility<Metavision::I_LL_Biases>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(biases.get(biasName)));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            if (!biases.set(biasName, static_cast<int>(value)))
-               LogMessage("ProphEBS: setting bias " + biasName + " to " + std::to_string(value) +
-                  " was rejected by the hardware", false);
-
-            // The allowed range reported by LL_Bias_Info::get_bias_range()
-            // (used for SetPropertyLimits() in CreateBiasProperties(), which
-            // widens to the full allowed range when
-            // EBS-biasRangeCheckBypass is On) is not always what the
-            // sensor's own firmware will actually accept: biases.set() can
-            // return true (no rejection) while silently clamping to a
-            // tighter, firmware-internal safety limit -- e.g. bias_refr's
-            // allowed max of 255 gets clamped down to 235 in practice, with
-            // no error from set() itself. Re-reading immediately here makes
-            // that visible right away (logged + reflected in the property)
-            // instead of the property silently reverting next time MM
-            // happens to poll it, which otherwise looks like an
-            // unexplained bug to the user.
-            int actual = biases.get(biasName);
-            if (actual != value)
-            {
-               LogMessage("ProphEBS: bias " + biasName + " was set to " + std::to_string(value) +
-                  " but the hardware clamped it to " + std::to_string(actual) +
-                  " (a firmware-level safety limit, tighter than the allowed range reported by "
-                  "the SDK even with EBS-biasRangeCheckBypass On)", false);
-               pProp->Set(static_cast<long>(actual));
-            }
-         }
+         int value = 0;
+         if (backend->GetBiasValue(biasName.c_str(), value))
+            pProp->Set(static_cast<long>(value));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage("ProphEBS: error accessing bias " + biasName + ": " + e.what(), false);
+         long value;
+         pProp->Get(value);
+         int actual = static_cast<int>(value);
+         if (!backend->SetBiasValue(biasName.c_str(), static_cast<int>(value), actual))
+            LogMessage("ProphEBS: setting bias " + biasName + " to " + std::to_string(value) +
+               " was rejected by the hardware", false);
+
+         // The allowed range reported by GetBiasInfo() (used for
+         // SetPropertyLimits() in CreateBiasProperties(), which widens to
+         // the full allowed range when EBS-biasRangeCheckBypass is On) is
+         // not always what the sensor's own firmware will actually accept:
+         // SetBiasValue() can return true (no rejection) while silently
+         // clamping to a tighter, firmware-internal safety limit -- e.g.
+         // bias_refr's allowed max of 255 gets clamped down to 235 in
+         // practice, with no error from set() itself. actualOut (re-read by
+         // the backend immediately after set()) makes that visible right
+         // away (logged + reflected in the property) instead of the
+         // property silently reverting next time MM happens to poll it,
+         // which otherwise looks like an unexplained bug to the user.
+         if (actual != value)
+         {
+            LogMessage("ProphEBS: bias " + biasName + " was set to " + std::to_string(value) +
+               " but the hardware clamped it to " + std::to_string(actual) +
+               " (a firmware-level safety limit, tighter than the allowed range reported by "
+               "the SDK even with EBS-biasRangeCheckBypass On)", false);
+            pProp->Set(static_cast<long>(actual));
+         }
       }
    }
    else
@@ -1328,20 +1291,20 @@ void CProphEBSCamera::CreateErcProperties()
 
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      uint32_t minRate, maxRate;
+      if (backend->ErcGetRange(minRate, maxRate) == ProphEBSResult::Ok)
       {
-         Metavision::I_ErcModule& erc = GetCamFacility<Metavision::I_ErcModule>();
-         SetPropertyLimits(g_PropErcEventRate, erc.get_min_supported_cd_event_rate(),
-            erc.get_max_supported_cd_event_rate());
+         SetPropertyLimits(g_PropErcEventRate, minRate, maxRate);
          // Apply the requested default (50 Mev/s) to the hardware now, so
          // EBS-ERC-EventRate reads back what's actually configured even
          // before the user touches the property.
-         erc.set_cd_event_rate(static_cast<uint32_t>(localErcEventRate_));
-         erc.enable(false);
+         backend->ErcSetRate(static_cast<uint32_t>(localErcEventRate_));
+         backend->ErcEnable(false);
       }
-      catch (const std::exception& e)
+      else
       {
-         LogMessage(std::string("ProphEBS: could not initialize ERC settings: ") + e.what(), false);
+         LogMessage("ProphEBS: could not initialize ERC settings (I_ErcModule unavailable)", false);
       }
    }
 }
@@ -1350,21 +1313,19 @@ int CProphEBSCamera::OnErcEnabled(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_ErcModule& erc = GetCamFacility<Metavision::I_ErcModule>();
-         if (eAct == MM::BeforeGet)
-            pProp->Set(erc.is_enabled() ? "On" : "Off");
-         else if (eAct == MM::AfterSet)
-         {
-            std::string value;
-            pProp->Get(value);
-            erc.enable(value == "On");
-         }
+         bool enabled;
+         if (backend->ErcIsEnabled(enabled) == ProphEBSResult::Ok)
+            pProp->Set(enabled ? "On" : "Off");
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing ERC enable state: ") + e.what(), false);
+         std::string value;
+         pProp->Get(value);
+         if (backend->ErcEnable(value == "On") != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing ERC enable state", false);
       }
    }
    else
@@ -1385,23 +1346,19 @@ int CProphEBSCamera::OnErcEventRate(MM::PropertyBase* pProp, MM::ActionType eAct
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_ErcModule& erc = GetCamFacility<Metavision::I_ErcModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<double>(erc.get_cd_event_rate()));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            double value;
-            pProp->Get(value);
-            erc.set_cd_event_rate(static_cast<uint32_t>(value));
-         }
+         uint32_t rate;
+         if (backend->ErcGetRate(rate) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<double>(rate));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing ERC event rate: ") + e.what(), false);
+         double value;
+         pProp->Get(value);
+         if (backend->ErcSetRate(static_cast<uint32_t>(value)) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing ERC event rate", false);
       }
    }
    else
@@ -1436,28 +1393,34 @@ void CProphEBSCamera::CreateEventTrailFilterProperties()
 
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      char availableCsv[128] = { 0 };
+      uint32_t minT, maxT;
+      if (backend->EventTrailFilterGetAvailableTypes(availableCsv) == ProphEBSResult::Ok &&
+          backend->EventTrailFilterGetThresholdRange(minT, maxT) == ProphEBSResult::Ok)
       {
-         Metavision::I_EventTrailFilterModule& filter =
-            GetCamFacility<Metavision::I_EventTrailFilterModule>();
-         std::set<Metavision::I_EventTrailFilterModule::Type> available = filter.get_available_types();
-         for (const auto& type : available)
-            AddAllowedValue(g_PropEventTrailFilterMode, EventTrailFilterTypeToString(type));
+         std::stringstream ss(availableCsv);
+         std::string type;
+         bool hasTrail = false;
+         while (std::getline(ss, type, ','))
+         {
+            if (type.empty())
+               continue;
+            AddAllowedValue(g_PropEventTrailFilterMode, type.c_str());
+            if (type == "TRAIL")
+               hasTrail = true;
+         }
 
-         SetPropertyLimits(g_PropEventTrailFilterThreshold, filter.get_min_supported_threshold(),
-            filter.get_max_supported_threshold());
+         SetPropertyLimits(g_PropEventTrailFilterThreshold, minT, maxT);
 
-         filter.set_threshold(static_cast<uint32_t>(localEventTrailFilterThreshold_));
-         if (available.count(Metavision::I_EventTrailFilterModule::Type::TRAIL))
-            filter.set_type(Metavision::I_EventTrailFilterModule::Type::TRAIL);
-         filter.enable(false);
+         backend->EventTrailFilterSetThreshold(static_cast<uint32_t>(localEventTrailFilterThreshold_));
+         if (hasTrail)
+            backend->EventTrailFilterSetType("TRAIL");
+         backend->EventTrailFilterEnable(false);
          return;
       }
-      catch (const std::exception& e)
-      {
-         LogMessage(std::string("ProphEBS: could not initialize event trail filter settings: ") + e.what(),
-            false);
-      }
+      LogMessage("ProphEBS: could not initialize event trail filter settings "
+         "(I_EventTrailFilterModule unavailable)", false);
    }
 
    AddAllowedValue(g_PropEventTrailFilterMode, "TRAIL");
@@ -1469,23 +1432,19 @@ int CProphEBSCamera::OnEventTrailFilterEnabled(MM::PropertyBase* pProp, MM::Acti
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_EventTrailFilterModule& filter =
-            GetCamFacility<Metavision::I_EventTrailFilterModule>();
-         if (eAct == MM::BeforeGet)
-            pProp->Set(filter.is_enabled() ? "On" : "Off");
-         else if (eAct == MM::AfterSet)
-         {
-            std::string value;
-            pProp->Get(value);
-            filter.enable(value == "On");
-         }
+         bool enabled;
+         if (backend->EventTrailFilterIsEnabled(enabled) == ProphEBSResult::Ok)
+            pProp->Set(enabled ? "On" : "Off");
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing event trail filter enable state: ") + e.what(),
-            false);
+         std::string value;
+         pProp->Get(value);
+         if (backend->EventTrailFilterEnable(value == "On") != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing event trail filter enable state", false);
       }
    }
    else
@@ -1506,25 +1465,19 @@ int CProphEBSCamera::OnEventTrailFilterThreshold(MM::PropertyBase* pProp, MM::Ac
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_EventTrailFilterModule& filter =
-            GetCamFacility<Metavision::I_EventTrailFilterModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(filter.get_threshold()));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            filter.set_threshold(static_cast<uint32_t>(value));
-         }
+         uint32_t value;
+         if (backend->EventTrailFilterGetThreshold(value) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<long>(value));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing event trail filter threshold: ") + e.what(),
-            false);
+         long value;
+         pProp->Get(value);
+         if (backend->EventTrailFilterSetThreshold(static_cast<uint32_t>(value)) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing event trail filter threshold", false);
       }
    }
    else
@@ -1541,26 +1494,19 @@ int CProphEBSCamera::OnEventTrailFilterMode(MM::PropertyBase* pProp, MM::ActionT
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_EventTrailFilterModule& filter =
-            GetCamFacility<Metavision::I_EventTrailFilterModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(EventTrailFilterTypeToString(filter.get_type()));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            std::string value;
-            pProp->Get(value);
-            Metavision::I_EventTrailFilterModule::Type type;
-            if (EventTrailFilterTypeFromString(value, type))
-               filter.set_type(type);
-         }
+         char typeBuf[32] = { 0 };
+         if (backend->EventTrailFilterGetType(typeBuf) == ProphEBSResult::Ok)
+            pProp->Set(typeBuf);
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing event trail filter mode: ") + e.what(), false);
+         std::string value;
+         pProp->Get(value);
+         if (backend->EventTrailFilterSetType(value.c_str()) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing event trail filter mode", false);
       }
    }
    else
@@ -1610,41 +1556,41 @@ void CProphEBSCamera::CreateAntiFlickerProperties()
 
    if (cameraConnected_)
    {
-      try
       {
-         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
-         SetPropertyLimits(g_PropAntiFlickerStartThreshold, af.get_min_supported_start_threshold(),
-            af.get_max_supported_start_threshold());
-         SetPropertyLimits(g_PropAntiFlickerStopThreshold, af.get_min_supported_stop_threshold(),
-            af.get_max_supported_stop_threshold());
-         SetPropertyLimits(g_PropAntiFlickerDutyCycle, af.get_min_supported_duty_cycle(),
-            af.get_max_supported_duty_cycle());
+         IProphEBSBackend* backend = backendHandle_.Get();
+         uint32_t minStart, maxStart, minStop, maxStop;
+         float minDc, maxDc;
+         uint32_t minFreq, maxFreq;
+         if (backend->AntiFlickerGetThresholdRanges(minStart, maxStart, minStop, maxStop) == ProphEBSResult::Ok)
+         {
+            SetPropertyLimits(g_PropAntiFlickerStartThreshold, minStart, maxStart);
+            SetPropertyLimits(g_PropAntiFlickerStopThreshold, minStop, maxStop);
+         }
+         if (backend->AntiFlickerGetDutyCycleRange(minDc, maxDc) == ProphEBSResult::Ok)
+            SetPropertyLimits(g_PropAntiFlickerDutyCycle, minDc, maxDc);
          // Goal 5 bug fix: LowFreq/HighFreq had no range limits set, so a
          // value outside the hardware-supported band was silently rejected
-         // by set_frequency_band() (bool return value, not checked) --
-         // discovered via self-test: setting LowFreq=45 on this sensor
+         // by AntiFlickerSetFrequencyBand() (bool return value, not checked)
+         // -- discovered via self-test: setting LowFreq=45 on this sensor
          // (min supported frequency is 50 Hz) left the property reading
          // back the old default instead of erroring visibly. Setting
          // limits here means MM itself rejects out-of-range values before
          // they ever reach the hardware.
-         SetPropertyLimits(g_PropAntiFlickerLowFreq, af.get_min_supported_frequency(),
-            af.get_max_supported_frequency());
-         SetPropertyLimits(g_PropAntiFlickerHighFreq, af.get_min_supported_frequency(),
-            af.get_max_supported_frequency());
+         if (backend->AntiFlickerGetFrequencyRange(minFreq, maxFreq) == ProphEBSResult::Ok)
+         {
+            SetPropertyLimits(g_PropAntiFlickerLowFreq, minFreq, maxFreq);
+            SetPropertyLimits(g_PropAntiFlickerHighFreq, minFreq, maxFreq);
+         }
 
-         if (!af.set_frequency_band(static_cast<uint32_t>(localAntiFlickerLowFreq_),
-            static_cast<uint32_t>(localAntiFlickerHighFreq_)))
+         if (backend->AntiFlickerSetFrequencyBand(static_cast<uint32_t>(localAntiFlickerLowFreq_),
+               static_cast<uint32_t>(localAntiFlickerHighFreq_)) != ProphEBSResult::Ok)
             LogMessage("ProphEBS: default anti-flicker frequency band (50/60 Hz) was rejected by the "
                "hardware -- check EBS-AntiFlicker-LowFreq/HighFreq's actual supported range", false);
-         af.set_filtering_mode(Metavision::I_AntiFlickerModule::BAND_STOP);
-         af.set_duty_cycle(static_cast<float>(localAntiFlickerDutyCycle_));
-         af.set_start_threshold(static_cast<uint32_t>(localAntiFlickerStartThreshold_));
-         af.set_stop_threshold(static_cast<uint32_t>(localAntiFlickerStopThreshold_));
-         af.enable(false);
-      }
-      catch (const std::exception& e)
-      {
-         LogMessage(std::string("ProphEBS: could not initialize anti-flicker settings: ") + e.what(), false);
+         backend->AntiFlickerSetFilterType(false); // BAND_STOP -- matches the original default
+         backend->AntiFlickerSetDutyCycle(static_cast<float>(localAntiFlickerDutyCycle_));
+         backend->AntiFlickerSetStartThreshold(static_cast<uint32_t>(localAntiFlickerStartThreshold_));
+         backend->AntiFlickerSetStopThreshold(static_cast<uint32_t>(localAntiFlickerStopThreshold_));
+         backend->AntiFlickerEnable(false);
       }
    }
 }
@@ -1653,21 +1599,19 @@ int CProphEBSCamera::OnAntiFlickerEnabled(MM::PropertyBase* pProp, MM::ActionTyp
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
-         if (eAct == MM::BeforeGet)
-            pProp->Set(af.is_enabled() ? "On" : "Off");
-         else if (eAct == MM::AfterSet)
-         {
-            std::string value;
-            pProp->Get(value);
-            af.enable(value == "On");
-         }
+         bool enabled;
+         if (backend->AntiFlickerIsEnabled(enabled) == ProphEBSResult::Ok)
+            pProp->Set(enabled ? "On" : "Off");
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing anti-flicker enable state: ") + e.what(), false);
+         std::string value;
+         pProp->Get(value);
+         if (backend->AntiFlickerEnable(value == "On") != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing anti-flicker enable state", false);
       }
    }
    else
@@ -1688,24 +1632,19 @@ int CProphEBSCamera::OnAntiFlickerStartThreshold(MM::PropertyBase* pProp, MM::Ac
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(af.get_start_threshold()));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            af.set_start_threshold(static_cast<uint32_t>(value));
-         }
+         uint32_t value;
+         if (backend->AntiFlickerGetStartThreshold(value) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<long>(value));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing anti-flicker start threshold: ") + e.what(),
-            false);
+         long value;
+         pProp->Get(value);
+         if (backend->AntiFlickerSetStartThreshold(static_cast<uint32_t>(value)) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing anti-flicker start threshold", false);
       }
    }
    else
@@ -1722,24 +1661,19 @@ int CProphEBSCamera::OnAntiFlickerStopThreshold(MM::PropertyBase* pProp, MM::Act
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(af.get_stop_threshold()));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            af.set_stop_threshold(static_cast<uint32_t>(value));
-         }
+         uint32_t value;
+         if (backend->AntiFlickerGetStopThreshold(value) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<long>(value));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing anti-flicker stop threshold: ") + e.what(),
-            false);
+         long value;
+         pProp->Get(value);
+         if (backend->AntiFlickerSetStopThreshold(static_cast<uint32_t>(value)) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing anti-flicker stop threshold", false);
       }
    }
    else
@@ -1756,23 +1690,19 @@ int CProphEBSCamera::OnAntiFlickerDutyCycle(MM::PropertyBase* pProp, MM::ActionT
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<double>(af.get_duty_cycle()));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            double value;
-            pProp->Get(value);
-            af.set_duty_cycle(static_cast<float>(value));
-         }
+         float value;
+         if (backend->AntiFlickerGetDutyCycle(value) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<double>(value));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing anti-flicker duty cycle: ") + e.what(), false);
+         double value;
+         pProp->Get(value);
+         if (backend->AntiFlickerSetDutyCycle(static_cast<float>(value)) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing anti-flicker duty cycle", false);
       }
    }
    else
@@ -1789,25 +1719,19 @@ int CProphEBSCamera::OnAntiFlickerFilterType(MM::PropertyBase* pProp, MM::Action
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(af.get_filtering_mode() == Metavision::I_AntiFlickerModule::BAND_PASS
-               ? g_AntiFlickerFilterTypeBandPass : g_AntiFlickerFilterTypeBandCut);
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            std::string value;
-            pProp->Get(value);
-            af.set_filtering_mode(value == g_AntiFlickerFilterTypeBandPass
-               ? Metavision::I_AntiFlickerModule::BAND_PASS : Metavision::I_AntiFlickerModule::BAND_STOP);
-         }
+         bool isBandPass;
+         if (backend->AntiFlickerGetFilterType(isBandPass) == ProphEBSResult::Ok)
+            pProp->Set(isBandPass ? g_AntiFlickerFilterTypeBandPass : g_AntiFlickerFilterTypeBandCut);
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing anti-flicker filter type: ") + e.what(), false);
+         std::string value;
+         pProp->Get(value);
+         if (backend->AntiFlickerSetFilterType(value == g_AntiFlickerFilterTypeBandPass) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing anti-flicker filter type", false);
       }
    }
    else
@@ -1824,27 +1748,23 @@ int CProphEBSCamera::OnAntiFlickerLowFreq(MM::PropertyBase* pProp, MM::ActionTyp
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(af.get_band_low_frequency()));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            long highValue = localAntiFlickerHighFreq_;
-            GetProperty(g_PropAntiFlickerHighFreq, highValue);
-            if (!af.set_frequency_band(static_cast<uint32_t>(value), static_cast<uint32_t>(highValue)))
-               LogMessage("ProphEBS: anti-flicker frequency band (" + std::to_string(value) + "/" +
-                  std::to_string(highValue) + " Hz) rejected by hardware", false);
-         }
+         uint32_t lowFreq, highFreq;
+         if (backend->AntiFlickerGetFrequencyBand(lowFreq, highFreq) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<long>(lowFreq));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing anti-flicker low frequency: ") + e.what(), false);
+         long value;
+         pProp->Get(value);
+         long highValue = localAntiFlickerHighFreq_;
+         GetProperty(g_PropAntiFlickerHighFreq, highValue);
+         if (backend->AntiFlickerSetFrequencyBand(static_cast<uint32_t>(value),
+               static_cast<uint32_t>(highValue)) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: anti-flicker frequency band (" + std::to_string(value) + "/" +
+               std::to_string(highValue) + " Hz) rejected by hardware", false);
       }
    }
    else
@@ -1861,28 +1781,23 @@ int CProphEBSCamera::OnAntiFlickerHighFreq(MM::PropertyBase* pProp, MM::ActionTy
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_AntiFlickerModule& af = GetCamFacility<Metavision::I_AntiFlickerModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(af.get_band_high_frequency()));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            long lowValue = localAntiFlickerLowFreq_;
-            GetProperty(g_PropAntiFlickerLowFreq, lowValue);
-            if (!af.set_frequency_band(static_cast<uint32_t>(lowValue), static_cast<uint32_t>(value)))
-               LogMessage("ProphEBS: anti-flicker frequency band (" + std::to_string(lowValue) + "/" +
-                  std::to_string(value) + " Hz) rejected by hardware", false);
-         }
+         uint32_t lowFreq, highFreq;
+         if (backend->AntiFlickerGetFrequencyBand(lowFreq, highFreq) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<long>(highFreq));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing anti-flicker high frequency: ") + e.what(),
-            false);
+         long value;
+         pProp->Get(value);
+         long lowValue = localAntiFlickerLowFreq_;
+         GetProperty(g_PropAntiFlickerLowFreq, lowValue);
+         if (backend->AntiFlickerSetFrequencyBand(static_cast<uint32_t>(lowValue),
+               static_cast<uint32_t>(value)) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: anti-flicker frequency band (" + std::to_string(lowValue) + "/" +
+               std::to_string(value) + " Hz) rejected by hardware", false);
       }
    }
    else
@@ -1930,33 +1845,38 @@ void CProphEBSCamera::CreateTriggerProperties()
    bool channelValuesAdded = false;
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      char channelsCsv[64] = { 0 };
+      if (backend->TriggerInGetAvailableChannels(channelsCsv) == ProphEBSResult::Ok)
       {
-         Metavision::I_TriggerIn& triggerIn = GetCamFacility<Metavision::I_TriggerIn>();
-         std::map<Metavision::I_TriggerIn::Channel, short> available = triggerIn.get_available_channels();
-         for (const auto& kv : available)
+         std::stringstream ss(channelsCsv);
+         std::string channel;
+         std::string firstChannel;
+         while (std::getline(ss, channel, ','))
          {
-            AddAllowedValue(g_PropTriggerInChannel, TriggerChannelToString(kv.first));
+            if (channel.empty())
+               continue;
+            AddAllowedValue(g_PropTriggerInChannel, channel.c_str());
             channelValuesAdded = true;
+            if (firstChannel.empty())
+               firstChannel = channel;
          }
-         if (!available.empty())
-            SetProperty(g_PropTriggerInChannel, TriggerChannelToString(available.begin()->first));
+         if (!firstChannel.empty())
+            SetProperty(g_PropTriggerInChannel, firstChannel.c_str());
       }
-      catch (const std::exception& e)
+      else
       {
-         LogMessage(std::string("ProphEBS: I_TriggerIn not available on this sensor: ") + e.what(), true);
+         LogMessage("ProphEBS: I_TriggerIn not available on this sensor", true);
       }
 
-      try
+      if (backend->TriggerOutSetPeriod(static_cast<uint32_t>(localTriggerOutPeriodUs_)) == ProphEBSResult::Ok)
       {
-         Metavision::I_TriggerOut& triggerOut = GetCamFacility<Metavision::I_TriggerOut>();
-         triggerOut.set_period(static_cast<uint32_t>(localTriggerOutPeriodUs_));
-         triggerOut.set_duty_cycle(localTriggerOutDutyCycle_);
-         triggerOut.disable();
+         backend->TriggerOutSetDutyCycle(localTriggerOutDutyCycle_);
+         backend->TriggerOutEnable(false);
       }
-      catch (const std::exception& e)
+      else
       {
-         LogMessage(std::string("ProphEBS: I_TriggerOut not available on this sensor: ") + e.what(), true);
+         LogMessage("ProphEBS: I_TriggerOut not available on this sensor", true);
       }
    }
 
@@ -1983,28 +1903,19 @@ int CProphEBSCamera::OnTriggerInEnabled(MM::PropertyBase* pProp, MM::ActionType 
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_TriggerIn& triggerIn = GetCamFacility<Metavision::I_TriggerIn>();
-         Metavision::I_TriggerIn::Channel ch;
-         TriggerChannelFromString(localTriggerInChannel_, ch);
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(triggerIn.is_enabled(ch) ? "On" : "Off");
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            std::string value;
-            pProp->Get(value);
-            if (value == "On")
-               triggerIn.enable(ch);
-            else
-               triggerIn.disable(ch);
-         }
+         bool enabled;
+         if (backend->TriggerInIsEnabled(localTriggerInChannel_.c_str(), enabled) == ProphEBSResult::Ok)
+            pProp->Set(enabled ? "On" : "Off");
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing trigger-in enable state: ") + e.what(), false);
+         std::string value;
+         pProp->Get(value);
+         if (backend->TriggerInEnable(localTriggerInChannel_.c_str(), value == "On") != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing trigger-in enable state", false);
       }
    }
    else
@@ -2025,29 +1936,20 @@ int CProphEBSCamera::OnTriggerOutEnabled(MM::PropertyBase* pProp, MM::ActionType
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_TriggerOut& triggerOut = GetCamFacility<Metavision::I_TriggerOut>();
-         if (eAct == MM::BeforeGet)
-         {
-            // I_TriggerOut has no is_enabled() query -- reflect back
-            // whatever this adapter last set instead of a hardware read.
-            pProp->Set(localTriggerOutEnabled_ ? "On" : "Off");
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            std::string value;
-            pProp->Get(value);
-            localTriggerOutEnabled_ = (value == "On");
-            if (localTriggerOutEnabled_)
-               triggerOut.enable();
-            else
-               triggerOut.disable();
-         }
+         // I_TriggerOut has no is_enabled() query -- reflect back whatever
+         // this adapter last set instead of a hardware read.
+         pProp->Set(localTriggerOutEnabled_ ? "On" : "Off");
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing trigger-out enable state: ") + e.what(), false);
+         std::string value;
+         pProp->Get(value);
+         localTriggerOutEnabled_ = (value == "On");
+         if (backend->TriggerOutEnable(localTriggerOutEnabled_) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing trigger-out enable state", false);
       }
    }
    else
@@ -2068,27 +1970,20 @@ int CProphEBSCamera::OnTriggerOutPeriodUs(MM::PropertyBase* pProp, MM::ActionTyp
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_TriggerOut& triggerOut = GetCamFacility<Metavision::I_TriggerOut>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(triggerOut.get_period()));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            if (!triggerOut.set_period(static_cast<uint32_t>(value)))
-               LogMessage("ProphEBS: trigger-out period (" + std::to_string(value) +
-                  " us) rejected by hardware", false);
-            else
-               localTriggerOutPeriodUs_ = value;
-         }
+         pProp->Set(localTriggerOutPeriodUs_);
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing trigger-out period: ") + e.what(), false);
+         long value;
+         pProp->Get(value);
+         if (backend->TriggerOutSetPeriod(static_cast<uint32_t>(value)) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: trigger-out period (" + std::to_string(value) +
+               " us) rejected by hardware", false);
+         else
+            localTriggerOutPeriodUs_ = value;
       }
    }
    else
@@ -2105,27 +2000,20 @@ int CProphEBSCamera::OnTriggerOutDutyCycle(MM::PropertyBase* pProp, MM::ActionTy
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-         Metavision::I_TriggerOut& triggerOut = GetCamFacility<Metavision::I_TriggerOut>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(triggerOut.get_duty_cycle());
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            double value;
-            pProp->Get(value);
-            if (!triggerOut.set_duty_cycle(value))
-               LogMessage("ProphEBS: trigger-out duty cycle (" + std::to_string(value) +
-                  ") rejected by hardware", false);
-            else
-               localTriggerOutDutyCycle_ = value;
-         }
+         pProp->Set(localTriggerOutDutyCycle_);
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing trigger-out duty cycle: ") + e.what(), false);
+         double value;
+         pProp->Get(value);
+         if (backend->TriggerOutSetDutyCycle(value) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: trigger-out duty cycle (" + std::to_string(value) +
+               ") rejected by hardware", false);
+         else
+            localTriggerOutDutyCycle_ = value;
       }
    }
    else
@@ -2165,37 +2053,33 @@ void CProphEBSCamera::CreateEventRateFilterProperties()
 
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      ProphEBSEventRateThresholds minT, maxT;
+      if (backend->EventRateFilterGetThresholdRanges(minT, maxT) == ProphEBSResult::Ok)
       {
-#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
-         Metavision::I_EventRateActivityFilterModule& filter =
-            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
-         auto minT = filter.get_min_supported_thresholds();
-         auto maxT = filter.get_max_supported_thresholds();
-         SetPropertyLimits(g_PropEventRateFilterLowerStart, minT.lower_bound_start, maxT.lower_bound_start);
-         SetPropertyLimits(g_PropEventRateFilterLowerStop, minT.lower_bound_stop, maxT.lower_bound_stop);
-         SetPropertyLimits(g_PropEventRateFilterUpperStart, minT.upper_bound_start, maxT.upper_bound_start);
-         SetPropertyLimits(g_PropEventRateFilterUpperStop, minT.upper_bound_stop, maxT.upper_bound_stop);
+         SetPropertyLimits(g_PropEventRateFilterLowerStart, minT.lowerBoundStart, maxT.lowerBoundStart);
+         SetPropertyLimits(g_PropEventRateFilterLowerStop, minT.lowerBoundStop, maxT.lowerBoundStop);
+         SetPropertyLimits(g_PropEventRateFilterUpperStart, minT.upperBoundStart, maxT.upperBoundStart);
+         SetPropertyLimits(g_PropEventRateFilterUpperStop, minT.upperBoundStop, maxT.upperBoundStop);
 
-         auto current = filter.get_thresholds();
-         SetProperty(g_PropEventRateFilterLowerStart, CDeviceUtils::ConvertToString(
-            static_cast<long>(current.lower_bound_start)));
-         SetProperty(g_PropEventRateFilterLowerStop, CDeviceUtils::ConvertToString(
-            static_cast<long>(current.lower_bound_stop)));
-         SetProperty(g_PropEventRateFilterUpperStart, CDeviceUtils::ConvertToString(
-            static_cast<long>(current.upper_bound_start)));
-         SetProperty(g_PropEventRateFilterUpperStop, CDeviceUtils::ConvertToString(
-            static_cast<long>(current.upper_bound_stop)));
-         filter.enable(false);
-#else
-         throw std::runtime_error(
-            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
-#endif
+         ProphEBSEventRateThresholds current;
+         if (backend->EventRateFilterGetThresholds(current) == ProphEBSResult::Ok)
+         {
+            SetProperty(g_PropEventRateFilterLowerStart,
+               CDeviceUtils::ConvertToString(static_cast<long>(current.lowerBoundStart)));
+            SetProperty(g_PropEventRateFilterLowerStop,
+               CDeviceUtils::ConvertToString(static_cast<long>(current.lowerBoundStop)));
+            SetProperty(g_PropEventRateFilterUpperStart,
+               CDeviceUtils::ConvertToString(static_cast<long>(current.upperBoundStart)));
+            SetProperty(g_PropEventRateFilterUpperStop,
+               CDeviceUtils::ConvertToString(static_cast<long>(current.upperBoundStop)));
+         }
+         backend->EventRateFilterEnable(false);
       }
-      catch (const std::exception& e)
+      else
       {
-         LogMessage(std::string("ProphEBS: could not initialize event-rate filter settings: ") + e.what(),
-            false);
+         LogMessage("ProphEBS: could not initialize event-rate filter settings "
+            "(I_EventRateActivityFilterModule unavailable)", false);
       }
    }
 }
@@ -2204,28 +2088,19 @@ int CProphEBSCamera::OnEventRateFilterEnabled(MM::PropertyBase* pProp, MM::Actio
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
-         Metavision::I_EventRateActivityFilterModule& filter =
-            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
-         if (eAct == MM::BeforeGet)
-            pProp->Set(filter.is_enabled() ? "On" : "Off");
-         else if (eAct == MM::AfterSet)
-         {
-            std::string value;
-            pProp->Get(value);
-            filter.enable(value == "On");
-         }
-#else
-         throw std::runtime_error(
-            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
-#endif
+         bool enabled;
+         if (backend->EventRateFilterIsEnabled(enabled) == ProphEBSResult::Ok)
+            pProp->Set(enabled ? "On" : "Off");
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing event-rate filter enable state: ") + e.what(),
-            false);
+         std::string value;
+         pProp->Get(value);
+         if (backend->EventRateFilterEnable(value == "On") != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: error accessing event-rate filter enable state", false);
       }
    }
    else
@@ -2243,42 +2118,32 @@ int CProphEBSCamera::OnEventRateFilterEnabled(MM::PropertyBase* pProp, MM::Actio
 }
 
 // Goal 8: the four event-rate-filter threshold handlers all follow the same
-// shape -- BeforeGet reads the matching field out of get_thresholds();
-// AfterSet reads the whole current struct back first and overwrites only its
-// own field before calling set_thresholds(), per the header's warning
-// against passing a partially-initialized struct.
+// shape -- BeforeGet reads the matching field out of
+// EventRateFilterGetThresholds(); AfterSet reads the whole current struct
+// back first and overwrites only its own field before calling
+// EventRateFilterSetThresholds(), per the original SDK header's warning
+// against passing a partially-initialized struct (preserved by the backend).
 int CProphEBSCamera::OnEventRateFilterLowerStart(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
-         Metavision::I_EventRateActivityFilterModule& filter =
-            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(filter.get_thresholds().lower_bound_start));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            auto t = filter.get_thresholds();
-            t.lower_bound_start = static_cast<uint32_t>(value);
-            if (!filter.set_thresholds(t))
-               LogMessage("ProphEBS: event-rate filter lower-bound-start (" + std::to_string(value) +
-                  " evt/s) rejected by hardware", false);
-         }
-#else
-         throw std::runtime_error(
-            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
-#endif
+         ProphEBSEventRateThresholds t;
+         if (backend->EventRateFilterGetThresholds(t) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<long>(t.lowerBoundStart));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing event-rate filter lower-bound-start: ") + e.what(),
-            false);
+         long value;
+         pProp->Get(value);
+         ProphEBSEventRateThresholds t;
+         backend->EventRateFilterGetThresholds(t);
+         t.lowerBoundStart = static_cast<uint32_t>(value);
+         if (backend->EventRateFilterSetThresholds(t) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: event-rate filter lower-bound-start (" + std::to_string(value) +
+               " evt/s) rejected by hardware", false);
       }
    }
    else
@@ -2295,34 +2160,23 @@ int CProphEBSCamera::OnEventRateFilterLowerStop(MM::PropertyBase* pProp, MM::Act
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
-         Metavision::I_EventRateActivityFilterModule& filter =
-            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(filter.get_thresholds().lower_bound_stop));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            auto t = filter.get_thresholds();
-            t.lower_bound_stop = static_cast<uint32_t>(value);
-            if (!filter.set_thresholds(t))
-               LogMessage("ProphEBS: event-rate filter lower-bound-stop (" + std::to_string(value) +
-                  " evt/s) rejected by hardware", false);
-         }
-#else
-         throw std::runtime_error(
-            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
-#endif
+         ProphEBSEventRateThresholds t;
+         if (backend->EventRateFilterGetThresholds(t) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<long>(t.lowerBoundStop));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing event-rate filter lower-bound-stop: ") + e.what(),
-            false);
+         long value;
+         pProp->Get(value);
+         ProphEBSEventRateThresholds t;
+         backend->EventRateFilterGetThresholds(t);
+         t.lowerBoundStop = static_cast<uint32_t>(value);
+         if (backend->EventRateFilterSetThresholds(t) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: event-rate filter lower-bound-stop (" + std::to_string(value) +
+               " evt/s) rejected by hardware", false);
       }
    }
    else
@@ -2339,34 +2193,23 @@ int CProphEBSCamera::OnEventRateFilterUpperStart(MM::PropertyBase* pProp, MM::Ac
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
-         Metavision::I_EventRateActivityFilterModule& filter =
-            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(filter.get_thresholds().upper_bound_start));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            auto t = filter.get_thresholds();
-            t.upper_bound_start = static_cast<uint32_t>(value);
-            if (!filter.set_thresholds(t))
-               LogMessage("ProphEBS: event-rate filter upper-bound-start (" + std::to_string(value) +
-                  " evt/s) rejected by hardware", false);
-         }
-#else
-         throw std::runtime_error(
-            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
-#endif
+         ProphEBSEventRateThresholds t;
+         if (backend->EventRateFilterGetThresholds(t) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<long>(t.upperBoundStart));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing event-rate filter upper-bound-start: ") + e.what(),
-            false);
+         long value;
+         pProp->Get(value);
+         ProphEBSEventRateThresholds t;
+         backend->EventRateFilterGetThresholds(t);
+         t.upperBoundStart = static_cast<uint32_t>(value);
+         if (backend->EventRateFilterSetThresholds(t) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: event-rate filter upper-bound-start (" + std::to_string(value) +
+               " evt/s) rejected by hardware", false);
       }
    }
    else
@@ -2383,34 +2226,23 @@ int CProphEBSCamera::OnEventRateFilterUpperStop(MM::PropertyBase* pProp, MM::Act
 {
    if (cameraConnected_)
    {
-      try
+      IProphEBSBackend* backend = backendHandle_.Get();
+      if (eAct == MM::BeforeGet)
       {
-#ifdef PROPHEBS_HAVE_EVENT_RATE_ACTIVITY_FILTER
-         Metavision::I_EventRateActivityFilterModule& filter =
-            GetCamFacility<Metavision::I_EventRateActivityFilterModule>();
-         if (eAct == MM::BeforeGet)
-         {
-            pProp->Set(static_cast<long>(filter.get_thresholds().upper_bound_stop));
-         }
-         else if (eAct == MM::AfterSet)
-         {
-            long value;
-            pProp->Get(value);
-            auto t = filter.get_thresholds();
-            t.upper_bound_stop = static_cast<uint32_t>(value);
-            if (!filter.set_thresholds(t))
-               LogMessage("ProphEBS: event-rate filter upper-bound-stop (" + std::to_string(value) +
-                  " evt/s) rejected by hardware", false);
-         }
-#else
-         throw std::runtime_error(
-            "I_EventRateActivityFilterModule not available in this Metavision SDK install");
-#endif
+         ProphEBSEventRateThresholds t;
+         if (backend->EventRateFilterGetThresholds(t) == ProphEBSResult::Ok)
+            pProp->Set(static_cast<long>(t.upperBoundStop));
       }
-      catch (const std::exception& e)
+      else if (eAct == MM::AfterSet)
       {
-         LogMessage(std::string("ProphEBS: error accessing event-rate filter upper-bound-stop: ") + e.what(),
-            false);
+         long value;
+         pProp->Get(value);
+         ProphEBSEventRateThresholds t;
+         backend->EventRateFilterGetThresholds(t);
+         t.upperBoundStop = static_cast<uint32_t>(value);
+         if (backend->EventRateFilterSetThresholds(t) != ProphEBSResult::Ok)
+            LogMessage("ProphEBS: event-rate filter upper-bound-stop (" + std::to_string(value) +
+               " evt/s) rejected by hardware", false);
       }
    }
    else
@@ -2444,28 +2276,15 @@ void CProphEBSCamera::ApplySyncModeToHardware()
    if (!cameraConnected_)
       return;
 
-   try
-   {
-      char modeBuf[MM::MaxStrLength];
-      GetProperty(g_PropSyncMode, modeBuf);
-      std::string mode(modeBuf);
+   char modeBuf[MM::MaxStrLength];
+   GetProperty(g_PropSyncMode, modeBuf);
+   std::string mode(modeBuf);
 
-      Metavision::I_CameraSynchronization& sync = GetCamFacility<Metavision::I_CameraSynchronization>();
-      bool ok;
-      if (mode == g_SyncModeMaster)
-         ok = sync.set_mode_master();
-      else if (mode == g_SyncModeSlave)
-         ok = sync.set_mode_slave();
-      else
-         ok = sync.set_mode_standalone();
-      if (!ok)
-         LogMessage("ProphEBS: sync mode '" + mode + "' rejected by hardware", false);
-   }
-   catch (const std::exception& e)
-   {
-      LogMessage(std::string("ProphEBS: I_CameraSynchronization not available on this sensor: ") + e.what(),
-         true);
-   }
+   ProphEBSResult result = backendHandle_.Get()->SetSyncMode(mode.c_str());
+   if (result == ProphEBSResult::Error)
+      LogMessage("ProphEBS: sync mode '" + mode + "' rejected by hardware", false);
+   else if (result == ProphEBSResult::Unsupported)
+      LogMessage("ProphEBS: I_CameraSynchronization not available on this sensor", true);
 }
 
 /**
@@ -2631,60 +2450,45 @@ void CProphEBSCamera::ApplyBlockedPixelsToHardware()
       return;
 
    MMThreadGuard g(blockedPixelsLock_);
+   IProphEBSBackend* backend = backendHandle_.Get();
+
+   std::vector<unsigned> xs, ys;
+   xs.reserve(blockedPixels_.size());
+   ys.reserve(blockedPixels_.size());
+   for (const auto& px : blockedPixels_)
+   {
+      xs.push_back(px.first);
+      ys.push_back(px.second);
+   }
 
    bool digitalMaskApplied = false;
-   try
+   size_t slotCount = 0;
+   if (backend->GetDigitalEventMaskSlotCount(slotCount) == ProphEBSResult::Ok)
    {
-      Metavision::I_DigitalEventMask& dem = GetCamFacility<Metavision::I_DigitalEventMask>();
-      const std::vector<Metavision::I_DigitalEventMask::I_PixelMaskPtr>& slots = dem.get_pixel_masks();
-      size_t applied = std::min(blockedPixels_.size(), slots.size());
-      for (size_t i = 0; i < slots.size(); i++)
+      ProphEBSResult applyResult = backend->ApplyDigitalEventMask(
+         xs.empty() ? nullptr : xs.data(), ys.empty() ? nullptr : ys.data(), xs.size());
+      if (applyResult == ProphEBSResult::Ok)
       {
-         if (i < applied)
-            slots[i]->set_mask(blockedPixels_[i].first, blockedPixels_[i].second, true);
-         else
-            slots[i]->set_mask(0, 0, false); // clear any previously-used slot no longer needed
+         digitalMaskApplied = true;
+         if (blockedPixels_.size() > slotCount)
+            LogMessage("ProphEBS: EBS-HotPixelBlockedPixels has " + std::to_string(blockedPixels_.size()) +
+               " entries, but this sensor's I_DigitalEventMask only has " + std::to_string(slotCount) +
+               " hardware mask slots -- only the first " + std::to_string(slotCount) +
+               " are actually being suppressed", false);
       }
-      digitalMaskApplied = true;
-      if (blockedPixels_.size() > slots.size())
-         LogMessage("ProphEBS: EBS-HotPixelBlockedPixels has " + std::to_string(blockedPixels_.size()) +
-            " entries, but this sensor's I_DigitalEventMask only has " + std::to_string(slots.size()) +
-            " hardware mask slots -- only the first " + std::to_string(slots.size()) +
-            " are actually being suppressed", false);
    }
-   catch (const std::exception& e)
-   {
-      LogMessage(std::string("ProphEBS: I_DigitalEventMask unavailable (") + e.what() +
-         "), falling back to I_RoiPixelMask only", false);
-   }
+   if (!digitalMaskApplied)
+      LogMessage("ProphEBS: I_DigitalEventMask unavailable, falling back to I_RoiPixelMask only", false);
 
-   // Metavision::I_RoiPixelMask::set_pixel()'s header doc comment says
-   // "Pixel will be masked when true," but the official
-   // metavision_active_pixel_detection.cpp sample calls set_pixel(x, y,
-   // false) to mask a pixel -- a real contradiction, moot on this sensor
-   // (see above) but still implemented against the header's documented
-   // contract for whatever generation actually enforces it via this path.
-   // I_RoiPixelMask itself is absent from some installed SDK versions (e.g.
-   // 4.3.0, no renamed equivalent) -- this whole belt-and-suspenders block is
-   // skipped entirely in that case, since I_DigitalEventMask above is the
-   // facility that actually enforces the mask on this sensor generation.
-#ifdef PROPHEBS_HAVE_ROI_PIXEL_MASK
-   const bool kMaskPixelValue = true;
-   try
-   {
-      Metavision::I_RoiPixelMask& mask = GetCamFacility<Metavision::I_RoiPixelMask>();
-      mask.reset_pixels();
-      for (const auto& px : blockedPixels_)
-         mask.set_pixel(px.first, px.second, kMaskPixelValue);
-      mask.apply_pixels();
-   }
-   catch (const std::exception& e)
-   {
-      if (!digitalMaskApplied)
-         LogMessage(std::string("ProphEBS: could not apply blocked-pixel mask via I_RoiPixelMask either: ") +
-            e.what(), false);
-   }
-#endif
+   // I_RoiPixelMask (Belt-and-suspenders secondary mechanism) is absent from
+   // some installed SDK generations entirely (e.g. 4.3.0) -- the backend
+   // reports Unsupported in that case, and this is silently skipped since
+   // I_DigitalEventMask above is the facility that actually enforces the
+   // mask on this sensor generation.
+   ProphEBSResult roiMaskResult = backend->ApplyRoiPixelMask(
+      xs.empty() ? nullptr : xs.data(), ys.empty() ? nullptr : ys.data(), xs.size());
+   if (roiMaskResult == ProphEBSResult::Error && !digitalMaskApplied)
+      LogMessage("ProphEBS: could not apply blocked-pixel mask via I_RoiPixelMask either", false);
 }
 
 int CProphEBSCamera::OnBlockedPixels(MM::PropertyBase* pProp, MM::ActionType eAct)
@@ -2800,31 +2604,37 @@ int CProphEBSCamera::OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionTyp
    // full-sensor coordinates) so mean/stddev are computed only over the
    // active ROI's own pixels -- converted back to absolute sensor
    // coordinates only when merging into blockedPixels_ below.
-   std::vector<uint32_t> calibOnCounts(static_cast<size_t>(roiW) * roiH, 0);
-   std::vector<uint32_t> calibOffCounts(static_cast<size_t>(roiW) * roiH, 0);
-   MMThreadLock calibLock;
-   Metavision::CallbackId calibCallbackId = cam_.cd().add_callback(
-      [this, &calibOnCounts, &calibOffCounts, &calibLock, roiX, roiY, roiW, roiH](
-         const Metavision::EventCD* begin, const Metavision::EventCD* end)
-      {
-         MMThreadGuard g(calibLock);
-         for (const Metavision::EventCD* ev = begin; ev != end; ++ev)
-         {
-            if (ev->x < roiX || ev->x >= roiX + roiW || ev->y < roiY || ev->y >= roiY + roiH)
-               continue; // outside the ROI being scanned -- shouldn't normally happen
-                         // while a hardware ROI is active, but guards against any
-                         // in-flight events from just before it was applied.
-            size_t idx = static_cast<size_t>(ev->y - roiY) * roiW + (ev->x - roiX);
-            std::vector<uint32_t>& counts = ev->p != 0 ? calibOnCounts : calibOffCounts;
-            if (counts[idx] < 0xFFFFFFFFu)
-               counts[idx]++;
-         }
-      });
+   // Backend-shim refactor: the backend interface supports only one
+   // registered CD callback (the one StartEventStreaming() registers, via
+   // OnEventsCD()), so this can no longer register its own second, temporary
+   // callback the way the pre-refactor two-callback design did. Instead,
+   // OnEventsCD() itself (the sole registered callback, already running
+   // while streaming_) tallies in-ROI events into
+   // hotPixelCalibOnCounts_/-OffCounts_ whenever hotPixelCalibActive_ is
+   // true -- see the member comments in ProphEBS.h.
+   {
+      MMThreadGuard g(hotPixelCalibLock_);
+      hotPixelCalibOnCounts_.assign(static_cast<size_t>(roiW) * roiH, 0);
+      hotPixelCalibOffCounts_.assign(static_cast<size_t>(roiW) * roiH, 0);
+      hotPixelCalibRoiX_ = roiX;
+      hotPixelCalibRoiY_ = roiY;
+      hotPixelCalibRoiW_ = roiW;
+      hotPixelCalibRoiH_ = roiH;
+   }
+   hotPixelCalibActive_ = true;
 
    double durationMs = hotPixelCalibDurationMs_.load();
    CDeviceUtils::SleepMs(static_cast<long>(durationMs));
 
-   cam_.cd().remove_callback(calibCallbackId);
+   hotPixelCalibActive_ = false;
+
+   std::vector<uint32_t> calibOnCounts;
+   std::vector<uint32_t> calibOffCounts;
+   {
+      MMThreadGuard g(hotPixelCalibLock_);
+      calibOnCounts = hotPixelCalibOnCounts_;
+      calibOffCounts = hotPixelCalibOffCounts_;
+   }
 
    // Single-pass mean/stddev, computed independently for each polarity --
    // no OpenCV linked into this project (unlike the official sample, which
@@ -2873,15 +2683,11 @@ int CProphEBSCamera::OnDetectHotPixelsNow(MM::PropertyBase* pProp, MM::ActionTyp
       const size_t kMaxSerializedLen = static_cast<size_t>(MM::MaxStrLength) - 16;
       size_t serializedLen = 0;
 
-      try
-      {
-         hardwareSlotCap = GetCamFacility<Metavision::I_DigitalEventMask>().get_pixel_masks().size();
-      }
-      catch (const std::exception&)
-      {
-         // No I_DigitalEventMask on this sensor -- fall back to the
-         // property-length budget alone.
-      }
+      size_t slotCount;
+      if (backendHandle_.Get()->GetDigitalEventMaskSlotCount(slotCount) == ProphEBSResult::Ok)
+         hardwareSlotCap = slotCount;
+      // else: no I_DigitalEventMask on this sensor -- fall back to the
+      // property-length budget alone.
 
       struct Candidate { double score; std::pair<unsigned, unsigned> px; };
       std::vector<Candidate> candidates;
@@ -3076,13 +2882,14 @@ int CProphEBSCamera::OnViewOffset(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 /**
  * Goal 6: software activity-noise filter enable/threshold handlers. Both
- * guard activityFilter_ under activityFilterLock_ -- the same lock
- * OnEventsCD() takes while calling process_events() -- since the algorithm's
- * threshold/state isn't documented as safe against a concurrent setter.
- * activityFilter_ itself is only constructed once StartEventStreaming()
- * knows the sensor geometry, so these are no-ops on the filter (beyond
- * updating the user-facing state) until a camera is connected and
- * streaming -- same pattern as the Goal 5 hardware filter properties.
+ * guard activityFilterConstructed_ under activityFilterLock_ -- the same
+ * lock OnEventsCD() takes while calling backendHandle_.Get()->
+ * ActivityFilterProcess() -- since the algorithm's threshold/state isn't
+ * documented as safe against a concurrent setter. The backend's filter
+ * instance is only constructed once StartEventStreaming() knows the sensor
+ * geometry, so these are no-ops on the filter itself (beyond updating the
+ * user-facing state) until a camera is connected and streaming -- same
+ * pattern as the Goal 5 hardware filter properties.
  */
 int CProphEBSCamera::OnActivityFilterEnabled(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
@@ -3114,8 +2921,8 @@ int CProphEBSCamera::OnActivityFilterThreshold(MM::PropertyBase* pProp, MM::Acti
       pProp->Get(value);
       MMThreadGuard g(activityFilterLock_);
       activityFilterThresholdUs_ = value;
-      if (activityFilter_)
-         activityFilter_->set_threshold(static_cast<Metavision::timestamp>(value));
+      if (activityFilterConstructed_)
+         backendHandle_.Get()->ActivityFilterSetThreshold(value);
    }
    return DEVICE_OK;
 }
@@ -3191,52 +2998,38 @@ void CProphEBSCamera::StartEventStreaming()
    // Goal 6: (re)construct the software activity-noise filter now that the
    // real sensor geometry is known -- reads the current
    // activityFilterThresholdUs_ (whatever the property was last set to,
-   // possibly before a camera was ever connected).
+   // possibly before a camera was ever connected). Backend-shim refactor:
+   // the actual Metavision::ActivityNoiseFilterAlgorithm instance now lives
+   // inside the backend DLL (ActivityFilterConstruct()); this file only
+   // tracks whether it succeeded.
    {
       MMThreadGuard g(activityFilterLock_);
-      activityFilter_ = std::make_unique<Metavision::ActivityNoiseFilterAlgorithm<>>(
-         sensorWidth_, sensorHeight_, static_cast<Metavision::timestamp>(activityFilterThresholdUs_));
+      activityFilterConstructed_ = backendHandle_.Get()->ActivityFilterConstruct(
+         sensorWidth_, sensorHeight_, activityFilterThresholdUs_);
    }
 
-   cdCallbackId_ = cam_.cd().add_callback(
-      [this](const Metavision::EventCD* begin, const Metavision::EventCD* end)
-      {
-         OnEventsCD(begin, end);
-      });
+   backendHandle_.Get()->RegisterCdCallback(&CProphEBSCamera::CdCallbackTrampoline, this);
 
    // Goal 5: raw-byte counter for EBS-AvgDataRate-MBps -- cheap, single
    // atomic add per buffer, same "off the hot path" design as OnEventsCD().
-   rawDataCallbackId_ = cam_.raw_data().add_callback(
-      [this](const uint8_t* /*data*/, size_t size)
-      {
-         totalRawBytes_ += size;
-      });
+   backendHandle_.Get()->RegisterRawDataCallback(&CProphEBSCamera::RawDataCallbackTrampoline, this);
 
-   // Goal 8 follow-up: EBS-TriggerIn-Count -- counts real EventExtTrigger
-   // events (from whichever channel EBS-TriggerIn-Channel/-Enabled is
-   // currently watching), so enabling trigger-in monitoring can actually be
-   // confirmed working from the Device/Property Browser. Wrapped in
-   // try/catch like every other facility access in this file, though
-   // ext_trigger() only documents throwing if the camera itself isn't
-   // initialized -- not a real risk this deep into a successful connect.
+   // Goal 8 follow-up: EBS-TriggerIn-Count -- counts real ext-trigger events
+   // (from whichever channel EBS-TriggerIn-Channel/-Enabled is currently
+   // watching), so enabling trigger-in monitoring can actually be confirmed
+   // working from the Device/Property Browser. RegisterExtTriggerCallback()
+   // may legitimately fail (mirrors the original try/catch around
+   // cam_.ext_trigger().add_callback()) -- logged and streaming continues
+   // without trigger-in counting, exactly as before the backend-shim
+   // refactor.
    triggerInCount_ = 0;
-   try
-   {
-      triggerInCallbackId_ = cam_.ext_trigger().add_callback(
-         [this](const Metavision::EventExtTrigger* begin, const Metavision::EventExtTrigger* end)
-         {
-            triggerInCount_ += static_cast<uint64_t>(end - begin);
-         });
-   }
-   catch (const std::exception& e)
-   {
-      LogMessage(std::string("ProphEBS: could not register ext-trigger callback: ") + e.what(), true);
-   }
+   if (!backendHandle_.Get()->RegisterExtTriggerCallback(&CProphEBSCamera::ExtTriggerCallbackTrampoline, this))
+      LogMessage("ProphEBS: could not register ext-trigger callback", true);
 
    frameBuilderThd_->Start();
    statsThd_->Start(g_StatsIntervalMs);
 
-   cam_.start();
+   backendHandle_.Get()->Start();
    streaming_ = true;
 
    std::ostringstream startMsg;
@@ -3257,24 +3050,16 @@ void CProphEBSCamera::StopEventStreaming()
    if (!streaming_)
       return;
 
-   cam_.stop();
+   backendHandle_.Get()->Stop();
    frameBuilderThd_->Stop();
    statsThd_->Stop();
-   cam_.cd().remove_callback(cdCallbackId_);
-   cam_.raw_data().remove_callback(rawDataCallbackId_);
-   try
-   {
-      cam_.ext_trigger().remove_callback(triggerInCallbackId_);
-   }
-   catch (const std::exception&)
-   {
-      // Registration may have failed in StartEventStreaming() -- nothing to
-      // remove in that case, harmless either way.
-   }
+   backendHandle_.Get()->UnregisterCallbacks();
    streaming_ = false;
 
    MMThreadGuard g(activityFilterLock_);
-   activityFilter_.reset();
+   if (activityFilterConstructed_)
+      backendHandle_.Get()->ActivityFilterDestroy();
+   activityFilterConstructed_ = false;
 }
 
 /**
@@ -3295,12 +3080,58 @@ void CProphEBSCamera::StopEventStreaming()
  * an atomic re-load for every single event would be wasteful at real
  * event rates.
  */
-void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavision::EventCD* end)
+void CProphEBSCamera::CdCallbackTrampoline(void* ctx, const ProphEBSEvent* begin, size_t count)
 {
-   totalEventCount_ += static_cast<uint64_t>(end - begin);
+   static_cast<CProphEBSCamera*>(ctx)->OnEventsCD(begin, count);
+}
 
-   if (begin == end)
+void CProphEBSCamera::RawDataCallbackTrampoline(void* ctx, size_t sizeBytes)
+{
+   static_cast<CProphEBSCamera*>(ctx)->totalRawBytes_ += sizeBytes;
+}
+
+void CProphEBSCamera::ExtTriggerCallbackTrampoline(void* ctx, const ProphEBSExtTriggerEvent* /*begin*/, size_t count)
+{
+   static_cast<CProphEBSCamera*>(ctx)->triggerInCount_ += static_cast<uint64_t>(count);
+}
+
+void CProphEBSCamera::OnEventsCD(const ProphEBSEvent* begin, size_t count)
+{
+   totalEventCount_ += static_cast<uint64_t>(count);
+
+   if (count == 0)
       return;
+
+   const ProphEBSEvent* end = begin + count;
+
+   // Goal 7 follow-up (backend-shim refactor): hot-pixel calibration tally --
+   // see hotPixelCalibActive_ in ProphEBS.h for why this now runs inside the
+   // one and only registered CD callback instead of a second, independent
+   // registration. Tallies from the raw (unfiltered) batch, exactly as the
+   // original's separate calibration callback did, and runs regardless of
+   // whether the rest of this function takes the backlog-flush early return
+   // below -- calibration is not part of the integration-window/backlog
+   // machinery.
+   if (hotPixelCalibActive_.load(std::memory_order_relaxed))
+   {
+      MMThreadGuard calibGuard(hotPixelCalibLock_);
+      if (hotPixelCalibActive_.load(std::memory_order_relaxed))
+      {
+         for (const ProphEBSEvent* ev = begin; ev != end; ++ev)
+         {
+            if (ev->x < hotPixelCalibRoiX_ || ev->x >= hotPixelCalibRoiX_ + hotPixelCalibRoiW_ ||
+                ev->y < hotPixelCalibRoiY_ || ev->y >= hotPixelCalibRoiY_ + hotPixelCalibRoiH_)
+               continue; // outside the ROI being scanned -- shouldn't normally happen
+                         // while a hardware ROI is active, but guards against any
+                         // in-flight events from just before it was applied.
+            size_t idx = static_cast<size_t>(ev->y - hotPixelCalibRoiY_) * hotPixelCalibRoiW_ +
+               (ev->x - hotPixelCalibRoiX_);
+            std::vector<uint32_t>& counts = ev->polarity != 0 ? hotPixelCalibOnCounts_ : hotPixelCalibOffCounts_;
+            if (idx < counts.size() && counts[idx] < 0xFFFFFFFFu)
+               counts[idx]++;
+         }
+      }
+   }
 
    // Follow-up: backlog detection, using each checked event's own raw
    // sensor timestamp (before any activity-filter subsetting) against how
@@ -3319,7 +3150,7 @@ void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavis
    // periodically (every g_LagCheckEventInterval events) from inside the
    // per-event loop below, always re-anchoring whenever the reading isn't
    // positive.
-   auto checkLag = [this](std::chrono::steady_clock::time_point wallNow, Metavision::timestamp eventT) -> double
+   auto checkLag = [this](std::chrono::steady_clock::time_point wallNow, int64_t eventT) -> double
    {
       if (streamSensorStart_ < 0)
       {
@@ -3349,7 +3180,7 @@ void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavis
    };
 
    auto nowWall = std::chrono::steady_clock::now();
-   Metavision::timestamp latestT = (end - 1)->t;
+   int64_t latestT = (end - 1)->tUs;
    double lagMs = checkLag(nowWall, latestT);
    callbackLagMs_ = lagMs;
 
@@ -3370,40 +3201,41 @@ void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavis
    }
 
    MMThreadGuard filterGuard(activityFilterLock_);
-   const Metavision::EventCD* filteredBegin = begin;
-   const Metavision::EventCD* filteredEnd = end;
-   std::vector<Metavision::EventCD> filtered;
-   if (activityFilterEnabled_ && activityFilter_)
+   const ProphEBSEvent* filteredBegin = begin;
+   const ProphEBSEvent* filteredEnd = end;
+   std::vector<ProphEBSEvent> filtered;
+   if (activityFilterEnabled_ && activityFilterConstructed_)
    {
-      filtered.reserve(static_cast<size_t>(end - begin));
-      activityFilter_->process_events(begin, end, std::back_inserter(filtered));
+      filtered.resize(count);
+      size_t filteredCount = 0;
+      backendHandle_.Get()->ActivityFilterProcess(begin, count, filtered.data(), filteredCount);
       filteredBegin = filtered.data();
-      filteredEnd = filtered.data() + filtered.size();
+      filteredEnd = filtered.data() + filteredCount;
    }
 
-   auto exposureUs = static_cast<Metavision::timestamp>(integrationTimeMs_.load() * 1000.0);
+   auto exposureUs = static_cast<int64_t>(integrationTimeMs_.load() * 1000.0);
    double flushThresholdMs = backlogFlushThresholdMs_.load();
    size_t sinceLagCheck = 0;
 
-   for (const Metavision::EventCD* ev = filteredBegin; ev != filteredEnd; ++ev)
+   for (const ProphEBSEvent* ev = filteredBegin; ev != filteredEnd; ++ev)
    {
       if (ev->x < sensorWidth_ && ev->y < sensorHeight_)
       {
          size_t idx = static_cast<size_t>(ev->y) * sensorWidth_ + ev->x;
-         int32_t& count = ev->p != 0 ? onCounts_[idx] : offCounts_[idx];
-         if (count < INT32_MAX)
-            count++;
+         int32_t& count2 = ev->polarity != 0 ? onCounts_[idx] : offCounts_[idx];
+         if (count2 < INT32_MAX)
+            count2++;
          touchedIndices_.push_back(static_cast<uint32_t>(idx));
 
          // Goal 8: time-decay view-mode state -- independent of the
          // integration-window machinery above, never reset by
          // CloseCurrentWindowLocked()/FlushBacklogLocked() (see ProphEBS.h).
-         lastEventTimeUs_[idx] = ev->t;
-         lastEventPolarity_[idx] = (ev->p != 0) ? 1 : -1;
+         lastEventTimeUs_[idx] = ev->tUs;
+         lastEventPolarity_[idx] = (ev->polarity != 0) ? 1 : -1;
       }
 
-      if (ev->t - windowStartT_ >= exposureUs)
-         CloseCurrentWindowLocked(true, ev->t);
+      if (ev->tUs - windowStartT_ >= exposureUs)
+         CloseCurrentWindowLocked(true, ev->tUs);
 
       // Mid-batch recheck: bounds a single large/slow batch's worst-case
       // delay before flushing to roughly one recheck interval's worth of
@@ -3413,11 +3245,11 @@ void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavis
       {
          sinceLagCheck = 0;
          auto midWall = std::chrono::steady_clock::now();
-         double midLagMs = checkLag(midWall, ev->t);
+         double midLagMs = checkLag(midWall, ev->tUs);
          callbackLagMs_ = midLagMs;
          if (midLagMs >= flushThresholdMs)
          {
-            FlushBacklogLocked(midWall, ev->t, midLagMs);
+            FlushBacklogLocked(midWall, ev->tUs, midLagMs);
             return;
          }
       }
@@ -3436,7 +3268,7 @@ void CProphEBSCamera::OnEventsCD(const Metavision::EventCD* begin, const Metavis
  * eventCountsLock_; this never locks it itself.
  */
 void CProphEBSCamera::FlushBacklogLocked(std::chrono::steady_clock::time_point nowWall,
-   Metavision::timestamp eventT, double lagMs)
+   int64_t eventT, double lagMs)
 {
    std::fill(onCounts_.begin(), onCounts_.end(), 0);
    std::fill(offCounts_.begin(), offCounts_.end(), 0);
@@ -3460,7 +3292,7 @@ void CProphEBSCamera::FlushBacklogLocked(std::chrono::steady_clock::time_point n
  * that window, not sensor resolution. Caller must already hold
  * eventCountsLock_; this never locks it itself.
  */
-void CProphEBSCamera::CloseCurrentWindowLocked(bool fromEvent, Metavision::timestamp eventT)
+void CProphEBSCamera::CloseCurrentWindowLocked(bool fromEvent, int64_t eventT)
 {
    // Bug fix: touchedIndices_ has no dedup -- one push per *qualifying
    // event*, not per distinct pixel -- so on a busy sensor over a long
@@ -3537,7 +3369,7 @@ void CProphEBSCamera::BuildAndSwapFrame()
    std::vector<int32_t> offCounts(n);
    std::vector<int64_t> lastEventTimeUs;
    std::vector<int8_t> lastEventPolarity;
-   Metavision::timestamp nowT;
+   int64_t nowT;
    std::chrono::steady_clock::time_point nowWallAnchor;
    {
       MMThreadGuard g(eventCountsLock_);
@@ -3591,7 +3423,7 @@ void CProphEBSCamera::BuildAndSwapFrame()
  */
 void CProphEBSCamera::RenderCountsToImage(ImgBuffer* target, const std::vector<int32_t>& onCounts,
    const std::vector<int32_t>& offCounts, const std::vector<int64_t>& lastEventTimeUs,
-   const std::vector<int8_t>& lastEventPolarity, Metavision::timestamp nowT,
+   const std::vector<int8_t>& lastEventPolarity, int64_t nowT,
    std::chrono::steady_clock::time_point nowWallAnchor)
 {
    ProphEBSViewMode mode = static_cast<ProphEBSViewMode>(viewMode_.load());
@@ -3819,41 +3651,41 @@ void CProphEBSCamera::UpdateStats()
    avgDataRateMBps_ = (static_cast<double>(bytes) / seconds) / (1024.0 * 1024.0);
    avgEventRateMEvps_ = (static_cast<double>(events) / seconds) / 1.0e6;
 
-   try
    {
-      Metavision::I_ErcModule& erc = GetCamFacility<Metavision::I_ErcModule>();
-      double dropRateKEvps = 0.0;
-      if (erc.is_enabled())
+      IProphEBSBackend* backend = backendHandle_.Get();
+      bool ercEnabled = false;
+      uint32_t ercRate = 0;
+      if (backend->ErcIsEnabled(ercEnabled) == ProphEBSResult::Ok &&
+          backend->ErcGetRate(ercRate) == ProphEBSResult::Ok)
       {
-         double targetEvps = static_cast<double>(erc.get_cd_event_rate());
-         double measuredEvps = static_cast<double>(events) / seconds;
-         double dropEvps = targetEvps - measuredEvps;
-         if (dropEvps > 0.0)
-            dropRateKEvps = dropEvps / 1000.0;
+         double dropRateKEvps = 0.0;
+         if (ercEnabled)
+         {
+            double targetEvps = static_cast<double>(ercRate);
+            double measuredEvps = static_cast<double>(events) / seconds;
+            double dropEvps = targetEvps - measuredEvps;
+            if (dropEvps > 0.0)
+               dropRateKEvps = dropEvps / 1000.0;
+         }
+         avgErcDropRateKEvps_ = dropRateKEvps;
       }
-      avgErcDropRateKEvps_ = dropRateKEvps;
-   }
-   catch (const std::exception&)
-   {
-      // ERC not available on this sensor -- leave the estimate at 0.
-   }
+      // else: ERC not available on this sensor -- leave the estimate at 0.
 
-   try
-   {
-      Metavision::I_Monitoring& mon = GetCamFacility<Metavision::I_Monitoring>();
+      double temperature;
+      if (backend->GetTemperatureC(temperature) == ProphEBSResult::Ok)
+         temperatureC_ = temperature;
 
-      try { temperatureC_ = static_cast<double>(mon.get_temperature()); }
-      catch (const std::exception&) { /* leave at last good value */ }
+      double illumination;
+      if (backend->GetIlluminationLux(illumination) == ProphEBSResult::Ok)
+         illuminationLux_ = illumination;
 
-      try { illuminationLux_ = static_cast<double>(mon.get_illumination()); }
-      catch (const std::exception&) { /* leave at last good value */ }
-
-      try { pixelDeadTimeUs_ = static_cast<double>(mon.get_pixel_dead_time()); }
-      catch (const std::exception&) { /* leave at last good value */ }
-   }
-   catch (const std::exception&)
-   {
-      // I_Monitoring facility itself not available on this sensor.
+      double pixelDeadTime;
+      if (backend->GetPixelDeadTimeUs(pixelDeadTime) == ProphEBSResult::Ok)
+         pixelDeadTimeUs_ = pixelDeadTime;
+      // Each I_Monitoring reading is polled independently (this sensor
+      // throws on get_illumination() but not get_temperature()/
+      // get_pixel_dead_time()) -- one failing metric leaves that cached
+      // value at whatever it was last, without suppressing the others.
    }
 
    // Push the freshly-updated values into MMCore's stateCache_ so the
@@ -4054,11 +3886,8 @@ void CProphEBSCamera::StartRawRecordingIfRequested()
       }
    }
 
-   try
+   if (backendHandle_.Get()->StartRecording(path.c_str()))
    {
-      if (!cam_.start_recording(path))
-         throw std::runtime_error("start_recording() returned false");
-
       rawRecordingActive_ = true;
       currentRawFilePath_ = path;
       std::string status = "Recording to " + path;
@@ -4066,12 +3895,16 @@ void CProphEBSCamera::StartRawRecordingIfRequested()
       OnPropertyChanged(g_PropRawRecordingStatus, status.c_str());
       LogMessage("ProphEBS: raw event recording started -> " + path, false);
    }
-   catch (const std::exception& e)
+   else
    {
       rawRecordingActive_ = false;
       currentRawFilePath_.clear();
       movePendingToMdaFolder_ = false;
-      std::string msg = std::string("Failed to start raw recording: ") + e.what();
+      // Backend-shim refactor: the exact exception text from
+      // Camera::start_recording() can no longer cross the DLL boundary --
+      // see IProphEBSBackend.h's StartRecording() contract. A generic
+      // message is used here instead of the original's e.what().
+      std::string msg = "Failed to start raw recording: backend reported an error";
       SetProperty(g_PropRawRecordingStatus, msg.c_str());
       OnPropertyChanged(g_PropRawRecordingStatus, msg.c_str());
       LogMessage("ProphEBS: " + msg, false);
@@ -4113,14 +3946,11 @@ void CProphEBSCamera::StopRawRecordingIfActive()
    if (!rawRecordingActive_)
       return;
 
-   try
-   {
-      cam_.stop_recording(currentRawFilePath_);
-   }
-   catch (const std::exception& e)
-   {
-      LogMessage(std::string("ProphEBS: error stopping raw recording: ") + e.what(), false);
-   }
+   // StopRecording() swallows any exception on the backend side (can't
+   // cross the DLL boundary -- see IProphEBSBackend.h's contract), so there
+   // is nothing further to log here beyond what StopRecording() itself may
+   // already have logged inside the backend.
+   backendHandle_.Get()->StopRecording(currentRawFilePath_.c_str());
 
    std::string finalPath = currentRawFilePath_;
 
@@ -4383,18 +4213,8 @@ int CProphEBSCamera::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySi
 
    if (cameraConnected_)
    {
-      try
-      {
-         Metavision::I_ROI& roi = GetCamFacility<Metavision::I_ROI>();
-         roi.set_mode(Metavision::I_ROI::Mode::ROI);
-         roi.set_window(Metavision::I_ROI::Window(
-            static_cast<int>(x), static_cast<int>(y), static_cast<int>(xSize), static_cast<int>(ySize)));
-         roi.enable(true);
-      }
-      catch (const std::exception& e)
-      {
-         LogMessage(std::string("ProphEBS: could not apply hardware ROI: ") + e.what(), false);
-      }
+      if (backendHandle_.Get()->RoiSetWindow(x, y, xSize, ySize) == ProphEBSResult::Error)
+         LogMessage("ProphEBS: could not apply hardware ROI", false);
    }
 
    ApplyRoiToBuffers();
@@ -4419,17 +4239,11 @@ int CProphEBSCamera::ClearROI()
 
    if (cameraConnected_)
    {
-      try
-      {
-         // Mirrors the official metavision_active_pixel_detection.cpp
-         // sample's own clearROI() helper: disable rather than re-set a
-         // full-frame window.
-         GetCamFacility<Metavision::I_ROI>().enable(false);
-      }
-      catch (const std::exception& e)
-      {
-         LogMessage(std::string("ProphEBS: could not clear hardware ROI: ") + e.what(), false);
-      }
+      // Mirrors the official metavision_active_pixel_detection.cpp sample's
+      // own clearROI() helper: disable rather than re-set a full-frame
+      // window.
+      if (backendHandle_.Get()->RoiDisable() == ProphEBSResult::Error)
+         LogMessage("ProphEBS: could not clear hardware ROI", false);
    }
 
    ApplyRoiToBuffers();
@@ -4726,7 +4540,7 @@ int ProphEBSSequenceThread::svc()
             std::vector<int32_t> onCounts, offCounts;
             std::vector<int64_t> lastEventTimeUs;
             std::vector<int8_t> lastEventPolarity;
-            Metavision::timestamp nowT;
+            int64_t nowT;
             std::chrono::steady_clock::time_point nowWallAnchor;
             {
                MMThreadGuard g(camera_->eventCountsLock_);

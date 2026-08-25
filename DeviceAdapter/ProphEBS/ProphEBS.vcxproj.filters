@@ -17,9 +17,18 @@
     <ClCompile Include="ProphEBSModule.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Backend\BackendLoader.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ProphEBS.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Backend\IProphEBSBackend.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Backend\BackendLoader.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

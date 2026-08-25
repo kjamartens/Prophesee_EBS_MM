@@ -171,12 +171,72 @@ skip this. From Goal 2 onward, the adapter won't build without it.
    MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64 /p:MetavisionSdkRoot="D:\Prophesee"
    ```
    (Building from inside the Visual Studio IDE always uses the default
-   `C:\Program Files\Prophesee` path.)
+   `C:\Program Files\Prophesee` path.) Note: since the backend-shim refactor
+   (see `docs/DEVLOG.md`), `MetavisionSdkRoot` is a property of the
+   `ProphEBS_Backend_SDK5x` project specifically, not the main `ProphEBS`
+   project — the main adapter DLL no longer touches the Metavision SDK at
+   all, see "Adding a new Metavision SDK generation backend" below.
 4. You do **not** need an EBS camera physically connected to build or load
    the adapter — Goal 2's connection attempt is designed to fail gracefully
    (see the Goal 2 section below) so you can develop and test without
    hardware. You only need the camera plugged in to verify the *connection*
    itself works.
+
+### Adding a new Metavision SDK generation backend
+
+As of the backend-shim refactor (see `docs/DEVLOG.md`), `mmgr_dal_ProphEBS.dll`
+(the only thing MicroManager ever loads) contains zero Metavision SDK code.
+Instead, at `Initialize()` time it probes which Metavision SDK generation is
+actually installed and dynamically loads a matching
+`ProphEBS_Backend_<tag>.dll`, each one a separate project statically linked
+against exactly one SDK generation and implementing the small
+`IProphEBSBackend` interface (`DeviceAdapter/ProphEBS/Backend/IProphEBSBackend.h`).
+This machine only has Metavision SDK 5.1.1 ("stream" module) installed, so
+only `Backend/SDK5x/` (`ProphEBS_Backend_SDK5x.dll`) is built and shipped
+today; a second backend for SDK 4.3.0 (`Backend/SDK43/`,
+`ProphEBS_Backend_SDK43.dll`) is designed for but not yet implemented (no
+4.3.0 install available on this dev machine to build/test against) — see the
+DEVLOG entry for that follow-up.
+
+To add support for a new Metavision SDK generation:
+
+1. Copy `DeviceAdapter/ProphEBS/Backend/SDK5x/` to a new sibling folder (e.g.
+   `Backend/SDK43/`), renaming the `.vcxproj`/class/exports file to match
+   (e.g. `ProphEBS_Backend_SDK43.vcxproj`, `ProphEBSBackendSDK43`). Give the
+   `.vcxproj` a fresh `<ProjectGuid>` and set `<TargetName>` to the new
+   backend's DLL name.
+2. Point its `MetavisionSdkRoot` property at wherever that SDK generation is
+   actually installed (same override convention as the main project, e.g.
+   `/p:MetavisionSdkRoot=...`), and update its `AdditionalIncludeDirectories`/
+   `AdditionalDependencies` (`.lib` names) to match that generation's actual
+   module names (e.g. `metavision_sdk_driver` instead of
+   `metavision_sdk_stream` for 4.3.0) -- see the historical `__has_include`
+   gating this replaced, still visible in `docs/DEVLOG.md`'s incident entry,
+   for exactly which facility/module names differ between generations.
+3. Implement every `IProphEBSBackend` virtual method against that
+   generation's actual SDK headers/types -- `Backend/SDK5x/ProphEBSBackendSDK5x.cpp`
+   is a complete worked example to translate from. A facility genuinely
+   absent on that generation (e.g. `I_EventRateActivityFilterModule` on
+   4.3.0) should return `ProphEBSResult::Unsupported` from every one of its
+   methods rather than omitting them -- the interface is fixed-shape, every
+   backend implements every method.
+4. Add one row to `g_BackendCandidates` in
+   `DeviceAdapter/ProphEBS/Backend/BackendLoader.cpp`, naming a marker DLL
+   unique to that generation (a DLL name that only exists when that SDK
+   generation is installed, e.g. `metavision_sdk_driver.dll` for 4.3.0) and
+   the new backend's own output DLL name.
+5. Add the new `.vcxproj` to `ProphEBS.sln` (new project GUID, same
+   `Debug|x64`/`Release|x64` config wiring as the existing two projects) --
+   it needs no `ProjectReference` to `MMDevice-SharedRuntime`, since it links
+   no MM headers at all.
+6. Build the whole solution
+   (`MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`) and
+   confirm the new `ProphEBS_Backend_<tag>.dll` lands in the same
+   `build\Release\x64\` output folder as `mmgr_dal_ProphEBS.dll` and the
+   other backend DLL(s) -- **all** backend DLLs a machine might need must be
+   copied alongside `mmgr_dal_ProphEBS.dll` into the MicroManager install
+   folder (step 4 below); `BackendLoader` only picks the first one whose
+   marker DLL actually resolves at runtime.
 
 ## 2. Get the source code
 
@@ -201,9 +261,12 @@ git submodule update --init --recursive
 
 1. In File Explorer, navigate to `DeviceAdapter\ProphEBS\` inside the cloned
    repository.
-2. Double-click **`ProphEBS.sln`**. This opens Visual Studio with two
-   projects loaded: `ProphEBS` (our adapter) and `MMDevice-SharedRuntime`
-   (Micro-Manager's own support library, which our adapter needs).
+2. Double-click **`ProphEBS.sln`**. This opens Visual Studio with three
+   projects loaded: `ProphEBS` (the main adapter DLL, `mmgr_dal_ProphEBS.dll`),
+   `MMDevice-SharedRuntime` (Micro-Manager's own support library, which the
+   main adapter needs), and `ProphEBS_Backend_SDK5x` (the Metavision-SDK-5.x
+   backend DLL the main adapter loads dynamically at runtime -- see "Adding a
+   new Metavision SDK generation backend" above).
 3. Near the top of the Visual Studio window there are two dropdowns that
    default to "Debug" and "x64" (or sometimes "Any CPU"). Set them to:
    - **Release**
@@ -215,10 +278,14 @@ git submodule update --init --recursive
    build ends with something like:
    ```
    ProphEBS.vcxproj -> ...\DeviceAdapter\ProphEBS\build\Release\x64\mmgr_dal_ProphEBS.dll
-   ========== Build: 2 succeeded, 0 failed ==========
+   ProphEBS_Backend_SDK5x.vcxproj -> ...\DeviceAdapter\ProphEBS\build\Release\x64\ProphEBS_Backend_SDK5x.dll
+   ========== Build: 3 succeeded, 0 failed ==========
    ```
-6. The file you need is:
-   `DeviceAdapter\ProphEBS\build\Release\x64\mmgr_dal_ProphEBS.dll`
+6. The files you need (both, together) are:
+   `DeviceAdapter\ProphEBS\build\Release\x64\mmgr_dal_ProphEBS.dll` and
+   `DeviceAdapter\ProphEBS\build\Release\x64\ProphEBS_Backend_SDK5x.dll` --
+   see step 4 below, both must be copied into the MicroManager install
+   folder together.
 
 ### Common first-build errors
 
@@ -227,17 +294,24 @@ git submodule update --init --recursive
 | `Cannot open include file: 'DeviceBase.h'` | Submodule wasn't cloned | Run `git submodule update --init --recursive` from the repo root, then reload the solution |
 | `TRACKER : error TRK0005: Failed to locate: "CL.exe"` | The C++ build tools component of Visual Studio isn't installed, or you launched a plain terminal instead of the IDE | Re-run the VS Installer and confirm "Desktop development with C++" is checked; if building from a terminal instead of the IDE, use the **"Developer Command Prompt for VS 2022"** (search for it in the Start menu) rather than a plain PowerShell/cmd window |
 | Solution won't load / "unsupported" project errors | Very old Visual Studio version | Make sure you installed **Visual Studio 2022** (not 2019 or earlier) |
-| `Cannot open include file: 'metavision/sdk/stream/camera.h'` or `'opencv2/core.hpp'` (Goal 2+) | Metavision SDK isn't installed, or is installed somewhere other than `C:\Program Files\Prophesee` | Install it (section 1d) or pass `/p:MetavisionSdkRoot="<your path>"` to MSBuild |
-| `unresolved external symbol` referencing `Metavision::...` at link time (Goal 2+) | Metavision `.lib` files not found/linked | Confirm `C:\Program Files\Prophesee\lib` (or your `MetavisionSdkRoot`) contains `metavision_hal.lib`, `metavision_sdk_base.lib`, `metavision_sdk_stream.lib` |
+| `Cannot open include file: 'metavision/sdk/stream/camera.h'` or `'opencv2/core.hpp'` (Goal 2+) | Metavision SDK isn't installed, or is installed somewhere other than `C:\Program Files\Prophesee` -- this error now comes from the **`ProphEBS_Backend_SDK5x`** project, not the main `ProphEBS` project (see the backend-shim refactor in `docs/DEVLOG.md`) | Install it (section 1d) or pass `/p:MetavisionSdkRoot="<your path>"` to MSBuild |
+| `unresolved external symbol` referencing `Metavision::...` at link time (Goal 2+) | Metavision `.lib` files not found/linked -- again, this is now a `ProphEBS_Backend_SDK5x` link error, never a `ProphEBS` (main adapter) one | Confirm `C:\Program Files\Prophesee\lib` (or your `MetavisionSdkRoot`) contains `metavision_hal.lib`, `metavision_sdk_base.lib`, `metavision_sdk_stream.lib` |
 | Build succeeds but into a `Debug` folder instead of `Release` | Configuration dropdown was left on "Debug" | Switch the dropdown to Release and rebuild (Debug DLLs also work in MicroManager, they're just slower and bulkier — Release is recommended) |
 
 ## 4. Install the adapter into MicroManager
 
-1. Copy `mmgr_dal_ProphEBS.dll` from the build output folder.
-2. Paste it directly into your MicroManager installation folder — the same
-   folder that contains `ImageJ.exe`/`MicroManager.exe` and the other
-   `mmgr_dal_*.dll` files (e.g. `mmgr_dal_DemoCamera.dll`). Where that is
-   depends on which install method you used in step 1c:
+1. Copy **both** `mmgr_dal_ProphEBS.dll` **and** `ProphEBS_Backend_SDK5x.dll`
+   from the build output folder — since the backend-shim refactor (see
+   `docs/DEVLOG.md`), the main adapter DLL contains no Metavision SDK code
+   at all and dynamically loads `ProphEBS_Backend_SDK5x.dll` alongside it at
+   `Initialize()` time; MicroManager will show `ProphEBS-Camera` as
+   "(unavailable)" (or connect but silently fall back to the no-hardware
+   test pattern) if only `mmgr_dal_ProphEBS.dll` is copied and its backend
+   DLL is missing.
+2. Paste both files directly into your MicroManager installation folder —
+   the same folder that contains `ImageJ.exe`/`MicroManager.exe` and the
+   other `mmgr_dal_*.dll` files (e.g. `mmgr_dal_DemoCamera.dll`). Where that
+   is depends on which install method you used in step 1c:
    - **Option A (pymmcore-plus)**: the active install's path is printed by
      `mmcore list` (marked `(active)`), e.g.
      `%LOCALAPPDATA%\pymmcore-plus\pymmcore-plus\mm\Micro-Manager_<version>_<date>\`
@@ -718,9 +792,9 @@ verified working** — let the project owner know so we can tag this as
 | Symptom | Likely cause |
 |---|---|
 | `ProphEBS` doesn't appear in the Hardware Configuration Wizard device list | The DLL isn't in the MicroManager install folder, or it's a 32-bit build (must be x64/Release), or MicroManager itself is a 32-bit install (rare, would need a 32-bit rebuild) |
-| `ProphEBS` appears as a flat entry marked **"(unavailable)"** instead of an expandable folder with `ProphEBS-Camera` inside it, **and** `tools\mm_python_env\Scripts\mmcore list` shows your active install's interface version *matching* what the DLL needs | **Metavision SDK DLLs missing/not on `PATH`** at MicroManager's load time (`metavision_hal.dll`, `metavision_sdk_base.dll`, `metavision_sdk_stream.dll`). This looks identical to the device-interface-version case below in the GUI (Windows can't load the DLL at all, so MMCore never gets far enough to report a specific reason) — the interface-version check above is what tells them apart. Confirm `C:\Program Files\Prophesee\bin` (or wherever you installed the SDK) is on your system `PATH` (see step 1d) — the SDK installer normally does this for you, but a manual/non-default install or a `PATH` edited afterward can undo it. After fixing `PATH`, restart MicroManager (a `PATH` change doesn't apply to already-running programs) |
+| `ProphEBS` appears as a flat entry marked **"(unavailable)"** instead of an expandable folder with `ProphEBS-Camera` inside it, **and** `tools\mm_python_env\Scripts\mmcore list` shows your active install's interface version *matching* what the DLL needs | Since the backend-shim refactor, `mmgr_dal_ProphEBS.dll` itself has no Metavision SDK dependency, so this specific cause should be rare for the main DLL now -- but `ProphEBS_Backend_SDK5x.dll` (loaded dynamically alongside it, see step 4) still needs **Metavision SDK DLLs on `PATH`** at the moment MicroManager loads it (`metavision_hal.dll`, `metavision_sdk_base.dll`, `metavision_sdk_stream.dll`). Confirm `C:\Program Files\Prophesee\bin` (or wherever you installed the SDK) is on your system `PATH` (see step 1d) — the SDK installer normally does this for you, but a manual/non-default install or a `PATH` edited afterward can undo it. After fixing `PATH`, restart MicroManager (a `PATH` change doesn't apply to already-running programs) |
 | `ProphEBS` appears as a flat entry marked **"(unavailable)"**, **and** `mmcore list` shows a version *mismatch* | **Device interface version mismatch** — your installed MicroManager build and the `mmgr_dal_ProphEBS.dll` you built expect different interface versions. Get a newer/matching nightly build via `mmcore install` (or the no-admin workaround, see step 1c) |
-| `ProphEBS` appears as a flat entry marked **"(unavailable)"**, **but** the device interface version *does* match, and the CoreLog (see step 6) shows `Error: Unable to load ProphEBS library: ... The module, or a module it depends upon, could not be found` | **The DLL was built against a different Metavision SDK version than what's installed on this machine** — a real, undocumented gap, not a `PATH` problem (see the Goal 4-adjacent DEVLOG incident "v0.9.2 DLL '(unavailable)' ... root-caused to a Metavision SDK version gap" in `docs/DEVLOG.md` for the full story). Confirm with `dumpbin /dependents mmgr_dal_ProphEBS.dll` (from a "Developer Command Prompt for VS 2022"): if it lists a DLL that doesn't actually exist anywhere under your `C:\Program Files\Prophesee` install (e.g. `metavision_sdk_stream.dll` when your install only has `metavision_sdk_driver.dll`, or vice versa), that confirms it. Rebuild from source on **this** machine, against **this** machine's installed SDK (`MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64`) rather than copying a DLL built elsewhere — the project auto-detects which module name (`stream` vs `driver`) your installed SDK actually provides. Note: on an older SDK (`driver`-module, e.g. 4.3.0) two features are automatically disabled at compile time rather than failing the build — the Goal 8 `EBS-EventRateFilter-*` sensor filter and the Goal 7 `I_RoiPixelMask` fallback (hot-pixel masking itself still works via `I_DigitalEventMask`) — both come back automatically on a rebuild against a newer SDK that has them |
+| `ProphEBS` appears as a flat entry marked **"(unavailable)"**, **but** the device interface version *does* match, and the CoreLog (see step 6) shows `Error: Unable to load ProphEBS library: ... The module, or a module it depends upon, could not be found` | Since the backend-shim refactor (see `docs/DEVLOG.md`), `mmgr_dal_ProphEBS.dll` itself contains **no** Metavision SDK dependency at all -- it links nothing from `C:\Program Files\Prophesee`, so this specific "module or a module it depends upon could not be found" failure mode for the *main* DLL should no longer happen from an SDK-generation mismatch (that's what this whole refactor fixed -- see the incident entry this replaced, "v0.9.2 DLL '(unavailable)' ... root-caused to a Metavision SDK version gap", for the full history). If you still see this for `mmgr_dal_ProphEBS.dll` specifically, confirm with `dumpbin /dependents mmgr_dal_ProphEBS.dll` that it really lists no `metavision_*.dll`/`opencv_*.dll` dependency; if it does, your build is stale, rebuild from source. A **backend DLL** (e.g. `ProphEBS_Backend_SDK5x.dll`) *can* still fail this way if it was built against a different SDK generation than what's installed -- but that's expected and handled: `BackendLoader` probes for a marker DLL unique to each known generation before ever attempting to load a backend, so a mismatched/missing backend DLL results in `EBS-ConnectionStatus` reading "Not connected: ..." (a graceful fallback to the Goal 1 static test image), not an "(unavailable)" device. If you need a generation this build doesn't ship a backend for yet, see "Adding a new Metavision SDK generation backend" above. |
 | Building fails with compiler errors like `cannot open include file 'metavision/sdk/...'` or linker errors about `metavision_hal.lib` | **Metavision SDK not installed, or `MetavisionSdkRoot` points at the wrong folder** — this is a raw MSBuild/compiler error, not a custom message from this project, so it can look like something else is wrong. Confirm the SDK is actually installed (step 1d) and, if it's not at the default `C:\Program Files\Prophesee`, pass `/p:MetavisionSdkRoot="<your path>"` on the MSBuild command line |
 | MicroManager crashes or shows a popup error when adding the device | Copy the exact error text and the relevant lines from the CoreLog around the crash — this is the most useful debugging info |
 | Live/Snap shows a black image or an error instead of the checkerboard | Note down what MicroManager's status bar / log says at that moment |
