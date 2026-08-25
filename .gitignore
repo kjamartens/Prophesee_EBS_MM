@@ -14,3 +14,11 @@
 /tools/mm_python_env/
 /tools/mm_install_test/
 
+# Vendored Metavision SDK installs, one per generation the backend-shim
+# architecture builds against (see docs/BUILD_AND_USAGE.md, "Adding a new
+# Metavision SDK generation backend") -- several GB each, not source, not
+# meant to be committed. Naming convention: SDKs/<major><minor><patch>/,
+# e.g. SDKs/511/ for Metavision SDK 5.1.1, laid out exactly like a normal
+# Metavision installer's target directory (include/, lib/, bin/, ...).
+/SDKs/
+
