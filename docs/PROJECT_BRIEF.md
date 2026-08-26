@@ -1,9 +1,13 @@
+# Project Brief
 
-I want you to code the Metavision Prophesee event-based camera into MicroManager 2.0 software as a DeviceAdapter, so that we can control the event-based sensor (EBS) via micromanager on microscopes.
+This is the original project brief that kicked off this repository: coding
+the Metavision Prophesee event-based camera into MicroManager 2.0 as a
+DeviceAdapter, so the event-based sensor (EBS) can be controlled from
+MicroManager on microscopes. It's kept here as historical context for the
+goal-by-goal structure referenced throughout `docs/DEVLOG.md` and
+`docs/BUILD_AND_USAGE.md`.
 
-Here i will give you some documentation you can look into, and some project goals.
-
-Documentation:
+Documentation used as reference when starting the project:
 The micro-manager API is described here:
 https://micro-manager.org/apidoc/mmstudio/latest/
 and here:
@@ -22,7 +26,8 @@ and some examples here:
 https://github.com/prophesee-ai/openeb
 of which i have included some in the folder /prophesee_examples/, where e.g. the events_integration might be interesting.
 
-Now on to the project goals. I will define a few of them, but I want you to stop work after each goal so I can test. Once this is complete, we upload it to github as v0.1, then continue to second goal, upload to v0.2, etc etc.
+Project goals were defined incrementally, one at a time, with a test/release
+checkpoint after each before moving to the next (v0.1, v0.2, ...).
 
 1. Barebones device adapter
 A barebones DeviceAdapter which just sort of prints a debug message or shows a static image upon loading, so we can assure that everything is OK with our building etc etc.
@@ -76,13 +81,15 @@ turns out to support more than one ROI window at once.
 
 9. Full suite polishing
 Do a full sweep over everything and make proper tests, documentation, handle errors, etc etc.
- - what if no sdk is found? error message or something
- - have the properties that are related to each other start with the same text so they are usefully ordered alphabetically (i.e. for hot pixels all start with HotPixel...)
 
-I also have some guidelines for you about the coding:
-For each goal, I want a full 'Current Status', and 'Build/Installation/Usage Tutorial'. Assume I'm a dummy and that you need to explain me *everything* about building a C++ program. What software do i need to have, what buttons to press, how to handle error messages, etc?
-Have proper documentation throughout the cpp files
-Have good documentation in the makefiles
-For the first goal, really give me detailed instructions on how to set everything up.
-Ask me questions if things are unclear!
-Ensure that you write good documentation for *yourself* so you can pick up where you left later. Keep track of what you want to do, what you did, what design decision you made and why, etc.
+- what if no sdk is found? error message or something
+- have the properties that are related to each other start with the same text so they are usefully ordered alphabetically (i.e. for hot pixels all start with HotPixel...)
+
+Coding/documentation guidelines set for the project:
+- For each goal, maintain a full "Current Status" and "Build/Installation/Usage
+  Tutorial", written for a reader with no prior experience building C++
+  software — explicit about what software to install, what buttons to press,
+  and how to handle error messages.
+- Proper documentation throughout the C++ source and project files.
+- Keep a running development log tracking design decisions and rationale, so
+  work can be picked up again later (see `docs/DEVLOG.md`).

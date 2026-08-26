@@ -10,6 +10,13 @@
 *.obj
 *.log
 
+# Python
+__pycache__/
+*.pyc
+
+# Local Claude Code project config (machine-specific paths/permissions)
+.claude/
+
 # Local Python tooling (pymmcore-plus helper venv) - recreated via docs/BUILD_AND_USAGE.md
 /tools/mm_python_env/
 /tools/mm_install_test/

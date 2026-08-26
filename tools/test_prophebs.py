@@ -1,10 +1,36 @@
 import os
+import sys
 import time
 
 import numpy as np
 from pymmcore_plus import CMMCorePlus
+from pymmcore_plus._util import USER_DATA_DIR
 
-mm_dir = r"C:\Users\kjamartens\AppData\Local\pymmcore-plus\pymmcore-plus\mm\Micro-Manager_2.0.3_20260724"
+
+def find_active_mm_dir() -> str:
+    """Locate the active pymmcore-plus-managed MicroManager install.
+
+    Mirrors what `mmcore list` reports as "(active)": the most recently
+    installed Micro-Manager_* folder under pymmcore-plus's managed mm/
+    directory. Override with the MM_DIR environment variable if you're
+    pointing at a different install (e.g. one set up via the no-admin-rights
+    innounp workaround in docs/BUILD_AND_USAGE.md).
+    """
+    env_override = os.environ.get("MM_DIR")
+    if env_override:
+        return env_override
+    mm_root = USER_DATA_DIR / "mm"
+    candidates = sorted(mm_root.glob("Micro-Manager_*"))
+    if not candidates:
+        sys.exit(
+            f"No MicroManager install found under {mm_root}.\n"
+            "Run `mmcore install` first, or set the MM_DIR environment "
+            "variable to point at your install (see docs/BUILD_AND_USAGE.md)."
+        )
+    return str(candidates[-1])
+
+
+mm_dir = find_active_mm_dir()
 
 core = CMMCorePlus()
 core.setDeviceAdapterSearchPaths([mm_dir])
