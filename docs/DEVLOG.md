@@ -3127,16 +3127,141 @@ Completed here, on the real machine:
 
 ### Open questions / TODO
 
-- Build and verify a `Backend/SDK43/` backend once a 4.3.0 SDK install is
-  available to test against — the recipe is fully documented in
-  `docs/BUILD_AND_USAGE.md` and every `IProphEBSBackend` method that 4.3.0
-  can't support has an `Unsupported`-returning path already exercised by
-  the "no camera connected" fallback logic in the main adapter, so this
-  should be close to copy-paste-and-fill-in against `Backend/SDK5x/`'s
-  worked example.
 - A full in-GUI Hardware Configuration Wizard / Live-Snap-with-a-physically-
   attached-camera pass is still up to the user, per this project's
   established practice for anything GUI-shaped — the self-test above proves
   the adapter loads, the backend probing/loading works, and every
   property/fallback path behaves correctly, but doesn't exercise real event
   streaming (no camera attached during this pass).
+
+## Backend-shim follow-up: four real per-version backends (SDK511/510/500/430), version-based detection, vendored SDKs/
+
+### Status: DONE — self-tested (no camera attached this session); real-hardware/GUI pass still up to the user
+
+The previous entry shipped exactly one backend (`Backend/SDK5x/`, built
+against whatever Metavision SDK happened to be installed system-wide) and
+left a second, 4.3.0-targeting backend as documented-but-unbuilt future
+work, since no 4.3.0 SDK was available on this dev machine at the time.
+The user has since vendored four full Metavision SDK installs directly into
+the repo under `SDKs/430/`, `SDKs/500/`, `SDKs/510/`, `SDKs/511/`
+(4.3.0/5.0.0/5.1.0/5.1.1 — gitignored, several GB each, see `.gitignore`),
+asking for this folder/naming convention to drive real per-generation
+backend builds instead of the single speculative one.
+
+### What was built
+
+- **`Backend/SDK5x/` renamed to `Backend/SDK511/`** (`ProphEBS_Backend_SDK511.dll`,
+  class `ProphEBSBackendSDK511`) — same code, renamed for the new
+  exact-version naming scheme, `MetavisionSdkRoot` now defaults to
+  `SDKs/511/` instead of the system install path.
+- **Two new "stream"-module backends, `Backend/SDK510/` and `Backend/SDK500/`**
+  — both are near-verbatim copies of `SDK511`'s implementation (the "stream"
+  module's `Camera` API, including `get_facility<T>()`, is identical across
+  5.0.0/5.1.0/5.1.1 — confirmed by these three builds all succeeding
+  unmodified against their own `SDKs/<version>/include`), each pointed at
+  its own `SDKs/500/`/`SDKs/510/`.
+- **One new "driver"-module backend, `Backend/SDK430/`** — deliberately
+  built against `metavision/sdk/driver/camera.h`, not `stream`, even though
+  `SDKs/430/`'s vendored devkit happens to also contain the `stream` module
+  headers. This matters: the incident that originally motivated the whole
+  backend-shim architecture was a real field machine whose 4.3.0 install
+  only shipped `metavision_sdk_driver.dll`, not `metavision_sdk_stream.dll`
+  — building this backend against `stream` (even though it would compile
+  fine against the vendored devkit) would silently defeat the entire point
+  for that class of machine. The only code change from `SDK511`'s
+  implementation is `Facility<T>()`: the "driver" module's `Camera` has no
+  `get_facility<T>()` convenience, so this normalizes onto the same
+  throwing-`T&` shape via `cam_.get_device().get_facility<T>()` (a pointer,
+  null-checked) instead — same technique the original pre-refactor
+  `ProphEBS.h`'s `GetCamFacility<T>()` used, just scoped to one backend now
+  instead of gated by a global `__has_include`.
+
+### Detection redesign: real file-version matching, not DLL-name presence
+
+The previous design picked a backend purely by whether a marker DLL
+(`metavision_sdk_stream.dll` vs. `metavision_sdk_driver.dll`) resolved on
+the search path — sufficient when there were only two candidate backends,
+but broken with four: SDK 5.0.0/5.1.0/5.1.1 all ship
+`metavision_sdk_stream.dll` under the same name, so presence alone can no
+longer tell them apart.
+
+- **`GetInstalledMetavisionVersion()`** (`BackendLoader.cpp`, new) resolves
+  `metavision_sdk_base.dll` via `SearchPathA` (the same search order
+  `LoadLibrary` itself uses, without actually loading/executing anything)
+  and reads its real major.minor.build straight out of its Win32
+  `VS_FIXEDFILEINFO` version resource (`GetFileVersionInfoA`/
+  `VerQueryValueA` — confirmed via PowerShell against this machine's live
+  install: `metavision_sdk_base.dll` → `FileVersion 5.1.1`,
+  `FileMajorPart=5`/`FileMinorPart=1`/`FileBuildPart=1`, matching
+  `HIWORD(dwFileVersionMS)`/`LOWORD(dwFileVersionMS)`/`HIWORD(dwFileVersionLS)`
+  exactly). Needs `Version.lib` linked into `ProphEBS.vcxproj` (added).
+- **`ProphEBSBackendCandidate`** (`BackendLoader.h`) now carries explicit
+  `major`/`minor`/`patch` ints instead of a marker-DLL string.
+  `LoadBestAvailableBackend()` tries an exact match first, then falls back
+  to any candidate sharing the same major.minor (any patch) — logged
+  explicitly as an inexact match, since patch-level ABI stability within a
+  minor version is an assumption inherited from how Metavision versions its
+  releases, not something this project has independently confirmed — then
+  gives up with a clear reason (naming the actual installed version) if
+  nothing matches at all.
+
+### Vendored `SDKs/` folder and a real provenance problem found in two of them
+
+`.gitignore` gained `/SDKs/` (several GB per generation, clearly not meant
+to be committed — confirmed it wasn't tracked yet before ignoring it).
+
+While verifying detection would actually distinguish the four generations,
+a file-hash comparison across the vendored folders surfaced something
+worth recording rather than quietly building past: `SDKs/430/` and
+`SDKs/500/`'s `metavision_hal.dll` and `metavision_sdk_base.dll` are
+**byte-identical** to `SDKs/511/`'s own copies (confirmed via SHA-256), and
+`metavision_sdk_base.dll`'s own embedded version resource inside the `430`/
+`500` folders literally reports `5.1.1`, not `4.3.0`/`5.0.0`. Their
+`include/metavision/sdk/version.h` headers *are* genuinely correct per
+generation, and `430`'s `metavision_sdk_driver.dll` specifically (a
+component no longer shipped by 5.x installers, so nothing newer ever had
+the chance to overwrite it) is genuinely dated Aug 2023, distinct in both
+timestamp and size from every other file checked. Asked the user directly:
+confirmed `430`/`500` were installed into locations that already had a 511
+install's files present, and those two installers didn't overwrite
+everything 511 had left behind — so `hal`/`base` in those two folders are
+stale 511 leftovers, not genuine 4.3.0/5.0.0 artifacts, while the headers
+and (for 430) the driver module are real. `SDKs/510/` has no such overlap
+(its own distinct `metavision_hal.dll` hash).
+
+**Decision (per user)**: keep both `SDK430`/`SDK500` backends as built —
+they compile and link clean, and `SDK430` in particular links against the
+one component (`metavision_sdk_driver.lib`) confirmed to be genuinely
+4.3.0-era — but document this clearly as **unverified against a real field
+install** rather than claim full confirmation, since the `hal`/`base`
+import libraries they linked against may themselves be 5.1.1-era rather
+than what 4.3.0/5.0.0 actually exported. `docs/BUILD_AND_USAGE.md`'s new
+"Vendored per-generation SDKs" section carries this caveat and the fix
+(reinstall those two into clean, never-reused target directories) for
+whenever the user wants to close it out.
+
+### Verified
+
+`MSBuild ProphEBS.sln /p:Configuration=Release /p:Platform=x64` — all six
+projects (`ProphEBS`, `MMDevice-SharedRuntime`, `ProphEBS_Backend_SDK511`/
+`SDK510`/`SDK500`/`SDK430`) build clean, 0 warnings/0 errors, each backend
+correctly linking its intended module
+(`dumpbin /dependents` confirmed: `SDK511`/`SDK510`/`SDK500` all import
+`metavision_sdk_stream.dll`; `SDK430` imports `metavision_sdk_driver.dll`
+only). Copied `mmgr_dal_ProphEBS.dll` plus all four backend DLLs into the
+active MicroManager install and re-ran `tools/test_prophebs.py` — full
+suite still passes (`SUCCESS`); `EBS-ConnectionStatus` still surfaces the
+real Metavision SDK exception text (no camera physically attached this
+session), confirming `LoadBestAvailableBackend()`'s new version-matching
+logic correctly picked `SDK511` (the genuinely-installed 5.1.1) over the
+other three candidates and reached the real SDK through it.
+
+### Open questions / TODO
+
+- Re-verify `SDK430`/`SDK500` once `SDKs/430/`/`SDKs/500/` are reinstalled
+  into clean, isolated target directories (not reused from another
+  generation's install) — see the provenance caveat above.
+- A real 4.3.0/5.0.0/5.1.0-generation physical camera (this dev machine's
+  hardware is 5.1.1/IMX636) would be needed to verify those three backends'
+  actual event-streaming path end-to-end, not just that they build/load —
+  out of scope until such hardware is available.

@@ -1,12 +1,12 @@
 ///////////////////////////////////////////////////////////////////////////////
-// FILE:          ProphEBSBackendSDK5x.h
+// FILE:          ProphEBSBackendSDK511.h
 // PROJECT:       Micro-Manager
-// SUBSYSTEM:     DeviceAdapters / ProphEBS / Backend / SDK5x
+// SUBSYSTEM:     DeviceAdapters / ProphEBS / Backend / SDK511
 //-----------------------------------------------------------------------------
 // DESCRIPTION:   IProphEBSBackend implementation statically linked against
-//                Metavision SDK 5.x's "stream" module (metavision_sdk_stream,
+//                Metavision SDK 5.1.1's "stream" module (metavision_sdk_stream,
 //                confirmed present as 5.1.1 on this dev machine). Ships as
-//                ProphEBS_Backend_SDK5x.dll, loaded dynamically at runtime by
+//                ProphEBS_Backend_SDK511.dll, loaded dynamically at runtime by
 //                mmgr_dal_ProphEBS.dll via BackendLoader -- see
 //                IProphEBSBackend.h for the full rationale.
 //
@@ -34,11 +34,11 @@
 #include <string>
 #include <vector>
 
-class ProphEBSBackendSDK5x : public IProphEBSBackend
+class ProphEBSBackendSDK511 : public IProphEBSBackend
 {
 public:
-   ProphEBSBackendSDK5x() = default;
-   ~ProphEBSBackendSDK5x() override;
+   ProphEBSBackendSDK511() = default;
+   ~ProphEBSBackendSDK511() override;
 
    // --- Connection -----------------------------------------------------
    bool Connect(bool biasRangeCheckBypass, char* errorOut, size_t errorOutLen) override;

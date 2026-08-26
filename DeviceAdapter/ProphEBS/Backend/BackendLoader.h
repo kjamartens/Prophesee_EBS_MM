@@ -5,16 +5,31 @@
 //-----------------------------------------------------------------------------
 // DESCRIPTION:   Probes which Metavision SDK generation is actually
 //                installed on this machine and dynamically loads the
-//                matching ProphEBS_Backend_<tag>.dll -- see
+//                matching ProphEBS_Backend_SDK<version>.dll -- see
 //                IProphEBSBackend.h for why this exists instead of a
 //                compile-time #if.
 //
+//                Detection is by real file version, not just DLL presence:
+//                metavision_sdk_base.dll exists (and is common to every SDK
+//                generation this project has seen so far, whether the
+//                "stream" or "driver" module is installed alongside it) and
+//                carries a normal Win32 version resource, so
+//                GetInstalledMetavisionVersion() reads its
+//                major.minor.build straight from that -- see the .cpp. This
+//                is required (not just convenient) once more than one
+//                installed generation can share the same module name: SDK
+//                5.0.0/5.1.0/5.1.1 all ship metavision_sdk_stream.dll, so
+//                "which marker DLL exists" alone can no longer distinguish
+//                them the way it could when there were only two generations
+//                (4.3.0 "driver" vs. everything-else "stream").
+//
 //                To add a new SDK generation: build a new backend project
 //                implementing IProphEBSBackend (copy an existing
-//                Backend/SDK*/ project as a template), add one row to
-//                g_BackendCandidates in BackendLoader.cpp naming its marker
-//                DLL and its own output DLL name, and add it to
-//                ProphEBS.sln's post-build staging step. See
+//                Backend/SDK*/ project as a template -- SDK511 if the new
+//                generation ships the "stream" module, SDK430 if somehow it
+//                doesn't), add one row to g_BackendCandidates in
+//                BackendLoader.cpp naming its exact version and its own
+//                output DLL name, and add it to ProphEBS.sln. See
 //                docs/BUILD_AND_USAGE.md, "Adding a new Metavision SDK
 //                generation backend."
 //
@@ -32,22 +47,25 @@
 
 #include <string>
 
-// One entry per supported Metavision SDK generation, tried in array order
-// (first whose markerDll actually resolves on this machine wins).
+// One entry per supported (built) Metavision SDK generation. major/minor/
+// patch identify exactly which installed version this backend was built
+// against -- see GetInstalledMetavisionVersion() in BackendLoader.cpp for
+// how the installed version is actually read.
 struct ProphEBSBackendCandidate
 {
-   const char* tag;            // short id, e.g. "sdk5x" -- for logging only
-   const char* markerDll;      // a DLL name unique to this generation, e.g.
-                                // "metavision_sdk_stream.dll" (5.x) or
-                                // "metavision_sdk_driver.dll" (4.3.0) --
-                                // presence of this DLL on the standard search
-                                // path is how the installed generation is
-                                // detected, without needing to actually load
-                                // the (potentially large/side-effectful)
-                                // Metavision SDK itself just to probe.
-   const char* backendDllName; // e.g. "ProphEBS_Backend_SDK5x.dll" -- must
+   const char* tag;            // short id, e.g. "sdk511" -- for logging only
+   int major;
+   int minor;
+   int patch;
+   const char* backendDllName; // e.g. "ProphEBS_Backend_SDK511.dll" -- must
                                 // be staged next to mmgr_dal_ProphEBS.dll.
 };
+
+// Reads metavision_sdk_base.dll's Win32 file version resource (major.minor.
+// build) off the standard DLL search path, without loading/executing the
+// DLL itself. Returns false (leaving the out-params untouched) if no
+// Metavision SDK install can be found on the search path at all.
+bool GetInstalledMetavisionVersion(int& major, int& minor, int& patch, std::string& resolvedPath);
 
 // RAII owner of one loaded backend module. Move-only.
 class ProphEBSBackendHandle
@@ -80,10 +98,15 @@ private:
    std::string tag_;
 };
 
-// Tries every entry in the built-in candidate table (BackendLoader.cpp) in
-// order; returns the first one that both (a) has its markerDll resolvable on
-// this machine and (b) actually loads and passes the ABI-tag check. If none
-// match, returns an unloaded handle and appends a human-readable reason
-// (mirroring ConnectToCamera()'s existing "why not connected" logging
-// convention) to errorOut.
+// Reads the installed Metavision SDK's version (GetInstalledMetavisionVersion())
+// and picks the matching entry from the built-in candidate table
+// (BackendLoader.cpp): an exact major.minor.patch match if one exists;
+// otherwise the candidate sharing the same major.minor (any patch), logged
+// as an inexact match via errorOut since patch-level ABI compatibility
+// within a minor version is an assumption, not a guarantee; otherwise no
+// match. Returns an unloaded handle with a human-readable reason appended to
+// errorOut (mirroring ConnectToCamera()'s existing "why not connected"
+// logging convention) if no Metavision SDK is installed at all, or no
+// backend covers the installed version, or the matching backend DLL itself
+// fails to load.
 ProphEBSBackendHandle LoadBestAvailableBackend(std::string& errorOut);

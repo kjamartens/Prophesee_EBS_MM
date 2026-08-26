@@ -1,9 +1,9 @@
 ///////////////////////////////////////////////////////////////////////////////
-// FILE:          ProphEBSBackendSDK5x.cpp
+// FILE:          ProphEBSBackendSDK430.cpp
 // PROJECT:       Micro-Manager
-// SUBSYSTEM:     DeviceAdapters / ProphEBS / Backend / SDK5x
+// SUBSYSTEM:     DeviceAdapters / ProphEBS / Backend / SDK430
 //-----------------------------------------------------------------------------
-// See ProphEBSBackendSDK5x.h for the design rationale. This is a 1:1
+// See ProphEBSBackendSDK430.h for the design rationale. This is a 1:1
 // translation of the original (pre-backend-shim) ProphEBS.cpp's
 // Metavision-facing logic behind the IProphEBSBackend vtable -- see
 // docs/DEVLOG.md.
@@ -12,7 +12,7 @@
 // LICENSE:       This file is distributed under the BSD license.
 ///////////////////////////////////////////////////////////////////////////////
 
-#include "ProphEBSBackendSDK5x.h"
+#include "ProphEBSBackendSDK430.h"
 
 #include <metavision/hal/facilities/i_antiflicker_module.h>
 #include <metavision/hal/facilities/i_camera_synchronization.h>
@@ -92,12 +92,12 @@ namespace
    }
 } // anonymous namespace
 
-ProphEBSBackendSDK5x::~ProphEBSBackendSDK5x()
+ProphEBSBackendSDK430::~ProphEBSBackendSDK430()
 {
    Disconnect();
 }
 
-bool ProphEBSBackendSDK5x::Connect(bool biasRangeCheckBypass, char* errorOut, size_t errorOutLen)
+bool ProphEBSBackendSDK430::Connect(bool biasRangeCheckBypass, char* errorOut, size_t errorOutLen)
 {
    try
    {
@@ -132,7 +132,7 @@ bool ProphEBSBackendSDK5x::Connect(bool biasRangeCheckBypass, char* errorOut, si
    }
 }
 
-void ProphEBSBackendSDK5x::Disconnect()
+void ProphEBSBackendSDK430::Disconnect()
 {
    if (connected_)
    {
@@ -142,7 +142,7 @@ void ProphEBSBackendSDK5x::Disconnect()
    connected_ = false;
 }
 
-bool ProphEBSBackendSDK5x::GetIdentification(ProphEBSIdentification& out)
+bool ProphEBSBackendSDK430::GetIdentification(ProphEBSIdentification& out)
 {
    try
    {
@@ -168,7 +168,7 @@ bool ProphEBSBackendSDK5x::GetIdentification(ProphEBSIdentification& out)
    }
 }
 
-void ProphEBSBackendSDK5x::RegisterCdCallback(ProphEBSCdCallback cb, void* ctx)
+void ProphEBSBackendSDK430::RegisterCdCallback(ProphEBSCdCallback cb, void* ctx)
 {
    cdCb_ = cb;
    cdCtx_ = ctx;
@@ -192,7 +192,7 @@ void ProphEBSBackendSDK5x::RegisterCdCallback(ProphEBSCdCallback cb, void* ctx)
    cdRegistered_ = true;
 }
 
-void ProphEBSBackendSDK5x::RegisterRawDataCallback(ProphEBSRawDataCallback cb, void* ctx)
+void ProphEBSBackendSDK430::RegisterRawDataCallback(ProphEBSRawDataCallback cb, void* ctx)
 {
    rawCb_ = cb;
    rawCtx_ = ctx;
@@ -205,7 +205,7 @@ void ProphEBSBackendSDK5x::RegisterRawDataCallback(ProphEBSRawDataCallback cb, v
    rawRegistered_ = true;
 }
 
-bool ProphEBSBackendSDK5x::RegisterExtTriggerCallback(ProphEBSExtTriggerCallback cb, void* ctx)
+bool ProphEBSBackendSDK430::RegisterExtTriggerCallback(ProphEBSExtTriggerCallback cb, void* ctx)
 {
    trigCb_ = cb;
    trigCtx_ = ctx;
@@ -237,7 +237,7 @@ bool ProphEBSBackendSDK5x::RegisterExtTriggerCallback(ProphEBSExtTriggerCallback
    }
 }
 
-void ProphEBSBackendSDK5x::UnregisterCallbacks()
+void ProphEBSBackendSDK430::UnregisterCallbacks()
 {
    // Mirrors the original ProphEBS.cpp's StopEventStreaming(): cd()/
    // raw_data()'s remove_callback() are expected to succeed (both facilities
@@ -261,25 +261,25 @@ void ProphEBSBackendSDK5x::UnregisterCallbacks()
    }
 }
 
-bool ProphEBSBackendSDK5x::Start()
+bool ProphEBSBackendSDK430::Start()
 {
    try { cam_.start(); return true; }
    catch (const std::exception&) { return false; }
 }
 
-void ProphEBSBackendSDK5x::Stop()
+void ProphEBSBackendSDK430::Stop()
 {
    try { cam_.stop(); }
    catch (const std::exception&) {}
 }
 
-bool ProphEBSBackendSDK5x::StartRecording(const char* path)
+bool ProphEBSBackendSDK430::StartRecording(const char* path)
 {
    try { return cam_.start_recording(path); }
    catch (const std::exception&) { return false; }
 }
 
-void ProphEBSBackendSDK5x::StopRecording(const char* path)
+void ProphEBSBackendSDK430::StopRecording(const char* path)
 {
    try { cam_.stop_recording(path); }
    catch (const std::exception&) { /* swallowed -- see IProphEBSBackend.h contract */ }
@@ -287,12 +287,12 @@ void ProphEBSBackendSDK5x::StopRecording(const char* path)
 
 // --- Biases ------------------------------------------------------------
 
-size_t ProphEBSBackendSDK5x::GetBiasCount()
+size_t ProphEBSBackendSDK430::GetBiasCount()
 {
    return biasNames_.size();
 }
 
-bool ProphEBSBackendSDK5x::GetBiasInfo(size_t index, ProphEBSBiasInfo& out)
+bool ProphEBSBackendSDK430::GetBiasInfo(size_t index, ProphEBSBiasInfo& out)
 {
    if (index >= biasNames_.size())
       return false;
@@ -325,7 +325,7 @@ bool ProphEBSBackendSDK5x::GetBiasInfo(size_t index, ProphEBSBiasInfo& out)
    }
 }
 
-bool ProphEBSBackendSDK5x::GetBiasValue(const char* name, int& out)
+bool ProphEBSBackendSDK430::GetBiasValue(const char* name, int& out)
 {
    try
    {
@@ -338,7 +338,7 @@ bool ProphEBSBackendSDK5x::GetBiasValue(const char* name, int& out)
    }
 }
 
-bool ProphEBSBackendSDK5x::SetBiasValue(const char* name, int value, int& actualOut)
+bool ProphEBSBackendSDK430::SetBiasValue(const char* name, int value, int& actualOut)
 {
    try
    {
@@ -359,7 +359,7 @@ bool ProphEBSBackendSDK5x::SetBiasValue(const char* name, int value, int& actual
 
 // --- ERC -----------------------------------------------------------
 
-ProphEBSResult ProphEBSBackendSDK5x::ErcGetRange(uint32_t& minRate, uint32_t& maxRate)
+ProphEBSResult ProphEBSBackendSDK430::ErcGetRange(uint32_t& minRate, uint32_t& maxRate)
 {
    try
    {
@@ -371,25 +371,25 @@ ProphEBSResult ProphEBSBackendSDK5x::ErcGetRange(uint32_t& minRate, uint32_t& ma
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::ErcIsEnabled(bool& out)
+ProphEBSResult ProphEBSBackendSDK430::ErcIsEnabled(bool& out)
 {
    try { out = Facility<Metavision::I_ErcModule>().is_enabled(); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::ErcEnable(bool enable)
+ProphEBSResult ProphEBSBackendSDK430::ErcEnable(bool enable)
 {
    try { Facility<Metavision::I_ErcModule>().enable(enable); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::ErcGetRate(uint32_t& out)
+ProphEBSResult ProphEBSBackendSDK430::ErcGetRate(uint32_t& out)
 {
    try { out = static_cast<uint32_t>(Facility<Metavision::I_ErcModule>().get_cd_event_rate()); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::ErcSetRate(uint32_t rate)
+ProphEBSResult ProphEBSBackendSDK430::ErcSetRate(uint32_t rate)
 {
    try { Facility<Metavision::I_ErcModule>().set_cd_event_rate(rate); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
@@ -397,7 +397,7 @@ ProphEBSResult ProphEBSBackendSDK5x::ErcSetRate(uint32_t rate)
 
 // --- Event trail (STC) filter ------------------------------------------
 
-ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterGetAvailableTypes(char availableTypesCsv[128])
+ProphEBSResult ProphEBSBackendSDK430::EventTrailFilterGetAvailableTypes(char availableTypesCsv[128])
 {
    try
    {
@@ -415,7 +415,7 @@ ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterGetAvailableTypes(char avai
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterGetThresholdRange(uint32_t& minT, uint32_t& maxT)
+ProphEBSResult ProphEBSBackendSDK430::EventTrailFilterGetThresholdRange(uint32_t& minT, uint32_t& maxT)
 {
    try
    {
@@ -427,31 +427,31 @@ ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterGetThresholdRange(uint32_t&
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterIsEnabled(bool& out)
+ProphEBSResult ProphEBSBackendSDK430::EventTrailFilterIsEnabled(bool& out)
 {
    try { out = Facility<Metavision::I_EventTrailFilterModule>().is_enabled(); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterEnable(bool enable)
+ProphEBSResult ProphEBSBackendSDK430::EventTrailFilterEnable(bool enable)
 {
    try { Facility<Metavision::I_EventTrailFilterModule>().enable(enable); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterGetThreshold(uint32_t& out)
+ProphEBSResult ProphEBSBackendSDK430::EventTrailFilterGetThreshold(uint32_t& out)
 {
    try { out = Facility<Metavision::I_EventTrailFilterModule>().get_threshold(); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterSetThreshold(uint32_t value)
+ProphEBSResult ProphEBSBackendSDK430::EventTrailFilterSetThreshold(uint32_t value)
 {
    try { Facility<Metavision::I_EventTrailFilterModule>().set_threshold(value); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterGetType(char typeOut[32])
+ProphEBSResult ProphEBSBackendSDK430::EventTrailFilterGetType(char typeOut[32])
 {
    try
    {
@@ -461,7 +461,7 @@ ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterGetType(char typeOut[32])
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterSetType(const char* type)
+ProphEBSResult ProphEBSBackendSDK430::EventTrailFilterSetType(const char* type)
 {
    try
    {
@@ -476,7 +476,7 @@ ProphEBSResult ProphEBSBackendSDK5x::EventTrailFilterSetType(const char* type)
 
 // --- Anti-flicker --------------------------------------------------
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetThresholdRanges(
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerGetThresholdRanges(
    uint32_t& minStart, uint32_t& maxStart, uint32_t& minStop, uint32_t& maxStop)
 {
    try
@@ -491,7 +491,7 @@ ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetThresholdRanges(
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetDutyCycleRange(float& minDc, float& maxDc)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerGetDutyCycleRange(float& minDc, float& maxDc)
 {
    try
    {
@@ -503,7 +503,7 @@ ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetDutyCycleRange(float& minDc, 
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetFrequencyRange(uint32_t& minFreq, uint32_t& maxFreq)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerGetFrequencyRange(uint32_t& minFreq, uint32_t& maxFreq)
 {
    try
    {
@@ -515,55 +515,55 @@ ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetFrequencyRange(uint32_t& minF
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerIsEnabled(bool& out)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerIsEnabled(bool& out)
 {
    try { out = Facility<Metavision::I_AntiFlickerModule>().is_enabled(); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerEnable(bool enable)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerEnable(bool enable)
 {
    try { Facility<Metavision::I_AntiFlickerModule>().enable(enable); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetStartThreshold(uint32_t& out)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerGetStartThreshold(uint32_t& out)
 {
    try { out = Facility<Metavision::I_AntiFlickerModule>().get_start_threshold(); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerSetStartThreshold(uint32_t value)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerSetStartThreshold(uint32_t value)
 {
    try { Facility<Metavision::I_AntiFlickerModule>().set_start_threshold(value); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetStopThreshold(uint32_t& out)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerGetStopThreshold(uint32_t& out)
 {
    try { out = Facility<Metavision::I_AntiFlickerModule>().get_stop_threshold(); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerSetStopThreshold(uint32_t value)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerSetStopThreshold(uint32_t value)
 {
    try { Facility<Metavision::I_AntiFlickerModule>().set_stop_threshold(value); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetDutyCycle(float& out)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerGetDutyCycle(float& out)
 {
    try { out = Facility<Metavision::I_AntiFlickerModule>().get_duty_cycle(); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerSetDutyCycle(float value)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerSetDutyCycle(float value)
 {
    try { Facility<Metavision::I_AntiFlickerModule>().set_duty_cycle(value); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetFilterType(bool& isBandPass)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerGetFilterType(bool& isBandPass)
 {
    try
    {
@@ -574,7 +574,7 @@ ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetFilterType(bool& isBandPass)
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerSetFilterType(bool isBandPass)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerSetFilterType(bool isBandPass)
 {
    try
    {
@@ -585,7 +585,7 @@ ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerSetFilterType(bool isBandPass)
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetFrequencyBand(uint32_t& lowFreq, uint32_t& highFreq)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerGetFrequencyBand(uint32_t& lowFreq, uint32_t& highFreq)
 {
    try
    {
@@ -597,7 +597,7 @@ ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerGetFrequencyBand(uint32_t& lowFr
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerSetFrequencyBand(uint32_t lowFreq, uint32_t highFreq)
+ProphEBSResult ProphEBSBackendSDK430::AntiFlickerSetFrequencyBand(uint32_t lowFreq, uint32_t highFreq)
 {
    try
    {
@@ -609,7 +609,7 @@ ProphEBSResult ProphEBSBackendSDK5x::AntiFlickerSetFrequencyBand(uint32_t lowFre
 
 // --- Hardware trigger in/out ------------------------------------------
 
-ProphEBSResult ProphEBSBackendSDK5x::TriggerInGetAvailableChannels(char channelsCsv[64])
+ProphEBSResult ProphEBSBackendSDK430::TriggerInGetAvailableChannels(char channelsCsv[64])
 {
    try
    {
@@ -627,7 +627,7 @@ ProphEBSResult ProphEBSBackendSDK5x::TriggerInGetAvailableChannels(char channels
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::TriggerInIsEnabled(const char* channel, bool& out)
+ProphEBSResult ProphEBSBackendSDK430::TriggerInIsEnabled(const char* channel, bool& out)
 {
    try
    {
@@ -640,7 +640,7 @@ ProphEBSResult ProphEBSBackendSDK5x::TriggerInIsEnabled(const char* channel, boo
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::TriggerInEnable(const char* channel, bool enable)
+ProphEBSResult ProphEBSBackendSDK430::TriggerInEnable(const char* channel, bool enable)
 {
    try
    {
@@ -657,7 +657,7 @@ ProphEBSResult ProphEBSBackendSDK5x::TriggerInEnable(const char* channel, bool e
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::TriggerOutSetPeriod(uint32_t periodUs)
+ProphEBSResult ProphEBSBackendSDK430::TriggerOutSetPeriod(uint32_t periodUs)
 {
    try
    {
@@ -666,7 +666,7 @@ ProphEBSResult ProphEBSBackendSDK5x::TriggerOutSetPeriod(uint32_t periodUs)
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::TriggerOutSetDutyCycle(double dutyCycle)
+ProphEBSResult ProphEBSBackendSDK430::TriggerOutSetDutyCycle(double dutyCycle)
 {
    try
    {
@@ -676,7 +676,7 @@ ProphEBSResult ProphEBSBackendSDK5x::TriggerOutSetDutyCycle(double dutyCycle)
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::TriggerOutEnable(bool enable)
+ProphEBSResult ProphEBSBackendSDK430::TriggerOutEnable(bool enable)
 {
    try
    {
@@ -717,7 +717,7 @@ namespace
    }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventRateFilterGetThresholdRanges(
+ProphEBSResult ProphEBSBackendSDK430::EventRateFilterGetThresholdRanges(
    ProphEBSEventRateThresholds& minT, ProphEBSEventRateThresholds& maxT)
 {
    try
@@ -730,7 +730,7 @@ ProphEBSResult ProphEBSBackendSDK5x::EventRateFilterGetThresholdRanges(
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventRateFilterGetThresholds(ProphEBSEventRateThresholds& out)
+ProphEBSResult ProphEBSBackendSDK430::EventRateFilterGetThresholds(ProphEBSEventRateThresholds& out)
 {
    try
    {
@@ -740,7 +740,7 @@ ProphEBSResult ProphEBSBackendSDK5x::EventRateFilterGetThresholds(ProphEBSEventR
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventRateFilterSetThresholds(const ProphEBSEventRateThresholds& value)
+ProphEBSResult ProphEBSBackendSDK430::EventRateFilterSetThresholds(const ProphEBSEventRateThresholds& value)
 {
    try
    {
@@ -750,13 +750,13 @@ ProphEBSResult ProphEBSBackendSDK5x::EventRateFilterSetThresholds(const ProphEBS
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventRateFilterIsEnabled(bool& out)
+ProphEBSResult ProphEBSBackendSDK430::EventRateFilterIsEnabled(bool& out)
 {
    try { out = Facility<Metavision::I_EventRateActivityFilterModule>().is_enabled(); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::EventRateFilterEnable(bool enable)
+ProphEBSResult ProphEBSBackendSDK430::EventRateFilterEnable(bool enable)
 {
    try { Facility<Metavision::I_EventRateActivityFilterModule>().enable(enable); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
@@ -764,7 +764,7 @@ ProphEBSResult ProphEBSBackendSDK5x::EventRateFilterEnable(bool enable)
 
 // --- Sync mode -----------------------------------------------------
 
-ProphEBSResult ProphEBSBackendSDK5x::SetSyncMode(const char* mode)
+ProphEBSResult ProphEBSBackendSDK430::SetSyncMode(const char* mode)
 {
    try
    {
@@ -784,7 +784,7 @@ ProphEBSResult ProphEBSBackendSDK5x::SetSyncMode(const char* mode)
 
 // --- Hardware ROI ----------------------------------------------------
 
-ProphEBSResult ProphEBSBackendSDK5x::RoiSetWindow(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
+ProphEBSResult ProphEBSBackendSDK430::RoiSetWindow(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
 {
    try
    {
@@ -798,7 +798,7 @@ ProphEBSResult ProphEBSBackendSDK5x::RoiSetWindow(unsigned x, unsigned y, unsign
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::RoiDisable()
+ProphEBSResult ProphEBSBackendSDK430::RoiDisable()
 {
    try { Facility<Metavision::I_ROI>().enable(false); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
@@ -806,7 +806,7 @@ ProphEBSResult ProphEBSBackendSDK5x::RoiDisable()
 
 // --- Hot-pixel masking -----------------------------------------------
 
-ProphEBSResult ProphEBSBackendSDK5x::GetDigitalEventMaskSlotCount(size_t& out)
+ProphEBSResult ProphEBSBackendSDK430::GetDigitalEventMaskSlotCount(size_t& out)
 {
    try
    {
@@ -816,7 +816,7 @@ ProphEBSResult ProphEBSBackendSDK5x::GetDigitalEventMaskSlotCount(size_t& out)
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::ApplyDigitalEventMask(const unsigned* xs, const unsigned* ys, size_t count)
+ProphEBSResult ProphEBSBackendSDK430::ApplyDigitalEventMask(const unsigned* xs, const unsigned* ys, size_t count)
 {
    try
    {
@@ -835,7 +835,7 @@ ProphEBSResult ProphEBSBackendSDK5x::ApplyDigitalEventMask(const unsigned* xs, c
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::ApplyRoiPixelMask(const unsigned* xs, const unsigned* ys, size_t count)
+ProphEBSResult ProphEBSBackendSDK430::ApplyRoiPixelMask(const unsigned* xs, const unsigned* ys, size_t count)
 {
    try
    {
@@ -851,19 +851,19 @@ ProphEBSResult ProphEBSBackendSDK5x::ApplyRoiPixelMask(const unsigned* xs, const
 
 // --- Monitoring ------------------------------------------------------
 
-ProphEBSResult ProphEBSBackendSDK5x::GetTemperatureC(double& out)
+ProphEBSResult ProphEBSBackendSDK430::GetTemperatureC(double& out)
 {
    try { out = static_cast<double>(Facility<Metavision::I_Monitoring>().get_temperature()); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::GetIlluminationLux(double& out)
+ProphEBSResult ProphEBSBackendSDK430::GetIlluminationLux(double& out)
 {
    try { out = static_cast<double>(Facility<Metavision::I_Monitoring>().get_illumination()); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
 }
 
-ProphEBSResult ProphEBSBackendSDK5x::GetPixelDeadTimeUs(double& out)
+ProphEBSResult ProphEBSBackendSDK430::GetPixelDeadTimeUs(double& out)
 {
    try { out = static_cast<double>(Facility<Metavision::I_Monitoring>().get_pixel_dead_time()); return ProphEBSResult::Ok; }
    catch (const std::exception&) { return ProphEBSResult::Unsupported; }
@@ -871,7 +871,7 @@ ProphEBSResult ProphEBSBackendSDK5x::GetPixelDeadTimeUs(double& out)
 
 // --- Software activity-noise filter ------------------------------------
 
-bool ProphEBSBackendSDK5x::ActivityFilterConstruct(unsigned width, unsigned height, int64_t thresholdUs)
+bool ProphEBSBackendSDK430::ActivityFilterConstruct(unsigned width, unsigned height, int64_t thresholdUs)
 {
    try
    {
@@ -886,18 +886,18 @@ bool ProphEBSBackendSDK5x::ActivityFilterConstruct(unsigned width, unsigned heig
    }
 }
 
-void ProphEBSBackendSDK5x::ActivityFilterSetThreshold(int64_t thresholdUs)
+void ProphEBSBackendSDK430::ActivityFilterSetThreshold(int64_t thresholdUs)
 {
    if (activityFilter_)
       activityFilter_->set_threshold(static_cast<Metavision::timestamp>(thresholdUs));
 }
 
-void ProphEBSBackendSDK5x::ActivityFilterDestroy()
+void ProphEBSBackendSDK430::ActivityFilterDestroy()
 {
    activityFilter_.reset();
 }
 
-void ProphEBSBackendSDK5x::ActivityFilterProcess(const ProphEBSEvent* in, size_t inCount,
+void ProphEBSBackendSDK430::ActivityFilterProcess(const ProphEBSEvent* in, size_t inCount,
    ProphEBSEvent* outScratch, size_t& outCount)
 {
    outCount = 0;

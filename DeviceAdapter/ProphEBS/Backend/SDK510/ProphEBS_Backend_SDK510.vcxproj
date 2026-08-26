@@ -11,8 +11,8 @@
     </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
-    <ProjectGuid>{5A1C9E2B-3D4F-4A6E-9B7C-1F2E3D4C5B6A}</ProjectGuid>
-    <RootNamespace>ProphEBS_Backend_SDK5x</RootNamespace>
+    <ProjectGuid>{7C3E1A4D-5F6B-4C8A-BD9E-3B4C5D6E7F80}</ProjectGuid>
+    <RootNamespace>ProphEBS_Backend_SDK510</RootNamespace>
     <Keyword>Win32Proj</Keyword>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
@@ -61,16 +61,19 @@
          SolutionDir is DeviceAdapter\ProphEBS\. -->
     <OutDir>$(SolutionDir)build\$(Configuration)\$(Platform)\</OutDir>
     <IntDir>$(SolutionDir)build\intermediates\$(Configuration)\$(Platform)\$(ProjectName)\</IntDir>
-    <TargetName>ProphEBS_Backend_SDK5x</TargetName>
+    <TargetName>ProphEBS_Backend_SDK510</TargetName>
   </PropertyGroup>
   <!--
-    Same MetavisionSdkRoot override point as ProphEBS.vcxproj used to have
-    (before the backend-shim refactor moved all SDK linkage into backend
-    projects like this one). Pass /p:MetavisionSdkRoot=... to MSBuild, or
-    edit the default below, if the SDK is installed elsewhere.
+    Defaults to this repo's own vendored copy of Metavision SDK 5.1.1 under
+    SDKs\510\ (see docs/BUILD_AND_USAGE.md, "Adding a new Metavision SDK
+    generation backend"): one version-pinned install per backend, not
+    whatever happens to be installed system-wide, so a rebuild is
+    reproducible regardless of what's on this machine's PATH. Pass
+    /p:MetavisionSdkRoot=... to MSBuild to point at a different install
+    (e.g. a fresh system install of the same generation) if needed.
   -->
   <PropertyGroup>
-    <MetavisionSdkRoot Condition="'$(MetavisionSdkRoot)'==''">C:\Program Files\Prophesee</MetavisionSdkRoot>
+    <MetavisionSdkRoot Condition="'$(MetavisionSdkRoot)'==''">$(SolutionDir)..\..\SDKs\510</MetavisionSdkRoot>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <Midl>
@@ -132,11 +135,11 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="ProphEBSBackendSDK5x.cpp" />
-    <ClCompile Include="ProphEBSBackendSDK5xExports.cpp" />
+    <ClCompile Include="ProphEBSBackendSDK510.cpp" />
+    <ClCompile Include="ProphEBSBackendSDK510Exports.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="ProphEBSBackendSDK5x.h" />
+    <ClInclude Include="ProphEBSBackendSDK510.h" />
     <ClInclude Include="..\IProphEBSBackend.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

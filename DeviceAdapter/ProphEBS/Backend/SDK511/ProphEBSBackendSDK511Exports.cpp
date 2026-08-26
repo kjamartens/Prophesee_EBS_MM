@@ -1,7 +1,7 @@
 ///////////////////////////////////////////////////////////////////////////////
-// FILE:          ProphEBSBackendSDK5xExports.cpp
+// FILE:          ProphEBSBackendSDK511Exports.cpp
 // PROJECT:       Micro-Manager
-// SUBSYSTEM:     DeviceAdapters / ProphEBS / Backend / SDK5x
+// SUBSYSTEM:     DeviceAdapters / ProphEBS / Backend / SDK511
 //-----------------------------------------------------------------------------
 // DESCRIPTION:   The three plain-C exports every ProphEBS_Backend_<tag>.dll
 //                must provide -- see IProphEBSBackend.h and BackendLoader.cpp
@@ -11,11 +11,11 @@
 // LICENSE:       This file is distributed under the BSD license.
 ///////////////////////////////////////////////////////////////////////////////
 
-#include "ProphEBSBackendSDK5x.h"
+#include "ProphEBSBackendSDK511.h"
 
 extern "C" __declspec(dllexport) IProphEBSBackend* CreateProphEBSBackend()
 {
-   return new ProphEBSBackendSDK5x();
+   return new ProphEBSBackendSDK511();
 }
 
 extern "C" __declspec(dllexport) void DestroyProphEBSBackend(IProphEBSBackend* backend)
