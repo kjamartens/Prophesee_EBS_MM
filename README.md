@@ -13,6 +13,23 @@ acquisition pipeline, while also exposing the sensor's own hardware
 properties (biases, filters, triggers, sync mode, etc.) as standard
 Micro-Manager device properties.
 
+## Getting started
+
+Most users don't need to build anything — grab a prebuilt release:
+
+1. Go to [Releases](../../releases) and download the latest `.zip`.
+2. Extract it, and copy `mmgr_dal_ProphEBS.dll` plus every
+   `ProphEBS_Backend_SDK*.dll` into your Micro-Manager install folder (the
+   same folder as `ImageJ.exe`/`MicroManager.exe`).
+3. Install the [Prophesee Metavision SDK](https://docs.prophesee.ai/stable/get_started/index.html)
+   (see Requirements below) if you haven't already — needed to actually run
+   against an EBS camera.
+4. Launch Micro-Manager, open **Tools → Hardware Configuration Wizard**, and
+   add the **ProphEBS-Camera** device.
+
+Building from source is only needed if you want to modify the adapter — see
+[Quick start](#quick-start) below.
+
 ## Features
 
 - Camera device adapter (`mmgr_dal_ProphEBS.dll`) implementing Micro-Manager's
@@ -38,10 +55,6 @@ Micro-Manager device properties.
 - A version-based backend-shim architecture (`DeviceAdapter/ProphEBS/Backend/`)
   so the same adapter DLL runs against multiple Metavision SDK generations
   (4.3.0, 5.0.0, 5.1.0, 5.1.1), auto-detected at runtime.
-
-See [docs/DEVLOG.md](docs/DEVLOG.md) for the full development history and
-design decisions behind each of these, and
-[docs/PROJECT_BRIEF.md](docs/PROJECT_BRIEF.md) for the original project goals.
 
 ## Requirements
 
