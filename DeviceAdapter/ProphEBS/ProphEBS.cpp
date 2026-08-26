@@ -83,6 +83,7 @@ const char* g_PropAntiFlickerHighFreq = "EBS-AntiFlicker-HighFreq";
 
 const char* g_PropGeneration = "EBS-Generation";
 const char* g_PropDataEncodingFormat = "EBS-DataEncodingFormat";
+const char* g_PropSdkVersion = "EBS-SDKVersion";
 
 const char* g_PropAvgDataRate = "EBS-AvgDataRate-MBps";
 const char* g_PropAvgEventRate = "EBS-AvgEventRate-MEvps";
@@ -697,6 +698,7 @@ CProphEBSCamera::CProphEBSCamera() :
    hotPixelStddevK_(g_DefaultHotPixelStddevK),
    generation_("N/A"),
    dataEncodingFormat_("N/A"),
+   sdkVersion_("N/A"),
    totalRawBytes_(0),
    totalEventCount_(0),
    statsThd_(nullptr),
@@ -773,7 +775,7 @@ int CProphEBSCamera::Initialize()
       return nRet;
 
    nRet = CreateStringProperty(MM::g_Keyword_Description,
-      "Prophesee EBS Camera adapter (Goal 4: raw event-file recording)", true);
+      "Prophesee EBS Camera adapter", true);
    if (DEVICE_OK != nRet)
       return nRet;
 
@@ -858,6 +860,12 @@ int CProphEBSCamera::Initialize()
    if (DEVICE_OK != nRet)
       return nRet;
    nRet = CreateStringProperty(g_PropDataEncodingFormat, dataEncodingFormat_.c_str(), true);
+   if (DEVICE_OK != nRet)
+      return nRet;
+
+   // Backend-shim follow-up: which installed Metavision SDK generation
+   // BackendLoader actually detected/selected -- see g_PropSdkVersion.
+   nRet = CreateStringProperty(g_PropSdkVersion, sdkVersion_.c_str(), true);
    if (DEVICE_OK != nRet)
       return nRet;
 
@@ -1072,6 +1080,26 @@ int CProphEBSCamera::Shutdown()
  */
 void CProphEBSCamera::ConnectToCamera()
 {
+   // Backend-shim follow-up: EBS-SDKVersion reports which Metavision SDK
+   // generation is actually installed/detected, independent of whether a
+   // camera ends up connected -- read directly here (not via
+   // LoadBestAvailableBackend()'s own internal call to the same function)
+   // so it's populated even when no backend covers the installed version.
+   {
+      int sdkMajor = 0, sdkMinor = 0, sdkPatch = 0;
+      std::string sdkPath;
+      if (GetInstalledMetavisionVersion(sdkMajor, sdkMinor, sdkPatch, sdkPath))
+      {
+         std::ostringstream sdkStream;
+         sdkStream << sdkMajor << "." << sdkMinor << "." << sdkPatch;
+         sdkVersion_ = sdkStream.str();
+      }
+      else
+      {
+         sdkVersion_ = "No Metavision SDK found";
+      }
+   }
+
    std::string loadError;
    backendHandle_ = LoadBestAvailableBackend(loadError);
    if (!backendHandle_.IsLoaded())
@@ -1082,6 +1110,12 @@ void CProphEBSCamera::ConnectToCamera()
          ") -- falling back to static test image, as in Goal 1", false);
       return;
    }
+
+   // A backend loaded successfully -- append which one, so EBS-SDKVersion
+   // distinguishes an exact match (e.g. "5.1.1 (backend: sdk511)") from the
+   // same-major.minor fallback LoadBestAvailableBackend() can pick instead
+   // (e.g. installed 5.1.2 but only sdk511/5.1.1 is built).
+   sdkVersion_ += " (backend: " + std::string(backendHandle_.Tag()) + ")";
 
    // Goal 5: EBS-biasRangeCheckBypass is a pre-init property (see the
    // constructor), so it's safe to read here -- it can no longer change

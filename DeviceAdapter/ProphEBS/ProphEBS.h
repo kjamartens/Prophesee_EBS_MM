@@ -218,6 +218,17 @@ extern const char* g_PropAntiFlickerHighFreq;
 extern const char* g_PropGeneration;
 extern const char* g_PropDataEncodingFormat;
 
+// Backend-shim follow-up: which Metavision SDK generation BackendLoader
+// actually detected/loaded on this machine (e.g. "5.1.1 (backend: sdk511,
+// ProphEBS_Backend_SDK511.dll)"), independent of whether a camera is
+// connected -- this is about the installed SDK, not the sensor, so it's
+// populated in ConnectToCamera() alongside cameraConnected_/connectionStatus_
+// but never gated on cameraConnected_ being true. Falls back to a message
+// naming the installed version (if any) and why no backend covered it, or
+// "No Metavision SDK found" if GetInstalledMetavisionVersion() itself
+// failed -- see CProphEBSCamera::sdkVersion_.
+extern const char* g_PropSdkVersion;
+
 // Goal 5: live, periodically-refreshed read-only monitoring properties.
 // Unlike g_PropRawRecordingStatus in Goal 4, these are NOT updated via
 // SetProperty()/OnPropertyChanged() from ProphEBSStatsThread's background
@@ -1296,6 +1307,10 @@ private:
    // Goal 5: static read-only info, read once in ConnectToCamera().
    std::string generation_;
    std::string dataEncodingFormat_;
+
+   // Backend-shim follow-up: backs g_PropSdkVersion -- see there. Set in
+   // ConnectToCamera() regardless of whether a camera ends up connected.
+   std::string sdkVersion_;
 
    // Goal 5: live-stats state. totalRawBytes_/totalEventCount_ are
    // incremented on the Metavision SDK's own callback threads (raw_data()
